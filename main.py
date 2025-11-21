@@ -1,415 +1,280 @@
-from flask import Flask, render_template, jsonify
-import requests
+import asyncio
+import aiohttp
+import pandas as pd
+import csv
 import os
-from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from aiohttp import web
+import aiofiles
+import json
 
-app = Flask(__name__)
-
-class FinnhubSymbolFetcher:
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv('FINNHUB_API_KEY')
-        if not self.api_key:
-            raise ValueError("Finnhub API key is required. Set FINNHUB_API_KEY environment variable.")
+class BinanceDataCollector:
+    def __init__(self):
+        self.base_url = "https://api.binance.com/api/v3"
+        self.csv_filename = "binance_data.csv"
+        self.data = []
         
-        self.base_url = "https://finnhub.io/api/v1"
-    
-    def get_stock_symbols(self, exchange: str = "US") -> List[Dict]:
-        """Fetch stock symbols from Finnhub API for a specific exchange."""
-        url = f"{self.base_url}/stock/symbol"
-        params = {
-            'exchange': exchange,
-            'token': self.api_key
-        }
-        
+    async def fetch_symbols(self):
+        """Fetch all available trading symbols from Binance"""
         try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching symbols: {e}")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.base_url}/exchangeInfo") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        symbols = [symbol['symbol'] for symbol in data['symbols'] 
+                                 if symbol['status'] == 'TRADING']
+                        return symbols
+                    else:
+                        print(f"Error fetching symbols: {response.status}")
+                        return []
+        except Exception as e:
+            print(f"Exception fetching symbols: {e}")
             return []
     
-    def get_crypto_symbols(self) -> List[Dict]:
-        """Fetch cryptocurrency symbols from Finnhub API."""
-        url = f"{self.base_url}/crypto/symbol"
-        params = {
-            'exchange': 'binance',
-            'token': self.api_key
-        }
+    async def fetch_klines(self, session, symbol, interval='1m', limit=50):
+        """Fetch klines (candlestick) data for a specific symbol"""
+        try:
+            url = f"{self.base_url}/klines"
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'limit': limit
+            }
+            
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    klines_data = await response.json()
+                    return symbol, klines_data
+                else:
+                    print(f"Error fetching data for {symbol}: {response.status}")
+                    return symbol, None
+        except Exception as e:
+            print(f"Exception fetching data for {symbol}: {e}")
+            return symbol, None
+    
+    async def collect_all_data(self):
+        """Collect data for all symbols"""
+        print("Fetching available symbols...")
+        symbols = await self.fetch_symbols()
+        
+        if not symbols:
+            print("No symbols found!")
+            return
+        
+        print(f"Found {len(symbols)} symbols. Fetching candle data...")
+        
+        # Limit to first 20 symbols to avoid too many requests
+        symbols = symbols[:20]
+        
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for symbol in symbols:
+                task = asyncio.create_task(self.fetch_klines(session, symbol))
+                tasks.append(task)
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.1)
+            
+            results = await asyncio.gather(*tasks)
+            
+            for symbol, klines_data in results:
+                if klines_data:
+                    for kline in klines_data:
+                        self.data.append({
+                            'symbol': symbol,
+                            'open_time': kline[0],
+                            'open': kline[1],
+                            'high': kline[2],
+                            'low': kline[3],
+                            'close': kline[4],
+                            'volume': kline[5],
+                            'close_time': kline[6],
+                            'quote_asset_volume': kline[7],
+                            'number_of_trades': kline[8],
+                            'taker_buy_base_asset_volume': kline[9],
+                            'taker_buy_quote_asset_volume': kline[10]
+                        })
+        
+        print(f"Collected data for {len(self.data)} candles")
+    
+    def save_to_csv(self):
+        """Save collected data to CSV file"""
+        if not self.data:
+            print("No data to save!")
+            return False
         
         try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching crypto symbols: {e}")
-            return []
-
-@app.route('/')
-def index():
-    """Main page displaying available symbols."""
-    return render_template('index.html')
-
-@app.route('/api/symbols/stocks')
-def get_stock_symbols():
-    """API endpoint to get stock symbols."""
-    fetcher = FinnhubSymbolFetcher()
-    symbols = fetcher.get_stock_symbols()
-    return jsonify(symbols)
-
-@app.route('/api/symbols/crypto')
-def get_crypto_symbols():
-    """API endpoint to get cryptocurrency symbols."""
-    fetcher = FinnhubSymbolFetcher()
-    symbols = fetcher.get_crypto_symbols()
-    return jsonify(symbols)
-
-@app.route('/api/symbols/all')
-def get_all_symbols():
-    """API endpoint to get both stock and crypto symbols."""
-    fetcher = FinnhubSymbolFetcher()
-    stocks = fetcher.get_stock_symbols()
-    crypto = fetcher.get_crypto_symbols()
+            with open(self.csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['symbol', 'open_time', 'open', 'high', 'low', 'close', 
+                            'volume', 'close_time', 'quote_asset_volume', 
+                            'number_of_trades', 'taker_buy_base_asset_volume', 
+                            'taker_buy_quote_asset_volume']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for row in self.data:
+                    writer.writerow(row)
+            
+            print(f"Data saved to {self.csv_filename}")
+            return True
+        except Exception as e:
+            print(f"Error saving to CSV: {e}")
+            return False
     
-    return jsonify({
-        'stocks': stocks,
-        'crypto': crypto
+    def get_dataframe(self):
+        """Return data as pandas DataFrame"""
+        return pd.DataFrame(self.data)
+
+async def handle_download(request):
+    """Handle file download requests"""
+    collector = request.app['collector']
+    
+    if not os.path.exists(collector.csv_filename):
+        return web.Response(text="Data file not found. Please collect data first.", status=404)
+    
+    return web.FileResponse(collector.csv_filename, headers={
+        'Content-Disposition': f'attachment; filename="{collector.csv_filename}"'
     })
 
-def create_template_directory():
-    """Create templates directory if it doesn't exist."""
-    os.makedirs('templates', exist_ok=True)
-
-def create_index_template():
-    """Create the HTML template for displaying symbols."""
-    template_content = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Finnhub Symbols</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            text-align: center;
-        }
-        .tabs {
-            display: flex;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #ddd;
-        }
-        .tab {
-            padding: 10px 20px;
-            cursor: pointer;
-            border: 1px solid transparent;
-            border-bottom: none;
-            margin-right: 5px;
-            border-radius: 4px 4px 0 0;
-        }
-        .tab.active {
-            background: #007bff;
-            color: white;
-        }
-        .tab-content {
-            display: none;
-        }
-        .tab-content.active {
-            display: block;
-        }
-        .symbol-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-        }
-        .symbol-table th,
-        .symbol-table td {
-            padding: 10px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }
-        .symbol-table th {
-            background-color: #f8f9fa;
-            font-weight: bold;
-        }
-        .symbol-table tr:hover {
-            background-color: #f8f9fa;
-        }
-        .loading {
-            text-align: center;
-            padding: 20px;
-            color: #666;
-        }
-        .error {
-            color: #dc3545;
-            padding: 10px;
-            background-color: #f8d7da;
-            border: 1px solid #f5c6cb;
-            border-radius: 4px;
-            margin: 10px 0;
-        }
-        .refresh-btn {
-            background: #28a745;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            cursor: pointer;
-            margin-bottom: 10px;
-        }
-        .refresh-btn:hover {
-            background: #218838;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Finnhub Available Symbols</h1>
-        
-        <div class="tabs">
-            <div class="tab active" onclick="showTab('stocks')">Stocks</div>
-            <div class="tab" onclick="showTab('crypto')">Cryptocurrency</div>
-            <div class="tab" onclick="showTab('all')">All Symbols</div>
-        </div>
-
-        <button class="refresh-btn" onclick="loadSymbols()">Refresh Symbols</button>
-
-        <div id="stocks" class="tab-content active">
-            <h2>Stock Symbols (US Exchange)</h2>
-            <div id="stocks-content"></div>
-        </div>
-
-        <div id="crypto" class="tab-content">
-            <h2>Cryptocurrency Symbols</h2>
-            <div id="crypto-content"></div>
-        </div>
-
-        <div id="all" class="tab-content">
-            <h2>All Symbols</h2>
-            <div id="all-content"></div>
-        </div>
-    </div>
-
-    <script>
-        function showTab(tabName) {
-            // Hide all tab contents
-            document.querySelectorAll('.tab-content').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            
-            // Remove active class from all tabs
-            document.querySelectorAll('.tab').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            
-            // Show selected tab content
-            document.getElementById(tabName).classList.add('active');
-            
-            // Add active class to clicked tab
-            event.target.classList.add('active');
-            
-            // Load data for the tab if not already loaded
-            if (tabName === 'stocks' && !document.getElementById('stocks-content').innerHTML) {
-                loadStocks();
-            } else if (tabName === 'crypto' && !document.getElementById('crypto-content').innerHTML) {
-                loadCrypto();
-            } else if (tabName === 'all' && !document.getElementById('all-content').innerHTML) {
-                loadAll();
+async def handle_root(request):
+    """Handle main page requests"""
+    collector = request.app['collector']
+    
+    # Create HTML response
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Binance Data Collector</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; }
+            .container { max-width: 1200px; margin: 0 auto; }
+            .header { background: #f0f0f0; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+            .data-section { margin: 20px 0; }
+            table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+            .download-btn { 
+                background: #007bff; 
+                color: white; 
+                padding: 10px 20px; 
+                text-decoration: none; 
+                border-radius: 5px; 
+                display: inline-block;
+                margin: 10px 0;
             }
-        }
-
-        function loadSymbols() {
-            loadStocks();
-            loadCrypto();
-            loadAll();
-        }
-
-        function loadStocks() {
-            const content = document.getElementById('stocks-content');
-            content.innerHTML = '<div class="loading">Loading stock symbols...</div>';
-            
-            fetch('/api/symbols/stocks')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.length === 0) {
-                        content.innerHTML = '<div class="error">No stock symbols found or API error occurred.</div>';
-                        return;
-                    }
-                    
-                    let html = `<table class="symbol-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Description</th>
-                                <th>Type</th>
-                                <th>Currency</th>
-                            </tr>
-                        </thead>
-                        <tbody>`;
-                    
-                    data.forEach(symbol => {
-                        html += `<tr>
-                            <td><strong>${symbol.symbol || 'N/A'}</strong></td>
-                            <td>${symbol.description || 'N/A'}</td>
-                            <td>${symbol.type || 'N/A'}</td>
-                            <td>${symbol.currency || 'N/A'}</td>
-                        </tr>`;
-                    });
-                    
-                    html += '</tbody></table>';
-                    content.innerHTML = html;
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    content.innerHTML = `<div class="error">Error loading stock symbols: ${error.message}</div>`;
-                });
-        }
-
-        function loadCrypto() {
-            const content = document.getElementById('crypto-content');
-            content.innerHTML = '<div class="loading">Loading cryptocurrency symbols...</div>';
-            
-            fetch('/api/symbols/crypto')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.length === 0) {
-                        content.innerHTML = '<div class="error">No cryptocurrency symbols found or API error occurred.</div>';
-                        return;
-                    }
-                    
-                    let html = `<table class="symbol-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Description</th>
-                                <th>Currency</th>
-                            </tr>
-                        </thead>
-                        <tbody>`;
-                    
-                    data.forEach(symbol => {
-                        html += `<tr>
-                            <td><strong>${symbol.symbol || 'N/A'}</strong></td>
-                            <td>${symbol.description || 'N/A'}</td>
-                            <td>${symbol.currency || 'N/A'}</td>
-                        </tr>`;
-                    });
-                    
-                    html += '</tbody></table>';
-                    content.innerHTML = html;
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    content.innerHTML = `<div class="error">Error loading cryptocurrency symbols: ${error.message}</div>`;
-                });
-        }
-
-        function loadAll() {
-            const content = document.getElementById('all-content');
-            content.innerHTML = '<div class="loading">Loading all symbols...</div>';
-            
-            fetch('/api/symbols/all')
-                .then(response => response.json())
-                .then(data => {
-                    let html = '<h3>Stock Symbols</h3>';
-                    
-                    if (data.stocks && data.stocks.length > 0) {
-                        html += `<table class="symbol-table">
-                            <thead>
-                                <tr>
-                                    <th>Symbol</th>
-                                    <th>Description</th>
-                                    <th>Type</th>
-                                    <th>Currency</th>
-                                </tr>
-                            </thead>
-                            <tbody>`;
-                        
-                        data.stocks.forEach(symbol => {
-                            html += `<tr>
-                                <td><strong>${symbol.symbol || 'N/A'}</strong></td>
-                                <td>${symbol.description || 'N/A'}</td>
-                                <td>${symbol.type || 'N/A'}</td>
-                                <td>${symbol.currency || 'N/A'}</td>
-                            </tr>`;
-                        });
-                        
-                        html += '</tbody></table>';
-                    } else {
-                        html += '<div class="error">No stock symbols found.</div>';
-                    }
-                    
-                    html += '<h3>Cryptocurrency Symbols</h3>';
-                    
-                    if (data.crypto && data.crypto.length > 0) {
-                        html += `<table class="symbol-table">
-                            <thead>
-                                <tr>
-                                    <th>Symbol</th>
-                                    <th>Description</th>
-                                    <th>Currency</th>
-                                </tr>
-                            </thead>
-                            <tbody>`;
-                        
-                        data.crypto.forEach(symbol => {
-                            html += `<tr>
-                                <td><strong>${symbol.symbol || 'N/A'}</strong></td>
-                                <td>${symbol.description || 'N/A'}</td>
-                                <td>${symbol.currency || 'N/A'}</td>
-                            </tr>`;
-                        });
-                        
-                        html += '</tbody></table>';
-                    } else {
-                        html += '<div class="error">No cryptocurrency symbols found.</div>';
-                    }
-                    
-                    content.innerHTML = html;
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    content.innerHTML = `<div class="error">Error loading symbols: ${error.message}</div>`;
-                });
-        }
-
-        // Load initial data
-        document.addEventListener('DOMContentLoaded', function() {
-            loadStocks();
-        });
-    </script>
-</body>
-</html>'''
+            .refresh-btn {
+                background: #28a745;
+                color: white;
+                padding: 10px 20px;
+                text-decoration: none;
+                border-radius: 5px;
+                display: inline-block;
+                margin: 10px 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Binance Data Collector</h1>
+                <p>Real-time 1-minute candle data for Binance trading pairs</p>
+            </div>
+    """
     
-    with open('templates/index.html', 'w') as f:
-        f.write(template_content)
+    # Add download link if data exists
+    if os.path.exists(collector.csv_filename):
+        html_content += f"""
+            <div>
+                <a href="/download" class="download-btn">Download CSV File</a>
+                <a href="/refresh" class="refresh-btn">Refresh Data</a>
+            </div>
+        """
+    
+    # Add data table if data exists
+    if collector.data:
+        df = collector.get_dataframe()
+        
+        # Convert timestamp to readable date
+        if not df.empty and 'open_time' in df.columns:
+            df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
+        
+        html_content += """
+            <div class="data-section">
+                <h2>Collected Data (First 50 rows)</h2>
+                <div style="overflow-x: auto;">
+        """
+        
+        # Convert DataFrame to HTML table (first 50 rows)
+        html_content += df.head(50).to_html(classes='data-table', index=False, escape=False)
+        
+        html_content += """
+                </div>
+                <p>Total records: """ + str(len(collector.data)) + """</p>
+            </div>
+        """
+    else:
+        html_content += """
+            <div>
+                <p>No data collected yet. <a href="/refresh">Click here to collect data</a></p>
+            </div>
+        """
+    
+    html_content += """
+        </div>
+    </body>
+    </html>
+    """
+    
+    return web.Response(text=html_content, content_type='text/html')
 
-if __name__ == '__main__':
-    # Create template directory and file
-    create_template_directory()
-    create_index_template()
+async def handle_refresh(request):
+    """Handle data refresh requests"""
+    collector = request.app['collector']
     
-    # Check if API key is available
-    api_key = os.getenv('FINNHUB_API_KEY')
-    if not api_key:
-        print("Warning: FINNHUB_API_KEY environment variable not set.")
-        print("Please set your Finnhub API key before running:")
-        print("export FINNHUB_API_KEY='your_api_key_here'")
-        print("\nThe server will start, but API calls will fail without a valid API key.")
+    print("Refreshing data...")
+    await collector.collect_all_data()
+    collector.save_to_csv()
     
-    # Start the web server
-    print("Starting Finnhub Symbols Web Server...")
-    print("Access the application at: http://localhost:5000")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Redirect back to main page
+    return web.HTTPFound('/')
+
+async def init_app():
+    """Initialize the web application"""
+    # Create data collector instance
+    collector = BinanceDataCollector()
+    
+    # Collect initial data
+    await collector.collect_all_data()
+    collector.save_to_csv()
+    
+    # Create web application
+    app = web.Application()
+    app['collector'] = collector
+    
+    # Setup routes
+    app.router.add_get('/', handle_root)
+    app.router.add_get('/download', handle_download)
+    app.router.add_get('/refresh', handle_refresh)
+    
+    return app
+
+def main():
+    """Main function to run the application"""
+    print("Starting Binance Data Collector...")
+    print("This will:")
+    print("1. Fetch available symbols from Binance")
+    print("2. Collect 50 minutes of 1-minute candle data for each symbol")
+    print("3. Save data to CSV file")
+    print("4. Start web server on http://localhost:8080")
+    print("5. Display data and provide download link")
+    
+    # Run the application
+    app = asyncio.run(init_app())
+    
+    print("\nWeb server started! Visit http://localhost:8080")
+    print("Press Ctrl+C to stop the server")
+    
+    web.run_app(app, host='localhost', port=8080)
+
+if __name__ == "__main__":
+    main()
