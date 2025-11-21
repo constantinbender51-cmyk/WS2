@@ -1,3 +1,6 @@
-aiohttp
-pandas
-aiofiles
+flask 
+aiohttp 
+pandas 
+numpy 
+matplotlib 
+requests
