@@ -297,7 +297,9 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     capital = [1000]
     for i in range(1, len(all_y_actual)):
         ret = (all_y_actual[i] - all_y_actual[i-1]) / all_y_actual[i-1]
-        pos = 1 if all_y_predicted[i] > all_y_actual[i-1] else -1 
+        # Use derivative of prediction: long if prediction is increasing, short if decreasing
+        pred_derivative = all_y_predicted[i] - all_y_predicted[i-1] if i > 0 else 0
+        pos = 1 if pred_derivative > 0 else -1 
         capital.append(capital[-1] * (1 + (ret * pos * 1)))
     
     plt.subplot(3, 1, 2)
