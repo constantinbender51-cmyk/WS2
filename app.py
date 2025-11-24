@@ -304,15 +304,21 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
 
     # Strategy capital calculation for combined data
     capital = [1000]
+    positions = []
     for i in range(1, len(all_y_actual)):
         ret = (all_y_actual[i] - all_y_actual[i-1]) / all_y_actual[i-1]
         # Use derivative of prediction: long if prediction is increasing, short if decreasing
         pred_derivative = all_y_predicted[i] - all_y_predicted[i-1] if i > 0 else 0
         pos = 1 if pred_derivative > 0 else -1 
         capital.append(capital[-1] * (1 + (ret * pos * 1)))
+        positions.append(pos)
     
     plt.subplot(3, 1, 2)
     plt.plot(all_dates, capital, color='purple')
+    # Mark positions on each day: grey for neutral (pos=0), yellow for active (pos != 0)
+    for i in range(len(positions)):
+        color = 'grey' if positions[i] == 0 else 'yellow'
+        plt.scatter(all_dates[i+1], capital[i+1], color=color, s=10)
     plt.title('Strategy Capital (Long/Short based on Predicted vs Yesterday Price)')
     plt.xticks(rotation=45)
 
