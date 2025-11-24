@@ -315,10 +315,11 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     
     plt.subplot(3, 1, 2)
     plt.plot(all_dates, capital, color='purple')
-    # Mark positions on each day: grey for neutral (pos=0), yellow for active (pos != 0)
+    # Mark positions on each day: grey for short (pos=-1), yellow for long (pos=1)
     for i in range(len(positions)):
-        color = 'grey' if positions[i] == 0 else 'yellow'
-        plt.scatter(all_dates[i+1], capital[i+1], color=color, s=10)
+        color = 'grey' if positions[i] == -1 else 'yellow' if positions[i] == 1 else 'none'
+        if color != 'none':
+            plt.scatter(all_dates[i+1], capital[i+1], color=color, s=10)
     plt.title('Strategy Capital (Long/Short based on Predicted vs Yesterday Price)')
     plt.xticks(rotation=45)
 
