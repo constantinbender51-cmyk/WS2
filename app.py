@@ -232,7 +232,7 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 10)
             features.append(feature)
-            targets.append(df_clean['close'].iloc[i])
+            targets.append(df_clean['close'].rolling(window=7).mean().iloc[i])
     
     features = np.array(features)
     valid_indices = ~np.isnan(features).any(axis=1)
