@@ -288,15 +288,15 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     # Plot 1: Combined actual vs predicted prices
     plt.subplot(3, 1, 1)
     plt.plot(all_dates, all_y_actual, label='Actual Price', color='blue')
-    plt.plot(all_dates, all_y_predicted, label='Predicted', color='green', alpha=0.7)
+    plt.plot(all_dates, all_y_predicted, label='Predicted Price', color='green', alpha=0.7)
     # Add the actual target (7-day rolling average of close price)
     actual_target = df['close'].rolling(window=7).mean().dropna()
     target_dates = df.index[df['close'].rolling(window=7).mean().notna()]
     # Align target dates with the combined data dates
     common_dates = target_dates.intersection(pd.DatetimeIndex(all_dates))
     common_target = actual_target.loc[common_dates]
-    plt.plot(common_dates, common_target, label='Actual Target (7-day MA)', color='red', linestyle='--', alpha=0.8)
-    plt.title('BTC Price Prediction vs Actual Target (Training and Test Sets)')
+    plt.plot(common_dates, common_target, label='Target (7-day MA)', color='red', linestyle='--', alpha=0.8)
+    plt.title('BTC Price Prediction vs Target (Training and Test Sets)')
     plt.legend()
     plt.xticks(rotation=45)
 
