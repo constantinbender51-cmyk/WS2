@@ -140,8 +140,8 @@ def calculate_strategy(df):
         # Set position for this day
         df.loc[df.index[i], 'position'] = current_position
         
-        # Calculate strategy return with 5x leverage
-        strategy_return = current_position * df['daily_return'].iloc[i] * 5
+        # Calculate strategy return with 2x leverage
+        strategy_return = current_position * df['daily_return'].iloc[i] * 2
         
         # Update capital with strategy return and apply 0.04% daily fee
         capital = capital_series[-1] * (1 + strategy_return) * (1 - 0.0004)
