@@ -95,6 +95,9 @@ def calculate_strategy(df):
     """Calculate trading strategy - always go long"""
     logger.info("Calculating always-long strategy...")
     
+    # Calculate 365-day SMA
+    df['sma_365'] = df['close'].rolling(window=365).mean()
+    
     # Strategy: Always go long (position = 1)
     df['position'] = 1
     
@@ -130,18 +133,9 @@ def create_plot(df):
     
     # Plot 2: Trading Positions
     plt.subplot(3, 1, 2)
-    # Create long/short position visualization
-    long_periods = df[df['position'] == 1]
-    short_periods = df[df['position'] == -1]
-    
-    if not long_periods.empty:
-        plt.plot(long_periods.index, long_periods['close'], 
-                label='Long Position', color='green', linewidth=2)
-    if not short_periods.empty:
-        plt.plot(short_periods.index, short_periods['close'], 
-                label='Short Position', color='red', linewidth=2)
-    
-    plt.title('Trading Positions (Green: Long, Red: Short)')
+    # Since strategy is always long, plot entire period as long
+    plt.plot(df.index, df['close'], label='Long Position (Always)', color='green', linewidth=2)
+    plt.title('Trading Positions (Always Long)')
     plt.ylabel('Price (USD)')
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -160,7 +154,7 @@ def create_plot(df):
     final_capital = df['capital'].iloc[-1]
     total_return = (final_capital - 1000) / 1000 * 100
     
-    plt.figtext(0.02, 0.02, f'Final Capital: ${final_capital:,.2f} | Total Return: {total_return:+.2f}%', 
+    plt.figtext(0.02, 0.02, f'Final Capital: ${final_capital:,.2f} | Total Return: {total_return:+.2f}% | Strategy: Always Long', 
                 fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
     
     plt.tight_layout()
