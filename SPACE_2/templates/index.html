@@ -150,8 +150,10 @@
                 </div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Total Days</div>
-                <div class="metric-value">{{ total_days }}</div>
+                <div class="metric-label">Sharpe Ratio</div>
+                <div class="metric-value {{ 'positive' if sharpe_ratio > 0 else 'negative' }}">
+                    {{ "%0.3f"|format(sharpe_ratio) }}
+                </div>
             </div>
             <div class="metric-card">
                 <div class="metric-label">Trading Days</div>
@@ -189,7 +191,7 @@
                 const data = await response.json();
                 
                 if (data.status === 'success') {
-                    alert(`API Status: ✅ Success\nFinal Capital: $${data.final_capital.toFixed(2)}\nReturn: ${data.total_return_percent.toFixed(2)}%`);
+                    alert(`API Status: ✅ Success\nFinal Capital: $${data.final_capital.toFixed(2)}\nReturn: ${data.total_return_percent.toFixed(2)}%\nSharpe Ratio: ${data.sharpe_ratio.toFixed(3)}`);
                 } else {
                     alert(`API Status: ❌ Error\n${data.error}`);
                 }
