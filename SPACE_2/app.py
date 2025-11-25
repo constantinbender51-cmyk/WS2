@@ -131,8 +131,8 @@ def calculate_strategy(df):
         else:
             # Check stop-loss condition if we have an open position
             if current_position != 0 and entry_price > 0:
-                stop_loss_level_long = entry_price * 0.96  # 4% below entry for long
-                stop_loss_level_short = entry_price * 1.04  # 4% above entry for short
+                stop_loss_level_long = entry_price * 0.99  # 1% below entry for long
+                stop_loss_level_short = entry_price * 1.01  # 1% above entry for short
                 
                 # Check if stop-loss is triggered
                 if (current_position == 1 and df['low'].iloc[i] <= stop_loss_level_long) or \
