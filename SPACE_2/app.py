@@ -110,56 +110,76 @@ def calculate_strategy(df):
     # Calculate daily returns
     df['daily_return'] = df['close'].pct_change()
     
-    # Use fixed ATR multiplier of 3.2 and leverage of 1.5
-    atr_multiplier = 3.2
-    leverage = 1.5
-    logger.info(f"Using fixed ATR multiplier: {atr_multiplier} and leverage: {leverage}")
+    # Set leverage to 1
+    leverage = 1.0
     
-    initial_capital = 1000
-    capital_series = [initial_capital]
-    current_position = 0
+    # Test ATR multipliers from 0.1 to 5.0 in increments of 0.1
+    atr_multipliers = [round(x * 0.1, 1) for x in range(1, 51)]
+    best_sharpe = -np.inf
+    best_atr_multiplier = 3.2  # Default fallback
+    best_capital_series = None
     
-    for i in range(1, len(df)):
-        # Determine target position based on SMA strategy
-        target_position = 1 if df['close'].iloc[i] > df['sma_365'].iloc[i] else -1
-        current_position = target_position
-        df.loc[df.index[i], 'position'] = current_position
+    for atr_multiplier in atr_multipliers:
+        capital_series = [1000]  # Initial capital
         
-        # Entry price is previous close
-        entry_price = df['close'].iloc[i-1]
-        df.loc[df.index[i], 'entry_price'] = entry_price
+        for i in range(1, len(df)):
+            # Determine target position based on SMA strategy
+            target_position = 1 if df['close'].iloc[i] > df['sma_365'].iloc[i] else -1
+            df.loc[df.index[i], 'position'] = target_position
+            
+            # Entry price is previous close
+            entry_price = df['close'].iloc[i-1]
+            df.loc[df.index[i], 'entry_price'] = entry_price
+            
+            # Initialize stop-loss triggered flag
+            df.loc[df.index[i], 'stop_loss_triggered'] = False
+            
+            # Calculate capital based on position, leverage, and stop-loss conditions
+            prev_capital = capital_series[-1]
+            current_price = df['close'].iloc[i]
+            prev_price = df['close'].iloc[i-1]
+            
+            if target_position == 1:
+                # Long position with leverage: capital * (1 + leverage * (current_price / prev_price - 1))
+                capital = prev_capital * (1 + leverage * (current_price / prev_price - 1))
+                # Stop-loss for long: if low <= entry_price - atr_multiplier * atr, capital reduced proportionally with leverage
+                atr_value = df['atr'].iloc[i]
+                if df['low'].iloc[i] <= entry_price - atr_multiplier * atr_value:
+                    capital = prev_capital * (1 + leverage * ((entry_price - atr_multiplier * atr_value) / entry_price - 1))
+                    df.loc[df.index[i], 'stop_loss_triggered'] = True
+            elif target_position == -1:
+                # Short position with leverage: capital * (1 + leverage * (1 - current_price / prev_price))
+                capital = prev_capital * (1 + leverage * (1 - current_price / prev_price))
+                # Stop-loss for short: if high >= entry_price + atr_multiplier * atr, capital reduced proportionally with leverage
+                atr_value = df['atr'].iloc[i]
+                if df['high'].iloc[i] >= entry_price + atr_multiplier * atr_value:
+                    capital = prev_capital * (1 + leverage * (1 - (entry_price + atr_multiplier * atr_value) / entry_price))
+                    df.loc[df.index[i], 'stop_loss_triggered'] = True
+            else:
+                capital = prev_capital
+            
+            capital_series.append(capital)
         
-        # Initialize stop-loss triggered flag
-        df.loc[df.index[i], 'stop_loss_triggered'] = False
-        
-        # Calculate capital based on position, leverage, and stop-loss conditions
-        prev_capital = capital_series[-1]
-        current_price = df['close'].iloc[i]
-        prev_price = df['close'].iloc[i-1]
-        
-        if current_position == 1:
-            # Long position with leverage: capital * (1 + leverage * (current_price / prev_price - 1))
-            capital = prev_capital * (1 + leverage * (current_price / prev_price - 1))
-            # Stop-loss for long: if low <= entry_price - atr_multiplier * atr, capital reduced proportionally with leverage
-            atr_value = df['atr'].iloc[i]
-            if df['low'].iloc[i] <= entry_price - atr_multiplier * atr_value:
-                capital = prev_capital * (1 + leverage * ((entry_price - atr_multiplier * atr_value) / entry_price - 1))
-                df.loc[df.index[i], 'stop_loss_triggered'] = True
-        elif current_position == -1:
-            # Short position with leverage: capital * (1 + leverage * (1 - current_price / prev_price))
-            capital = prev_capital * (1 + leverage * (1 - current_price / prev_price))
-            # Stop-loss for short: if high >= entry_price + atr_multiplier * atr, capital reduced proportionally with leverage
-            atr_value = df['atr'].iloc[i]
-            if df['high'].iloc[i] >= entry_price + atr_multiplier * atr_value:
-                capital = prev_capital * (1 + leverage * (1 - (entry_price + atr_multiplier * atr_value) / entry_price))
-                df.loc[df.index[i], 'stop_loss_triggered'] = True
+        # Calculate Sharpe ratio for this ATR multiplier
+        capital_df = pd.Series(capital_series, index=df.index)
+        strategy_returns = capital_df.pct_change().dropna()
+        if len(strategy_returns) > 0:
+            annual_factor = np.sqrt(365)
+            sharpe_ratio = (strategy_returns.mean() / strategy_returns.std()) * annual_factor if strategy_returns.std() > 0 else 0
         else:
-            capital = prev_capital
+            sharpe_ratio = 0
         
-        capital_series.append(capital)
+        # Update best if current Sharpe is higher
+        if sharpe_ratio > best_sharpe:
+            best_sharpe = sharpe_ratio
+            best_atr_multiplier = atr_multiplier
+            best_capital_series = capital_series
     
-    df['capital'] = capital_series
-    df['capital'] = df['capital'].fillna(initial_capital)
+    logger.info(f"Best ATR multiplier: {best_atr_multiplier} with Sharpe ratio: {best_sharpe:.3f}")
+    
+    # Use the best capital series
+    df['capital'] = best_capital_series
+    df['capital'] = df['capital'].fillna(1000)
     
     # Calculate strategy returns and Sharpe ratio
     df['strategy_return'] = df['capital'].pct_change()
@@ -207,7 +227,15 @@ def create_plot(df):
     final_capital = df['capital'].iloc[-1]
     total_return = (final_capital - 1000) / 1000 * 100
     
-    plt.figtext(0.02, 0.02, f'Final Capital: ${final_capital:,.2f} | Total Return: {total_return:+.2f}% | Strategy: Long if Price > SMA 365, Otherwise Short', 
+    # Calculate Sharpe ratio for the best ATR multiplier
+    strategy_returns = df['strategy_return'].dropna()
+    if len(strategy_returns) > 0:
+        annual_factor = np.sqrt(365)
+        sharpe_ratio = (strategy_returns.mean() / strategy_returns.std()) * annual_factor if strategy_returns.std() > 0 else 0
+    else:
+        sharpe_ratio = 0
+    
+    plt.figtext(0.02, 0.02, f'Final Capital: ${final_capital:,.2f} | Total Return: {total_return:+.2f}% | Sharpe Ratio: {sharpe_ratio:.3f} | ATR Multiplier: {best_atr_multiplier} | Strategy: Long if Price > SMA 365, Otherwise Short', 
                 fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
     
     plt.tight_layout()
@@ -237,7 +265,7 @@ def index():
         total_days = len(df)
         trading_days = len(df[df['position'].notna()])
         
-        # Calculate Sharpe ratio (annualized)
+        # Calculate Sharpe ratio (annualized) for the best ATR multiplier
         strategy_returns = df['strategy_return'].dropna()
         if len(strategy_returns) > 0:
             # Assuming 365 trading days per year
