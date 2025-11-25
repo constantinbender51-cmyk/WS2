@@ -117,7 +117,7 @@
     <div class="container">
         <h1>📈 BTC SMA 365 Trading Strategy</h1>
         <div class="subtitle">
-            Strategy: Always LONG (Buy and Hold)
+            Strategy: Long if Price > SMA 365, Otherwise Short
         </div>
 
         {% if error %}
@@ -128,12 +128,12 @@
 
         <div class="strategy-description">
             <h3>📊 Strategy Overview</h3>
-            <p>This strategy implements a simple buy-and-hold approach:</p>
+            <p>This strategy uses a 365-day simple moving average (SMA) to determine positions:</p>
             <ul>
-                <li><strong>Position:</strong> Always Long (Buy and Hold)</li>
-                <li><strong>No Shorting:</strong> Strategy only takes long positions</li>
+                <li><strong>Position:</strong> Long if Price > SMA 365, Otherwise Short</li>
+                <li><strong>Shorting Enabled:</strong> Strategy takes short positions when price is below SMA</li>
                 <li><strong>Initial Capital:</strong> $1,000</li>
-                <li><strong>Data Period:</strong> 2024-01-01 to 2025-12-31</li>
+                <li><strong>Data Period:</strong> 2018-01-01 to 2025-12-31</li>
             </ul>
         </div>
 
@@ -177,7 +177,7 @@
         {% endif %}
 
         <div class="footer">
-            <p>Data Source: Binance API | Strategy: Always Long (Buy & Hold) | Initial Capital: $1,000</p>
+            <p>Data Source: Binance API | Strategy: Long if Price > SMA 365, Otherwise Short | Initial Capital: $1,000</p>
             <p><small>Note: This is for educational purposes only. Past performance does not guarantee future results.</small></p>
         </div>
     </div>
