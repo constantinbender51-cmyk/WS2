@@ -107,9 +107,26 @@ def calculate_strategy(df):
     # Calculate strategy returns (position * daily return)
     df['strategy_return'] = df['position'].shift(1) * df['daily_return']
     
-    # Calculate cumulative capital development
+    # Calculate cumulative capital development - update only on signal changes
     initial_capital = 1000
-    df['capital'] = initial_capital * (1 + df['strategy_return']).cumprod()
+    capital = initial_capital
+    capital_series = []
+    
+    for i in range(len(df)):
+        # Only update capital when position changes
+        if i > 0 and df['position'].iloc[i] != df['position'].iloc[i-1]:
+            # Update capital based on the return since last signal change
+            capital = capital_series[-1] * (1 + df['strategy_return'].iloc[i])
+        elif i == 0:
+            # First day
+            capital = initial_capital
+        else:
+            # Maintain same capital until next signal change
+            capital = capital_series[-1]
+        
+        capital_series.append(capital)
+    
+    df['capital'] = capital_series
     
     # Fill NaN values
     df['capital'] = df['capital'].fillna(initial_capital)
