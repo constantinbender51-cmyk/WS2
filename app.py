@@ -317,8 +317,8 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
         btc_price_i = df.loc[all_dates[i], 'close']
         btc_price_prev = df.loc[all_dates[i-1], 'close']
         ret = (btc_price_i - btc_price_prev) / btc_price_prev
-        # Strategy: long if yesterday's close is below prediction, otherwise short
-        pos = 1 if btc_price_prev < all_y_predicted[i] else -1
+        # Strategy: long if yesterday's close is above prediction, otherwise short
+        pos = 1 if btc_price_prev > all_y_predicted[i] else -1
         capital.append(capital[-1] * (1 + (ret * pos * 1)))
         positions.append(pos)
     
