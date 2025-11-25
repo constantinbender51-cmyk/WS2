@@ -182,24 +182,9 @@ def create_plot(df, best_atr_multiplier):
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    plt.figure(figsize=(12, 10))
-    
-    # Plot 1: BTC Price and 365-day SMA
-    plt.subplot(3, 1, 1)
-    # Skip the first 365 data points for plotting
-    plot_df = df.iloc[365:]
-    plt.plot(plot_df.index, plot_df['close'], label='BTC Price', color='blue', linewidth=1)
-    plt.plot(plot_df.index, plot_df['sma_365'], label='365-day SMA', color='orange', linewidth=1)
-    plt.title('BTC Price and 365-day Simple Moving Average')
-    plt.ylabel('Price (USD)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
     # Plot 2: Trading Positions
     plt.subplot(3, 1, 2)
     # Plot long positions (green) and short positions (red)
-    # Skip the first 365 data points for plotting
-    plot_df = df.iloc[365:]
     long_mask = plot_df['position'] == 1
     short_mask = plot_df['position'] == -1
     plt.plot(plot_df.index[long_mask], plot_df['close'][long_mask], label='Long Position', color='green', linewidth=2)
@@ -211,8 +196,6 @@ def create_plot(df, best_atr_multiplier):
     
     # Plot 3: Capital Development
     plt.subplot(3, 1, 3)
-    # Skip the first 365 data points for plotting
-    plot_df = df.iloc[365:]
     plt.plot(plot_df.index, plot_df['capital'], label='Strategy Capital', color='purple', linewidth=2)
     plt.axhline(y=1000, color='gray', linestyle='--', label='Initial Capital ($1000)')
     plt.title('Capital Development - SMA 365 Strategy')
