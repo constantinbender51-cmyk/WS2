@@ -186,7 +186,7 @@ def calculate_strategy(df):
     # Calculate strategy returns and Sharpe ratio
     df['strategy_return'] = df['capital'].pct_change()
     
-    return df, best_atr_multiplier
+    return df, best_atr_multiplier, best_atr_multiplier
 
 def create_plot(df, best_atr_multiplier):
     """Create visualization of strategy results"""
