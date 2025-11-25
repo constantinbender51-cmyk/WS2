@@ -92,14 +92,11 @@ def fetch_btc_data():
         raise Exception("Failed to fetch BTC data")
 
 def calculate_strategy(df):
-    """Calculate trading strategy based on 365-day SMA"""
-    logger.info("Calculating 365-day SMA strategy...")
+    """Calculate trading strategy - always go long"""
+    logger.info("Calculating always-long strategy...")
     
-    # Calculate 365-day Simple Moving Average
-    df['sma_365'] = df['close'].rolling(window=365, min_periods=1).mean()
-    
-    # Strategy: Long if price > SMA, Short if price < SMA
-    df['position'] = np.where(df['close'] > df['sma_365'], 1, -1)
+    # Strategy: Always go long (position = 1)
+    df['position'] = 1
     
     # Calculate daily returns
     df['daily_return'] = df['close'].pct_change()
