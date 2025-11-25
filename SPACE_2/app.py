@@ -115,10 +115,13 @@ def calculate_strategy(df):
         # Determine target position based on SMA strategy
         target_position = 1 if df['close'].iloc[i] > df['sma_365'].iloc[i] else -1
         
+        # Entry price is always previous close
+        current_entry_price = df['close'].iloc[i-1]
+        
         # Check if we need to change position
         if current_position != target_position:
             current_position = target_position
-            entry_price = df['close'].iloc[i]
+            entry_price = current_entry_price
             df.loc[df.index[i], 'entry_price'] = entry_price
             df.loc[df.index[i], 'stop_loss_triggered'] = False
         else:
