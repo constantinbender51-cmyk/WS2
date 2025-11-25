@@ -186,9 +186,9 @@ def calculate_strategy(df):
     # Calculate strategy returns and Sharpe ratio
     df['strategy_return'] = df['capital'].pct_change()
     
-    return df
+    return df, best_atr_multiplier
 
-def create_plot(df):
+def create_plot(df, best_atr_multiplier):
     """Create visualization of strategy results"""
     logger.info("Creating strategy visualization...")
     
@@ -256,10 +256,10 @@ def index():
     try:
         # Fetch and calculate strategy
         df = fetch_btc_data()
-        df = calculate_strategy(df)
+        df, best_atr_multiplier = calculate_strategy(df)
         
         # Create visualization
-        plot_url = create_plot(df)
+        plot_url = create_plot(df, best_atr_multiplier)
         
         # Calculate performance metrics
         final_capital = df['capital'].iloc[-1]
@@ -295,7 +295,7 @@ def api_strategy_data():
     """API endpoint for strategy data"""
     try:
         df = fetch_btc_data()
-        df = calculate_strategy(df)
+        df, best_atr_multiplier = calculate_strategy(df)
         
         # Return basic strategy performance
         final_capital = df['capital'].iloc[-1]
