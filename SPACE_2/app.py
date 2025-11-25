@@ -92,8 +92,8 @@ def fetch_btc_data():
         raise Exception("Failed to fetch BTC data")
 
 def calculate_strategy(df):
-    """Calculate trading strategy - long if price above SMA 365, otherwise short with 0.5 ATR stop-loss"""
-    logger.info("Calculating SMA 365 strategy with 0.5 ATR stop-loss...")
+    """Calculate trading strategy - long if price above SMA 365, otherwise short with optimized ATR stop-loss"""
+    logger.info("Calculating SMA 365 strategy with optimized ATR stop-loss...")
     
     # Calculate 365-day SMA
     df['sma_365'] = df['close'].rolling(window=365).mean()
@@ -110,6 +110,56 @@ def calculate_strategy(df):
     # Calculate daily returns
     df['daily_return'] = df['close'].pct_change()
     
+    # Test ATR multipliers from 0.1 to 5.0 in 0.1 increments
+    atr_multipliers = [round(i * 0.1, 1) for i in range(1, 51)]
+    best_capital = -1
+    best_atr_multiplier = 0.1
+    
+    for atr_multiplier in atr_multipliers:
+        initial_capital = 1000
+        capital_series = [initial_capital]
+        current_position = 0
+        
+        for i in range(1, len(df)):
+            # Determine target position based on SMA strategy
+            target_position = 1 if df['close'].iloc[i] > df['sma_365'].iloc[i] else -1
+            current_position = target_position
+            
+            # Entry price is previous close
+            entry_price = df['close'].iloc[i-1]
+            
+            # Calculate capital based on position and stop-loss conditions
+            prev_capital = capital_series[-1]
+            current_price = df['close'].iloc[i]
+            prev_price = df['close'].iloc[i-1]
+            
+            if current_position == 1:
+                # Long position: capital * current_price / prev_price
+                capital = prev_capital * current_price / prev_price
+                # Stop-loss for long: if low <= entry_price - atr_multiplier * atr, capital reduced proportionally
+                atr_value = df['atr'].iloc[i]
+                if df['low'].iloc[i] <= entry_price - atr_multiplier * atr_value:
+                    capital = prev_capital * (entry_price - atr_multiplier * atr_value) / entry_price
+            elif current_position == -1:
+                # Short position: capital * (2 - current_price / prev_price)
+                capital = prev_capital * (2 - current_price / prev_price)
+                # Stop-loss for short: if high >= entry_price + atr_multiplier * atr, capital reduced proportionally
+                atr_value = df['atr'].iloc[i]
+                if df['high'].iloc[i] >= entry_price + atr_multiplier * atr_value:
+                    capital = prev_capital * (2 - (entry_price + atr_multiplier * atr_value) / entry_price)
+            else:
+                capital = prev_capital
+            
+            capital_series.append(capital)
+        
+        final_capital = capital_series[-1]
+        if final_capital > best_capital:
+            best_capital = final_capital
+            best_atr_multiplier = atr_multiplier
+    
+    logger.info(f"Best ATR multiplier: {best_atr_multiplier} with final capital: {best_capital:.2f}")
+    
+    # Recalculate with best ATR multiplier for final dataframe
     initial_capital = 1000
     capital_series = [initial_capital]
     current_position = 0
@@ -135,18 +185,18 @@ def calculate_strategy(df):
         if current_position == 1:
             # Long position: capital * current_price / prev_price
             capital = prev_capital * current_price / prev_price
-            # Stop-loss for long: if low <= entry_price - 0.8 * atr, capital reduced proportionally
+            # Stop-loss for long: if low <= entry_price - best_atr_multiplier * atr, capital reduced proportionally
             atr_value = df['atr'].iloc[i]
-            if df['low'].iloc[i] <= entry_price - 0.8 * atr_value:
-                capital = prev_capital * (entry_price - 0.8 * atr_value) / entry_price
+            if df['low'].iloc[i] <= entry_price - best_atr_multiplier * atr_value:
+                capital = prev_capital * (entry_price - best_atr_multiplier * atr_value) / entry_price
                 df.loc[df.index[i], 'stop_loss_triggered'] = True
         elif current_position == -1:
             # Short position: capital * (2 - current_price / prev_price)
             capital = prev_capital * (2 - current_price / prev_price)
-            # Stop-loss for short: if high >= entry_price + 0.8 * atr, capital reduced proportionally
+            # Stop-loss for short: if high >= entry_price + best_atr_multiplier * atr, capital reduced proportionally
             atr_value = df['atr'].iloc[i]
-            if df['high'].iloc[i] >= entry_price + 0.8 * atr_value:
-                capital = prev_capital * (2 - (entry_price + 0.8 * atr_value) / entry_price)
+            if df['high'].iloc[i] >= entry_price + best_atr_multiplier * atr_value:
+                capital = prev_capital * (2 - (entry_price + best_atr_multiplier * atr_value) / entry_price)
                 df.loc[df.index[i], 'stop_loss_triggered'] = True
         else:
             capital = prev_capital
