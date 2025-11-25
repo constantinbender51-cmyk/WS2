@@ -110,9 +110,9 @@ def calculate_strategy(df):
     # Calculate daily returns
     df['daily_return'] = df['close'].pct_change()
     
-    # Use fixed ATR multiplier of 3.2 and leverage of 1
+    # Use fixed ATR multiplier of 3.2 and leverage of 3
     atr_multiplier = 3.2
-    leverage = 1
+    leverage = 3
     logger.info(f"Using fixed ATR multiplier: {atr_multiplier} and leverage: {leverage}")
     
     initial_capital = 1000
