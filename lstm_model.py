@@ -187,7 +187,7 @@ def train_model():
         LSTM(100, return_sequences=False),
         Dropout(0.5),
         Dense(50, activation='relu', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4)),
-        Dense(1, activation='linear', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4))  # Linear activation for regression; adjust if sma_position is categorical
+        Dense(1, activation='tanh', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4))  # Tanh activation to constrain outputs to [-1, 1]
     ])
 
     # Compile the model
@@ -207,8 +207,9 @@ def train_model():
     # Predict on the test set
     y_pred = model.predict(X_test_scaled)
 
-    # If sma_position is categorical (e.g., -1, 0, 1), round predictions to nearest integer
-    y_pred_rounded = np.round(y_pred).astype(int)
+    # If sma_position is categorical (e.g., -1, 0, 1), clip and round predictions to nearest integer in range [-1, 1]
+    y_pred_clipped = np.clip(y_pred, -1, 1)
+    y_pred_rounded = np.round(y_pred_clipped).astype(int)
 
     # Calculate performance metrics
     accuracy = accuracy_score(y_test, y_pred_rounded)
