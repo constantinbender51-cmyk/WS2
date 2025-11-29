@@ -57,11 +57,11 @@ X_test_scaled = scaler.transform(X_test_reshaped).reshape(X_test.shape)
 
 # Build the LSTM model
 model = Sequential([
-    LSTM(50, return_sequences=True, input_shape=(X_train_scaled.shape[1], 1)),
+    LSTM(100, return_sequences=True, input_shape=(X_train_scaled.shape[1], 1)),
     Dropout(0.5),
-    LSTM(50, return_sequences=False),
+    LSTM(100, return_sequences=False),
     Dropout(0.5),
-    Dense(25, activation='relu', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4)),
+    Dense(50, activation='relu', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4)),
     Dense(1, activation='linear', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4))  # Linear activation for regression; adjust if sma_position is categorical
 ])
 
@@ -69,7 +69,7 @@ model = Sequential([
 model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])  # Adjust loss if needed for classification
 
 # Train the model
-history = model.fit(X_train_scaled, y_train, batch_size=32, epochs=10, validation_data=(X_test_scaled, y_test), verbose=1)
+history = model.fit(X_train_scaled, y_train, batch_size=256, epochs=10, validation_data=(X_test_scaled, y_test), verbose=1)
 
 # Predict on the test set
 y_pred = model.predict(X_test_scaled)
