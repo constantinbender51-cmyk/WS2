@@ -71,7 +71,7 @@ html_template = '''
                     const progressPercent = (data.current_epoch / data.total_epochs) * 100;
                     document.getElementById('epoch_progress').style.width = progressPercent + '%';
                     
-                    if (data.status === 'completed') {
+                    if (data.status === 'running' || data.status === 'completed') {
                         document.getElementById('charts').style.display = 'block';
                         updateCharts(data);
                     } else {
@@ -84,12 +84,16 @@ html_template = '''
         function updateCharts(data) {
             // Loss chart
             const lossCtx = document.getElementById('lossChart').getContext('2d');
-            new Chart(lossCtx, {
+            // Destroy existing chart if it exists to avoid duplicates
+            if (window.lossChartInstance) {
+                window.lossChartInstance.destroy();
+            }
+            window.lossChartInstance = new Chart(lossCtx, {
                 type: 'line',
                 data: {
                     labels: Array.from({length: data.train_loss.length}, (_, i) => i + 1),
                     datasets: [
-                        { label: 'Train Loss', data: data.train_loss, borderColor: 'blue', fill: false },
+                        { label: 'Training Loss', data: data.train_loss, borderColor: 'blue', fill: false },
                         { label: 'Validation Loss', data: data.val_loss, borderColor: 'red', fill: false }
                     ]
                 },
@@ -98,7 +102,10 @@ html_template = '''
             
             // Training Prediction chart
             const trainPredCtx = document.getElementById('trainPredictionChart').getContext('2d');
-            new Chart(trainPredCtx, {
+            if (window.trainPredictionChartInstance) {
+                window.trainPredictionChartInstance.destroy();
+            }
+            window.trainPredictionChartInstance = new Chart(trainPredCtx, {
                 type: 'line',
                 data: {
                     labels: Array.from({length: data.train_predictions.length}, (_, i) => i),
@@ -112,7 +119,10 @@ html_template = '''
             
             // Test Prediction chart
             const testPredCtx = document.getElementById('testPredictionChart').getContext('2d');
-            new Chart(testPredCtx, {
+            if (window.testPredictionChartInstance) {
+                window.testPredictionChartInstance.destroy();
+            }
+            window.testPredictionChartInstance = new Chart(testPredCtx, {
                 type: 'line',
                 data: {
                     labels: Array.from({length: data.test_predictions.length}, (_, i) => i),
@@ -136,7 +146,7 @@ html_template = '''
 @app.route('/')
 def index():
     progress_percent = (training_progress['current_epoch'] / training_progress['total_epochs']) * 100 if training_progress['total_epochs'] > 0 else 0
-    charts_display = 'block' if training_progress['status'] == 'completed' else 'none'
+    charts_display = 'block' if training_progress['status'] in ['running', 'completed'] else 'none'
     return render_template_string(html_template, 
                                   status=training_progress['status'],
                                   current_epoch=training_progress['current_epoch'],
