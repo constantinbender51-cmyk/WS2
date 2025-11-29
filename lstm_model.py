@@ -218,14 +218,6 @@ def train_model():
     print(f"Mean Squared Error: {mse:.4f}")
     print(f"Mean Absolute Error: {mae:.4f}")
 
-    # Print metrics
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1-Score: {f1:.4f}")
-    print("Confusion Matrix:")
-    print(conf_matrix)
-
     # Update progress with predictions and test data
     training_progress['predictions'] = y_pred_continuous.tolist()
     training_progress['y_test'] = y_test.tolist()
