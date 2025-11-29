@@ -294,19 +294,19 @@ def index():
                     <h3>Training Performance</h3>
                     <div class="metric-row">
                         <span>Naive Bayes:</span>
-                        <strong>${{nb_train_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(nb_train_final) }}</strong>
                     </div>
                     <div class="metric-row">
                         <span>Random Forest:</span>
-                        <strong>${{rf_train_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(rf_train_final) }}</strong>
                     </div>
                     <div class="metric-row">
                         <span>Neural Network:</span>
-                        <strong>${{nn_train_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(nn_train_final) }}</strong>
                     </div>
                     <div class="metric-row">
                         <span>Perfect Strategy:</span>
-                        <strong>${{perfect_train_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(perfect_train_final) }}</strong>
                     </div>
                 </div>
                 
@@ -314,24 +314,24 @@ def index():
                     <h3>Test Performance</h3>
                     <div class="metric-row">
                         <span>Naive Bayes:</span>
-                        <strong>${{nb_test_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(nb_test_final) }}</strong>
                     </div>
                     <div class="metric-row">
                         <span>Random Forest:</span>
-                        <strong>${{rf_test_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(rf_test_final) }}</strong>
                     </div>
                     <div class="metric-row">
                         <span>Neural Network:</span>
-                        <strong>${{nn_test_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(nn_test_final) }}</strong>
                     </div>
                     <div class="metric-row">
                         <span>Perfect Strategy:</span>
-                        <strong>${{perfect_test_final:.2f}}</strong>
+                        <strong>${{ "%.2f"|format(perfect_test_final) }}</strong>
                     </div>
                 </div>
             </div>
             
-            <img src="data:image/png;base64,{{plot_data}}" alt="Trading Analysis">
+            <img src="data:image/png;base64,{{ plot_data }}" alt="Trading Analysis">
         </div>
     </body>
     </html>
