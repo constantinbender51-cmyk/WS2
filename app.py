@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.naive_bayes import GaussianNB
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 import matplotlib.pyplot as plt
 from flask import Flask, render_template_string
@@ -35,17 +35,16 @@ ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
 for col in tqdm(ohlcv_cols, desc="Computing returns"):
     df[f'{col}_return'] = df[col].pct_change()
 
-# Feature Engineering - Technical Indicators
+# Feature Engineering
 print("\n[2/6] Engineering advanced features...")
-
 features_progress = tqdm(total=8, desc="Creating features")
 
-# Rolling volatility (5, 10, 20 day windows)
+# Rolling volatility
 for window in [5, 10, 20]:
     df[f'volatility_{window}'] = df['close_return'].rolling(window=window).std()
 features_progress.update(1)
 
-# Momentum indicators (Rate of Change)
+# Momentum indicators
 for window in [5, 10, 20]:
     df[f'momentum_{window}'] = df['close'].pct_change(periods=window)
 features_progress.update(1)
@@ -65,13 +64,13 @@ for window in [5, 10, 20]:
     df[f'volume_price_corr_{window}'] = df['close_return'].rolling(window).corr(df['volume_return'].rolling(window).mean())
 features_progress.update(1)
 
-# High-Low spread (volatility measure)
+# High-Low spread
 df['hl_spread'] = (df['high'] - df['low']) / df['close']
 for window in [5, 10]:
     df[f'hl_spread_ma_{window}'] = df['hl_spread'].rolling(window).mean()
 features_progress.update(1)
 
-# Volume ratio (current vs moving average)
+# Volume ratio
 for window in [5, 10, 20]:
     df[f'volume_ratio_{window}'] = df['volume'] / df['volume'].rolling(window).mean()
 
@@ -95,11 +94,11 @@ features_progress.update(1)
 features_progress.close()
 
 # Create lagged features
-print("\n[3/6] Creating lagged features (this may take a moment)...")
+print("\n[3/6] Creating lagged features...")
 lag_days = 30
 feature_cols = []
 
-# Lagged OHLCV returns with progress bar
+# Lagged OHLCV returns
 for col in tqdm(ohlcv_cols, desc="Lagging OHLCV"):
     for lag in range(1, lag_days + 1):
         lag_col = f'{col}_return_lag_{lag}'
@@ -122,13 +121,13 @@ print(f"\n[4/6] Cleaning data...")
 print(f"  Rows before removing NaN: {len(df)}")
 df = df.dropna()
 print(f"  Rows after removing NaN: {len(df)}")
-print(f"  ✓ Total features engineered: {len(feature_cols)}")
+print(f"  ✓ Total features: {len(feature_cols)}")
 
 # Prepare features and target
 X = df[feature_cols].values
 y = df['perfect_position'].values
 
-# Train/test split (70/30 time-series split)
+# Train/test split
 split_idx = int(len(X) * 0.7)
 X_train, X_test = X[:split_idx], X[split_idx:]
 y_train, y_test = y[:split_idx], y[split_idx:]
@@ -143,16 +142,15 @@ scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
-# Training models with progress tracking
+# Training models
 print("\n" + "="*70)
-print("TRAINING DEEP MODELS (High Complexity)")
+print("TRAINING DEEP MODELS")
 print("="*70)
 
-# Time Series Cross-Validation
 tscv = TimeSeriesSplit(n_splits=3)
 
-# 1. Deep Neural Network with many layers
-print("\n[1/5] Training Deep Neural Network (5 layers, 500+ neurons)...")
+# 1. Deep Neural Network
+print("\n[1/5] Training Deep Neural Network...")
 deep_nn_configs = [
     {'hidden_layer_sizes': (500, 250, 125, 64, 32), 'alpha': 0.0001, 'learning_rate_init': 0.001},
     {'hidden_layer_sizes': (400, 200, 100, 50), 'alpha': 0.0001, 'learning_rate_init': 0.001},
@@ -179,11 +177,11 @@ for params in tqdm(deep_nn_configs, desc="Tuning Deep NN"):
         best_deep_nn_score = mean_score
         best_deep_nn_params = params
 
-print(f"  ✓ Best Deep NN params: {best_deep_nn_params}")
+print(f"  ✓ Best params: {best_deep_nn_params}")
 print(f"  ✓ CV Score: {best_deep_nn_score:.4f}")
 
-# 2. Very Deep Random Forest
-print("\n[2/5] Training Large Random Forest (500 trees)...")
+# 2. Large Random Forest
+print("\n[2/5] Training Large Random Forest...")
 large_rf_configs = [
     {'n_estimators': 500, 'max_depth': 30, 'min_samples_split': 5, 'min_samples_leaf': 2},
     {'n_estimators': 300, 'max_depth': 40, 'min_samples_split': 3, 'min_samples_leaf': 1},
@@ -208,10 +206,10 @@ for params in tqdm(large_rf_configs, desc="Tuning Large RF"):
         best_large_rf_score = mean_score
         best_large_rf_params = params
 
-print(f"  ✓ Best Large RF params: {best_large_rf_params}")
+print(f"  ✓ Best params: {best_large_rf_params}")
 print(f"  ✓ CV Score: {best_large_rf_score:.4f}")
 
-# 3. Gradient Boosting (complex)
+# 3. Gradient Boosting
 print("\n[3/5] Training Gradient Boosting...")
 gb_configs = [
     {'n_estimators': 300, 'max_depth': 7, 'learning_rate': 0.05, 'subsample': 0.8},
@@ -222,7 +220,7 @@ gb_configs = [
 best_gb_score = 0
 best_gb_params = None
 
-for params in tqdm(gb_configs, desc="Tuning Gradient Boost"):
+for params in tqdm(gb_configs, desc="Tuning GB"):
     scores = []
     for train_idx, val_idx in tscv.split(X_train_scaled):
         X_tr, X_val = X_train_scaled[train_idx], X_train_scaled[val_idx]
@@ -237,11 +235,11 @@ for params in tqdm(gb_configs, desc="Tuning Gradient Boost"):
         best_gb_score = mean_score
         best_gb_params = params
 
-print(f"  ✓ Best GB params: {best_gb_params}")
+print(f"  ✓ Best params: {best_gb_params}")
 print(f"  ✓ CV Score: {best_gb_score:.4f}")
 
 # 4. Wide Neural Network
-print("\n[4/5] Training Wide Neural Network (fewer layers, more neurons)...")
+print("\n[4/5] Training Wide Neural Network...")
 wide_nn_configs = [
     {'hidden_layer_sizes': (1000, 500), 'alpha': 0.0001, 'learning_rate_init': 0.001},
     {'hidden_layer_sizes': (800, 400), 'alpha': 0.0001, 'learning_rate_init': 0.001},
@@ -268,14 +266,14 @@ for params in tqdm(wide_nn_configs, desc="Tuning Wide NN"):
         best_wide_nn_score = mean_score
         best_wide_nn_params = params
 
-print(f"  ✓ Best Wide NN params: {best_wide_nn_params}")
+print(f"  ✓ Best params: {best_wide_nn_params}")
 print(f"  ✓ CV Score: {best_wide_nn_score:.4f}")
 
-# 5. Naive Bayes (baseline)
-print("\n[5/5] Training Naive Bayes (baseline)...")
+# 5. Naive Bayes
+print("\n[5/5] Training Naive Bayes...")
 best_nb_params = 1e-7
 
-# Train all final models
+# Train final models
 print("\n" + "="*70)
 print("TRAINING FINAL MODELS")
 print("="*70)
@@ -293,7 +291,7 @@ models_to_train = [
 trained_models = {}
 predictions = {}
 
-for name, model in tqdm(models_to_train, desc="Training final models"):
+for name, model in tqdm(models_to_train, desc="Training models"):
     model.fit(X_train_scaled, y_train)
     train_pred = model.predict(X_train_scaled)
     test_pred = model.predict(X_test_scaled)
@@ -312,7 +310,7 @@ for name, model in tqdm(models_to_train, desc="Training final models"):
 
 # Ensemble Model
 print("\n" + "="*70)
-print("CREATING ENSEMBLE MODEL")
+print("CREATING ENSEMBLE")
 print("="*70)
 
 ensemble = VotingClassifier(
@@ -325,7 +323,7 @@ ensemble = VotingClassifier(
     voting='hard'
 )
 
-print("Training ensemble (this may take a moment)...")
+print("Training ensemble...")
 ensemble.fit(X_train_scaled, y_train)
 ensemble_train_pred = ensemble.predict(X_train_scaled)
 ensemble_test_pred = ensemble.predict(X_test_scaled)
@@ -337,7 +335,7 @@ predictions['Ensemble'] = {
     'test_acc': accuracy_score(y_test, ensemble_test_pred)
 }
 
-print(f"\nEnsemble Model:")
+print(f"\nEnsemble:")
 print(f"  Train Accuracy: {predictions['Ensemble']['train_acc']:.4f}")
 print(f"  Test Accuracy: {predictions['Ensemble']['test_acc']:.4f}")
 
@@ -366,11 +364,11 @@ def simulate_trading(predictions, actual_prices, starting_capital=1000):
     return np.array(capital_history)
 
 print("\n" + "="*70)
-print("SIMULATING TRADING STRATEGIES")
+print("SIMULATING TRADES")
 print("="*70)
 
 capital_results = {}
-for name in tqdm(predictions.keys(), desc="Simulating trades"):
+for name in tqdm(predictions.keys(), desc="Simulating"):
     capital_results[name] = {
         'train': simulate_trading(predictions[name]['train'], train_prices),
         'test': simulate_trading(predictions[name]['test'], test_prices)
@@ -379,7 +377,7 @@ for name in tqdm(predictions.keys(), desc="Simulating trades"):
 perfect_train_capital = simulate_trading(y_train, train_prices)
 perfect_test_capital = simulate_trading(y_test, test_prices)
 
-# Calculate returns (fix the math!)
+# Calculate returns
 def calculate_return(final_capital, initial_capital=1000):
     return ((final_capital - initial_capital) / initial_capital) * 100
 
@@ -392,7 +390,7 @@ for name in predictions.keys():
     final = capital_results[name]['train'][-1]
     ret = calculate_return(final)
     print(f"  {name}: ${final:.2f} ({ret:+.1f}%)")
-print(f"  Perfect Strategy: ${perfect_train_capital[-1]:.2f} ({calculate_return(perfect_train_capital[-1]):+.1f}%)")
+print(f"  Perfect: ${perfect_train_capital[-1]:.2f} ({calculate_return(perfect_train_capital[-1]):+.1f}%)")
 
 print("\nTest Performance:")
 for name in predictions.keys():
@@ -400,7 +398,7 @@ for name in predictions.keys():
     ret = calculate_return(final)
     pct_of_perfect = (final / perfect_test_capital[-1]) * 100
     print(f"  {name}: ${final:.2f} ({ret:+.1f}%) - {pct_of_perfect:.1f}% of perfect")
-print(f"  Perfect Strategy: ${perfect_test_capital[-1]:.2f} ({calculate_return(perfect_test_capital[-1]):+.1f}%)")
+print(f"  Perfect: ${perfect_test_capital[-1]:.2f} ({calculate_return(perfect_test_capital[-1]):+.1f}%)")
 
 # Visualization
 def create_plots():
@@ -412,7 +410,7 @@ def create_plots():
     for name in ['Deep NN', 'Large RF', 'Ensemble']:
         ax1.plot(predictions[name]['train'], label=name, alpha=0.7)
     ax1.plot(y_train, label='Perfect', linewidth=2, alpha=0.8)
-    ax1.set_title('Training: Model Predictions vs Perfect', fontsize=12, fontweight='bold')
+    ax1.set_title('Training: Predictions vs Perfect', fontsize=12, fontweight='bold')
     ax1.set_xlabel('Time')
     ax1.set_ylabel('Position')
     ax1.legend()
@@ -423,7 +421,7 @@ def create_plots():
     for name in ['Deep NN', 'Large RF', 'Ensemble']:
         ax2.plot(predictions[name]['test'], label=name, alpha=0.7)
     ax2.plot(y_test, label='Perfect', linewidth=2, alpha=0.8)
-    ax2.set_title('Test: Model Predictions vs Perfect', fontsize=12, fontweight='bold')
+    ax2.set_title('Test: Predictions vs Perfect', fontsize=12, fontweight='bold')
     ax2.set_xlabel('Time')
     ax2.set_ylabel('Position')
     ax2.legend()
@@ -432,7 +430,7 @@ def create_plots():
     # Training price
     ax3 = fig.add_subplot(gs[1, 0])
     ax3.plot(train_prices, color='black', linewidth=1)
-    ax3.set_title('Training: Price Movement', fontsize=12, fontweight='bold')
+    ax3.set_title('Training: Price', fontsize=12, fontweight='bold')
     ax3.set_xlabel('Time')
     ax3.set_ylabel('Price')
     ax3.grid(True, alpha=0.3)
@@ -440,7 +438,7 @@ def create_plots():
     # Test price
     ax4 = fig.add_subplot(gs[1, 1])
     ax4.plot(test_prices, color='black', linewidth=1)
-    ax4.set_title('Test: Price Movement', fontsize=12, fontweight='bold')
+    ax4.set_title('Test: Price', fontsize=12, fontweight='bold')
     ax4.set_xlabel('Time')
     ax4.set_ylabel('Price')
     ax4.grid(True, alpha=0.3)
@@ -450,7 +448,7 @@ def create_plots():
     for name in capital_results.keys():
         ax5.plot(capital_results[name]['train'], label=name, alpha=0.7)
     ax5.plot(perfect_train_capital, label='Perfect', linewidth=2, color='gold')
-    ax5.set_title('Training: Capital Over Time', fontsize=12, fontweight='bold')
+    ax5.set_title('Training: Capital', fontsize=12, fontweight='bold')
     ax5.set_xlabel('Time')
     ax5.set_ylabel('Capital ($)')
     ax5.legend()
@@ -461,7 +459,7 @@ def create_plots():
     for name in capital_results.keys():
         ax6.plot(capital_results[name]['test'], label=name, alpha=0.7)
     ax6.plot(perfect_test_capital, label='Perfect', linewidth=2, color='gold')
-    ax6.set_title('Test: Capital Over Time', fontsize=12, fontweight='bold')
+    ax6.set_title('Test: Capital', fontsize=12, fontweight='bold')
     ax6.set_xlabel('Time')
     ax6.set_ylabel('Capital ($)')
     ax6.legend()
@@ -476,16 +474,16 @@ def create_plots():
     x = np.arange(len(model_names))
     width = 0.35
     
-    ax7.bar(x - width/2, train_accs, width, label='Train Accuracy', alpha=0.8)
-    ax7.bar(x + width/2, test_accs, width, label='Test Accuracy', alpha=0.8)
+    ax7.bar(x - width/2, train_accs, width, label='Train', alpha=0.8)
+    ax7.bar(x + width/2, test_accs, width, label='Test', alpha=0.8)
     ax7.set_ylabel('Accuracy')
-    ax7.set_title('Model Accuracy Comparison', fontsize=12, fontweight='bold')
+    ax7.set_title('Model Accuracy', fontsize=12, fontweight='bold')
     ax7.set_xticks(x)
     ax7.set_xticklabels(model_names, rotation=15, ha='right')
     ax7.legend()
     ax7.grid(True, alpha=0.3, axis='y')
     
-    plt.suptitle('Deep Learning Trading Models - High Complexity', fontsize=16, fontweight='bold', y=0.995)
+    plt.suptitle('Deep Learning Trading Models', fontsize=16, fontweight='bold', y=0.995)
     
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
@@ -507,9 +505,9 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Deep Learning Trading Models</title>
+        <title>Deep Learning Trading</title>
         <style>
-            body { font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+            body { font-family: Arial, sans-serif; margin: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
             h1 { color: white; text-align: center; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
             .container { max-width: 1600px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }
             .info { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; margin-bottom: 25px; }
@@ -525,16 +523,16 @@ def index():
         </style>
     </head>
     <body>
-        <h1>🚀 Deep Learning Trading Models Dashboard</h1>
+        <h1>🚀 Deep Learning Trading Dashboard</h1>
         <div class="container">
             <div class="info">
-                <strong>🧠 Model Architecture:</strong> Deep NN (5 layers, 500+ neurons), Large RF (500 trees), Gradient Boosting (400 estimators), Wide NN (1000+ neurons), Ensemble Voting
-                <br><strong>📊 Features:</strong> {{ total_features }} engineered features (OHLCV returns + 30 lags, volatility, momentum, RSI, Bollinger Bands, volume ratios)
+                <strong>🧠 Models:</strong> Deep NN (5 layers), Large RF (500 trees), Gradient Boost, Wide NN, Ensemble
+                <br><strong>📊 Features:</strong> {{ total_features }} (OHLCV + 30 lags, volatility, momentum, RSI, Bollinger Bands)
             </div>
             
             <div class="metrics">
                 <div class="metric-box">
-                    <h3>📈 Training Performance</h3>
+                    <h3>📈 Training</h3>
                     {% for name, data in train_results.items() %}
                     <div class="metric-row">
                         <span>{{ name }}:</span>
@@ -542,13 +540,13 @@ def index():
                     </div>
                     {% endfor %}
                     <div class="metric-row">
-                        <span><strong>Perfect Strategy:</strong></span>
+                        <span><strong>Perfect:</strong></span>
                         <span class="perfect">${{ "%.2f"|format(perfect_train_final) }} ({{ "%+.1f"|format(perfect_train_return) }}%)</span>
                     </div>
                 </div>
                 
                 <div class="metric-box">
-                    <h3>🎯 Test Performance</h3>
+                    <h3>🎯 Test</h3>
                     {% for name, data in test_results.items() %}
                     <div class="metric-row">
                         <span>{{ name }}:</span>
@@ -556,13 +554,13 @@ def index():
                     </div>
                     {% endfor %}
                     <div class="metric-row">
-                        <span><strong>Perfect Strategy:</strong></span>
+                        <span><strong>Perfect:</strong></span>
                         <span class="perfect">${{ "%.2f"|format(perfect_test_final) }} ({{ "%+.1f"|format(perfect_test_return) }}%)</span>
                     </div>
                 </div>
             </div>
             
-            <img src="data:image/png;base64,{{ plot_data }}" alt="Trading Analysis">
+            <img src="data:image/png;base64,{{ plot_data }}" alt="Analysis">
         </div>
     </body>
     </html>
@@ -596,3 +594,10 @@ def index():
         perfect_test_final=perfect_test_capital[-1],
         perfect_test_return=calculate_return(perfect_test_capital[-1]),
         total_features=len(feature_cols)
+    )
+
+if __name__ == '__main__':
+    print("\n" + "="*70)
+    print("🌐 Starting web server on http://0.0.0.0:8080")
+    print("="*70 + "\n")
+    app.run(host='0.0.0.0', port=8080, debug=False)
