@@ -1,7 +1,0 @@
-Flask
-pandas
-numpy
-gdown
-scikit-learn
-matplotlib
-tqdm
