@@ -69,7 +69,7 @@ model = Sequential([
 model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])  # Adjust loss if needed for classification
 
 # Train the model
-history = model.fit(X_train_scaled, y_train, batch_size=256, epochs=10, validation_data=(X_test_scaled, y_test), verbose=1)
+history = model.fit(X_train_scaled, y_train, batch_size=256, epochs=20, validation_data=(X_test_scaled, y_test), verbose=1)
 
 # Predict on the test set
 y_pred = model.predict(X_test_scaled)
