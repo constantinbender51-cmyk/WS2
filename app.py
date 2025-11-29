@@ -1,8 +1,10 @@
 import pandas as pd
 import requests
-from flask import Flask, send_file
+from flask import Flask, send_file, render_template_string
 import io
 from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import base64
 
 app = Flask(__name__)
 
@@ -76,17 +78,53 @@ def generate_data():
     df.reset_index(inplace=True)
     return df
 
+# Generate plot
+def generate_plot():
+    df = generate_data()
+    # Create the plot
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['timestamp'], df['close'], label='Close Price', color='blue')
+    plt.title('Binance OHLCV Data - Close Price and SMA Position')
+    plt.xlabel('Date')
+    plt.ylabel('Price (USD)')
+    plt.legend()
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    # Save plot to a bytes buffer
+    img = io.BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
+    plt.close()
+    
+    # Encode image to base64 for embedding in HTML
+    plot_url = base64.b64encode(img.getvalue()).decode('utf8')
+    return plot_url
+
 @app.route('/')
 def index():
-    return '<h1>Binance OHLCV Data with SMA Position</h1><p><a href="/download">Download CSV</a></p>'
+    return '<h1>Binance OHLCV Data with SMA Position</h1><p><a href="/download">Download CSV</a></p><p><a href="/plot">View Plot</a></p>'
 
 @app.route('/download')
 def download_csv():
     df = generate_data()
+    # Exclude SMA columns from CSV
+    df_csv = df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 'sma_position']]
     output = io.BytesIO()
-    df.to_csv(output, index=False)
+    df_csv.to_csv(output, index=False)
     output.seek(0)
     return send_file(output, as_attachment=True, download_name='binance_data_sma.csv', mimetype='text/csv')
+
+@app.route('/plot')
+def plot_data():
+    plot_url = generate_plot()
+    html_content = f'''
+    <h1>Binance OHLCV Data Plot</h1>
+    <img src="data:image/png;base64,{plot_url}" alt="OHLCV Plot">
+    <p><a href="/">Back to Home</a></p>
+    '''
+    return render_template_string(html_content)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
