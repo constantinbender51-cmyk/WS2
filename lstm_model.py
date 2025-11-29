@@ -20,8 +20,10 @@ training_progress = {
     'total_epochs': 20,
     'train_loss': [],
     'val_loss': [],
-    'predictions': [],
-    'y_test': []
+    'train_predictions': [],
+    'train_actual': [],
+    'test_predictions': [],
+    'test_actual': []
 }
 
 app = Flask(__name__)
@@ -92,15 +94,29 @@ html_template = '''
                 options: { responsive: true, scales: { y: { beginAtZero: true } } }
             });
             
-            // Prediction chart
-            const predCtx = document.getElementById('predictionChart').getContext('2d');
-            new Chart(predCtx, {
+            // Training Prediction chart
+            const trainPredCtx = document.getElementById('trainPredictionChart').getContext('2d');
+            new Chart(trainPredCtx, {
                 type: 'line',
                 data: {
-                    labels: Array.from({length: data.predictions.length}, (_, i) => i),
+                    labels: Array.from({length: data.train_predictions.length}, (_, i) => i),
                     datasets: [
-                        { label: 'Predictions', data: data.predictions, borderColor: 'green', fill: false },
-                        { label: 'Actual', data: data.y_test, borderColor: 'orange', fill: false }
+                        { label: 'Training Predictions', data: data.train_predictions, borderColor: 'green', fill: false },
+                        { label: 'Training Actual', data: data.train_actual, borderColor: 'orange', fill: false }
+                    ]
+                },
+                options: { responsive: true }
+            });
+            
+            // Test Prediction chart
+            const testPredCtx = document.getElementById('testPredictionChart').getContext('2d');
+            new Chart(testPredCtx, {
+                type: 'line',
+                data: {
+                    labels: Array.from({length: data.test_predictions.length}, (_, i) => i),
+                    datasets: [
+                        { label: 'Test Predictions', data: data.test_predictions, borderColor: 'blue', fill: false },
+                        { label: 'Test Actual', data: data.test_actual, borderColor: 'red', fill: false }
                     ]
                 },
                 options: { responsive: true }
@@ -199,6 +215,15 @@ def train_model():
             training_progress['current_epoch'] = epoch + 1
             training_progress['train_loss'].append(logs.get('loss'))
             training_progress['val_loss'].append(logs.get('val_loss'))
+            
+            # Get training predictions for this epoch
+            train_pred = self.model.predict(X_train_scaled, verbose=0)
+            train_pred_continuous = train_pred.flatten()
+            
+            # Store training predictions and actual values
+            training_progress['train_predictions'] = train_pred_continuous.tolist()
+            training_progress['train_actual'] = y_train.tolist()
+            
             time.sleep(0.1)  # Small delay to allow progress updates
 
     # Train the model
@@ -219,8 +244,8 @@ def train_model():
     print(f"Mean Absolute Error: {mae:.4f}")
 
     # Update progress with predictions and test data
-    training_progress['predictions'] = y_pred_continuous.tolist()
-    training_progress['y_test'] = y_test.tolist()
+    training_progress['test_predictions'] = y_pred_continuous.tolist()
+    training_progress['test_actual'] = y_test.tolist()
     training_progress['status'] = 'completed'
 
     # Save the model if needed
