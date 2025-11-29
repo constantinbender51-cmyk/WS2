@@ -7,6 +7,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.regularizers import l1_l2
 
 # Download the CSV file from Google Drive
 url = 'https://drive.google.com/uc?id=1QsfDXX4ueu4_IkPKp36EnDHnpZUR19yG'
@@ -57,11 +58,11 @@ X_test_scaled = scaler.transform(X_test_reshaped).reshape(X_test.shape)
 # Build the LSTM model
 model = Sequential([
     LSTM(50, return_sequences=True, input_shape=(X_train_scaled.shape[1], 1)),
-    Dropout(0.2),
+    Dropout(0.5),
     LSTM(50, return_sequences=False),
-    Dropout(0.2),
-    Dense(25, activation='relu'),
-    Dense(1, activation='linear')  # Linear activation for regression; adjust if sma_position is categorical
+    Dropout(0.5),
+    Dense(25, activation='relu', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4)),
+    Dense(1, activation='linear', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4))  # Linear activation for regression; adjust if sma_position is categorical
 ])
 
 # Compile the model
