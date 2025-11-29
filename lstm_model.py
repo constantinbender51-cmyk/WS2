@@ -184,7 +184,7 @@ def train_model():
     close_prices = data['close'].values
     sma_positions = data['sma_position'].values
 
-    # Calculate 120-day SMA
+    # Calculate 120-day SMA and handle NaN values
     data['sma_120'] = data['close'].rolling(window=120).mean()
     
     # Create sequences of 22 days for features (reduced by factor of 2)
@@ -194,6 +194,11 @@ def train_model():
         # Features: close prices and SMA values for past 22 days
         close_features = close_prices[i-22:i]
         sma_features = data['sma_120'].values[i-22:i]
+        
+        # Skip if any NaN values in the sequence
+        if np.any(np.isnan(close_features)) or np.any(np.isnan(sma_features)):
+            continue
+            
         # Combine close prices and SMA as features
         combined_features = np.column_stack((close_features, sma_features))
         X.append(combined_features)
@@ -217,18 +222,30 @@ def train_model():
     X_train_scaled = scaler.transform(X_train_reshaped).reshape(X_train.shape)
     X_test_scaled = scaler.transform(X_test_reshaped).reshape(X_test.shape)
 
-    # Build the LSTM model
+    # Check for NaN values in the data
+    if np.any(np.isnan(X_train_scaled)) or np.any(np.isnan(y_train)):
+        print("Warning: NaN values detected in training data")
+        X_train_scaled = np.nan_to_num(X_train_scaled)
+        y_train = np.nan_to_num(y_train)
+    
+    if np.any(np.isnan(X_test_scaled)) or np.any(np.isnan(y_test)):
+        print("Warning: NaN values detected in test data")
+        X_test_scaled = np.nan_to_num(X_test_scaled)
+        y_test = np.nan_to_num(y_test)
+
+    # Build the LSTM model with reduced complexity and no strong regularization
     model = Sequential([
-        LSTM(100, return_sequences=True, input_shape=(X_train_scaled.shape[1], 2)),
-        Dropout(0.5),
-        LSTM(100, return_sequences=False),
-        Dropout(0.5),
-        Dense(50, activation='relu', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4)),
-        Dense(1, activation='tanh', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-4))  # Tanh activation to constrain outputs to [-1, 1]
+        LSTM(64, return_sequences=True, input_shape=(X_train_scaled.shape[1], 2)),
+        Dropout(0.3),
+        LSTM(32, return_sequences=False),
+        Dropout(0.3),
+        Dense(16, activation='relu'),
+        Dense(1, activation='linear')  # Linear activation for regression
     ])
 
-    # Compile the model
-    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])  # Adjust loss if needed for classification
+    # Compile the model with gradient clipping
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, clipvalue=1.0)
+    model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mae'])
 
     # Custom callback to update progress
     class ProgressCallback(tf.keras.callbacks.Callback):
