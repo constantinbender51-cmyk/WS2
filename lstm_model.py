@@ -267,9 +267,15 @@ def train_model():
             train_pred = self.model.predict(X_train_scaled, verbose=0)
             train_pred_continuous = train_pred.flatten()
             
-            # Store training predictions and actual values
+            # Get test predictions for this epoch
+            test_pred = self.model.predict(X_test_scaled, verbose=0)
+            test_pred_continuous = test_pred.flatten()
+            
+            # Store training and test predictions and actual values
             training_progress['train_predictions'] = train_pred_continuous.tolist()
             training_progress['train_actual'] = y_train.tolist()
+            training_progress['test_predictions'] = test_pred_continuous.tolist()
+            training_progress['test_actual'] = y_test.tolist()
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
