@@ -521,8 +521,10 @@ def index():
         nn_test_pct=nn_test_capital[-1]/perfect_test_capital[-1]*100
     )
 
+    )
+
 if __name__ == '__main__':
-    print("\n" + "="*50)
-    print("Starting web server on http://0.0.0.0:8080")
-    print("="*50 + "\n")
+    print("\n" + "="*70)
+    print("🌐 Starting web server on http://0.0.0.0:8080")
+    print("="*70 + "\n")
     app.run(host='0.0.0.0', port=8080, debug=False)
