@@ -207,16 +207,16 @@ def train_model():
     # Predict on the test set
     y_pred = model.predict(X_test_scaled)
 
-    # If sma_position is categorical (e.g., -1, 0, 1), clip and round predictions to nearest integer in range [-1, 1]
-    y_pred_clipped = np.clip(y_pred, -1, 1)
-    y_pred_rounded = np.round(y_pred_clipped).astype(int)
+    # Use raw continuous predictions for sma_position in range [-1, 1]
+    y_pred_continuous = y_pred.flatten()
 
-    # Calculate performance metrics
-    accuracy = accuracy_score(y_test, y_pred_rounded)
-    precision = precision_score(y_test, y_pred_rounded, average='weighted', zero_division=0)
-    recall = recall_score(y_test, y_pred_rounded, average='weighted', zero_division=0)
-    f1 = f1_score(y_test, y_pred_rounded, average='weighted', zero_division=0)
-    conf_matrix = confusion_matrix(y_test, y_pred_rounded)
+    # Calculate performance metrics using continuous predictions (e.g., MSE, MAE)
+    mse = np.mean((y_test - y_pred_continuous) ** 2)
+    mae = np.mean(np.abs(y_test - y_pred_continuous))
+
+    # Print metrics
+    print(f"Mean Squared Error: {mse:.4f}")
+    print(f"Mean Absolute Error: {mae:.4f}")
 
     # Print metrics
     print(f"Accuracy: {accuracy:.4f}")
@@ -227,7 +227,7 @@ def train_model():
     print(conf_matrix)
 
     # Update progress with predictions and test data
-    training_progress['predictions'] = y_pred_rounded.flatten().tolist()
+    training_progress['predictions'] = y_pred_continuous.tolist()
     training_progress['y_test'] = y_test.tolist()
     training_progress['status'] = 'completed'
 
