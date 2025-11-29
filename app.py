@@ -6,10 +6,13 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import TimeSeriesSplit
 import matplotlib.pyplot as plt
 from flask import Flask, render_template_string
 import io
 import base64
+import warnings
+warnings.filterwarnings('ignore')
 
 # Download dataset
 print("Downloading dataset...")
@@ -29,21 +32,58 @@ ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
 for col in ohlcv_cols:
     df[f'{col}_return'] = df[col].pct_change()
 
-# Create 30 days of lagged features
+# Feature Engineering - Technical Indicators
+print("Engineering features...")
+
+# Rolling volatility (5, 10, 20 day windows)
+for window in [5, 10, 20]:
+    df[f'volatility_{window}'] = df['close_return'].rolling(window=window).std()
+
+# Momentum indicators (Rate of Change)
+for window in [5, 10]:
+    df[f'momentum_{window}'] = df['close'].pct_change(periods=window)
+
+# Moving average of returns
+for window in [5, 10, 20]:
+    df[f'ma_return_{window}'] = df['close_return'].rolling(window=window).mean()
+
+# Volume-price divergence
+df['volume_price_corr_5'] = df['close_return'].rolling(5).corr(df['volume_return'].rolling(5).mean())
+df['volume_price_corr_10'] = df['close_return'].rolling(10).corr(df['volume_return'].rolling(10).mean())
+
+# High-Low spread (volatility measure)
+df['hl_spread'] = (df['high'] - df['low']) / df['close']
+df['hl_spread_ma_5'] = df['hl_spread'].rolling(5).mean()
+
+# Volume ratio (current vs moving average)
+for window in [5, 10]:
+    df[f'volume_ratio_{window}'] = df['volume'] / df['volume'].rolling(window).mean()
+
+# Create 30 days of lagged features for returns
 print("Creating lagged features...")
 lag_days = 30
 feature_cols = []
 
+# Lagged OHLCV returns
 for col in ohlcv_cols:
     for lag in range(1, lag_days + 1):
         lag_col = f'{col}_return_lag_{lag}'
         df[lag_col] = df[f'{col}_return'].shift(lag)
         feature_cols.append(lag_col)
 
+# Lagged technical indicators
+tech_indicators = [c for c in df.columns if any(x in c for x in ['volatility', 'momentum', 'ma_return', 'volume_price_corr', 'hl_spread', 'volume_ratio'])]
+for col in tech_indicators:
+    for lag in range(1, 11):  # 10 lags for technical indicators
+        lag_col = f'{col}_lag_{lag}'
+        df[lag_col] = df[col].shift(lag)
+        feature_cols.append(lag_col)
+
 # Remove NaN rows
 print(f"Rows before removing NaN: {len(df)}")
 df = df.dropna()
 print(f"Rows after removing NaN: {len(df)}")
+print(f"Total features: {len(feature_cols)}")
 
 # Prepare features and target
 X = df[feature_cols].values
@@ -64,12 +104,99 @@ scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
-# Train models
-print("\nTraining models...")
+# Hyperparameter tuning with Time Series Cross-Validation
+print("\nPerforming hyperparameter tuning...")
+
+# Time Series Cross-Validation
+tscv = TimeSeriesSplit(n_splits=5)
+
+# Naive Bayes (with var_smoothing tuning)
+print("Tuning Naive Bayes...")
+best_nb_score = 0
+best_nb_params = None
+for var_smoothing in [1e-9, 1e-8, 1e-7, 1e-6, 1e-5]:
+    scores = []
+    for train_idx, val_idx in tscv.split(X_train_scaled):
+        X_tr, X_val = X_train_scaled[train_idx], X_train_scaled[val_idx]
+        y_tr, y_val = y_train[train_idx], y_train[val_idx]
+        
+        model = GaussianNB(var_smoothing=var_smoothing)
+        model.fit(X_tr, y_tr)
+        scores.append(accuracy_score(y_val, model.predict(X_val)))
+    
+    mean_score = np.mean(scores)
+    if mean_score > best_nb_score:
+        best_nb_score = mean_score
+        best_nb_params = var_smoothing
+
+print(f"Best NB var_smoothing: {best_nb_params}, CV Score: {best_nb_score:.4f}")
+
+# Random Forest (with regularization)
+print("Tuning Random Forest...")
+best_rf_score = 0
+best_rf_params = None
+rf_configs = [
+    {'n_estimators': 50, 'max_depth': 5, 'min_samples_split': 20, 'min_samples_leaf': 10},
+    {'n_estimators': 100, 'max_depth': 10, 'min_samples_split': 15, 'min_samples_leaf': 5},
+    {'n_estimators': 100, 'max_depth': 15, 'min_samples_split': 10, 'min_samples_leaf': 5},
+    {'n_estimators': 150, 'max_depth': 20, 'min_samples_split': 10, 'min_samples_leaf': 3},
+]
+
+for params in rf_configs:
+    scores = []
+    for train_idx, val_idx in tscv.split(X_train_scaled):
+        X_tr, X_val = X_train_scaled[train_idx], X_train_scaled[val_idx]
+        y_tr, y_val = y_train[train_idx], y_train[val_idx]
+        
+        model = RandomForestClassifier(**params, random_state=42, n_jobs=-1)
+        model.fit(X_tr, y_tr)
+        scores.append(accuracy_score(y_val, model.predict(X_val)))
+    
+    mean_score = np.mean(scores)
+    if mean_score > best_rf_score:
+        best_rf_score = mean_score
+        best_rf_params = params
+
+print(f"Best RF params: {best_rf_params}, CV Score: {best_rf_score:.4f}")
+
+# Neural Network (with regularization and early stopping)
+print("Tuning Neural Network...")
+best_nn_score = 0
+best_nn_params = None
+nn_configs = [
+    {'hidden_layer_sizes': (50, 25), 'alpha': 0.01},
+    {'hidden_layer_sizes': (100, 50), 'alpha': 0.01},
+    {'hidden_layer_sizes': (100, 50, 25), 'alpha': 0.01},
+    {'hidden_layer_sizes': (150, 75), 'alpha': 0.001},
+    {'hidden_layer_sizes': (100, 50), 'alpha': 0.001},
+]
+
+for params in nn_configs:
+    scores = []
+    for train_idx, val_idx in tscv.split(X_train_scaled):
+        X_tr, X_val = X_train_scaled[train_idx], X_train_scaled[val_idx]
+        y_tr, y_val = y_train[train_idx], y_train[val_idx]
+        
+        model = MLPClassifier(**params, max_iter=1000, early_stopping=True, 
+                             validation_fraction=0.1, random_state=42)
+        model.fit(X_tr, y_tr)
+        scores.append(accuracy_score(y_val, model.predict(X_val)))
+    
+    mean_score = np.mean(scores)
+    if mean_score > best_nn_score:
+        best_nn_score = mean_score
+        best_nn_params = params
+
+print(f"Best NN params: {best_nn_params}, CV Score: {best_nn_score:.4f}")
+
+# Train final models with best parameters
+print("\n" + "="*50)
+print("Training final models with best parameters...")
+print("="*50)
 
 # Naive Bayes
-print("Training Naive Bayes...")
-nb_model = GaussianNB()
+print("\nTraining Naive Bayes...")
+nb_model = GaussianNB(var_smoothing=best_nb_params)
 nb_model.fit(X_train_scaled, y_train)
 nb_train_pred = nb_model.predict(X_train_scaled)
 nb_test_pred = nb_model.predict(X_test_scaled)
@@ -78,16 +205,25 @@ print(f"Naive Bayes Test Accuracy: {accuracy_score(y_test, nb_test_pred):.4f}")
 
 # Random Forest
 print("\nTraining Random Forest...")
-rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+rf_model = RandomForestClassifier(**best_rf_params, random_state=42, n_jobs=-1)
 rf_model.fit(X_train_scaled, y_train)
 rf_train_pred = rf_model.predict(X_train_scaled)
 rf_test_pred = rf_model.predict(X_test_scaled)
 print(f"Random Forest Train Accuracy: {accuracy_score(y_train, rf_train_pred):.4f}")
 print(f"Random Forest Test Accuracy: {accuracy_score(y_test, rf_test_pred):.4f}")
 
+# Feature importance
+feature_importance = pd.DataFrame({
+    'feature': feature_cols,
+    'importance': rf_model.feature_importances_
+}).sort_values('importance', ascending=False)
+print("\nTop 10 Most Important Features:")
+print(feature_importance.head(10))
+
 # Neural Network
 print("\nTraining Neural Network...")
-nn_model = MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42)
+nn_model = MLPClassifier(**best_nn_params, max_iter=1000, early_stopping=True,
+                        validation_fraction=0.1, random_state=42)
 nn_model.fit(X_train_scaled, y_train)
 nn_train_pred = nn_model.predict(X_train_scaled)
 nn_test_pred = nn_model.predict(X_test_scaled)
@@ -120,7 +256,10 @@ def simulate_trading(predictions, actual_prices, starting_capital=1000):
     return np.array(capital_history)
 
 # Simulate trading for all models
-print("\nSimulating trading strategies...")
+print("\n" + "="*50)
+print("Simulating trading strategies...")
+print("="*50)
+
 nb_train_capital = simulate_trading(nb_train_pred, train_prices)
 nb_test_capital = simulate_trading(nb_test_pred, test_prices)
 
@@ -134,21 +273,32 @@ perfect_train_capital = simulate_trading(y_train, train_prices)
 perfect_test_capital = simulate_trading(y_test, test_prices)
 
 print(f"\nFinal Capital (Train):")
-print(f"  Naive Bayes: ${nb_train_capital[-1]:.2f}")
-print(f"  Random Forest: ${rf_train_capital[-1]:.2f}")
-print(f"  Neural Network: ${nn_train_capital[-1]:.2f}")
+print(f"  Naive Bayes: ${nb_train_capital[-1]:.2f} ({(nb_train_capital[-1]/perfect_train_capital[-1]*100):.1f}% of perfect)")
+print(f"  Random Forest: ${rf_train_capital[-1]:.2f} ({(rf_train_capital[-1]/perfect_train_capital[-1]*100):.1f}% of perfect)")
+print(f"  Neural Network: ${nn_train_capital[-1]:.2f} ({(nn_train_capital[-1]/perfect_train_capital[-1]*100):.1f}% of perfect)")
 print(f"  Perfect Strategy: ${perfect_train_capital[-1]:.2f}")
 
 print(f"\nFinal Capital (Test):")
-print(f"  Naive Bayes: ${nb_test_capital[-1]:.2f}")
-print(f"  Random Forest: ${rf_test_capital[-1]:.2f}")
-print(f"  Neural Network: ${nn_test_capital[-1]:.2f}")
+print(f"  Naive Bayes: ${nb_test_capital[-1]:.2f} ({(nb_test_capital[-1]/perfect_test_capital[-1]*100):.1f}% of perfect)")
+print(f"  Random Forest: ${rf_test_capital[-1]:.2f} ({(rf_test_capital[-1]/perfect_test_capital[-1]*100):.1f}% of perfect)")
+print(f"  Neural Network: ${nn_test_capital[-1]:.2f} ({(nn_test_capital[-1]/perfect_test_capital[-1]*100):.1f}% of perfect)")
 print(f"  Perfect Strategy: ${perfect_test_capital[-1]:.2f}")
+
+# Calculate Sharpe-like metrics
+def calculate_returns_std(capital_history):
+    returns = np.diff(capital_history) / capital_history[:-1]
+    return returns.std()
+
+print(f"\nRisk (Std of Returns) - Test:")
+print(f"  Naive Bayes: {calculate_returns_std(nb_test_capital):.6f}")
+print(f"  Random Forest: {calculate_returns_std(rf_test_capital):.6f}")
+print(f"  Neural Network: {calculate_returns_std(nn_test_capital):.6f}")
+print(f"  Perfect Strategy: {calculate_returns_std(perfect_test_capital):.6f}")
 
 # Create visualizations
 def create_plots():
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
-    fig.suptitle('Trading Model Comparison', fontsize=16)
+    fig.suptitle('Trading Model Comparison (Regularized & Feature-Enhanced)', fontsize=16)
     
     # Training - Predictions vs Perfect Position
     ax = axes[0, 0]
@@ -279,9 +429,20 @@ def index():
                 justify-content: space-between;
                 padding: 5px 0;
             }
+            .percentage {
+                color: #28a745;
+                font-size: 0.9em;
+            }
             img {
                 width: 100%;
                 border-radius: 5px;
+            }
+            .info-box {
+                background-color: #e7f3ff;
+                padding: 15px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+                border-left: 4px solid #007bff;
             }
         </style>
     </head>
@@ -289,20 +450,24 @@ def index():
         <div class="container">
             <h1>🎯 Trading Model Comparison Dashboard</h1>
             
+            <div class="info-box">
+                <strong>Improvements Applied:</strong> Regularization, Feature Engineering (volatility, momentum, volume ratios), Time-Series CV for hyperparameter tuning
+            </div>
+            
             <div class="metrics">
                 <div class="metric-box">
                     <h3>Training Performance</h3>
                     <div class="metric-row">
                         <span>Naive Bayes:</span>
-                        <strong>${{ "%.2f"|format(nb_train_final) }}</strong>
+                        <strong>${{ "%.2f"|format(nb_train_final) }} <span class="percentage">({{ "%.1f"|format(nb_train_pct) }}%)</span></strong>
                     </div>
                     <div class="metric-row">
                         <span>Random Forest:</span>
-                        <strong>${{ "%.2f"|format(rf_train_final) }}</strong>
+                        <strong>${{ "%.2f"|format(rf_train_final) }} <span class="percentage">({{ "%.1f"|format(rf_train_pct) }}%)</span></strong>
                     </div>
                     <div class="metric-row">
                         <span>Neural Network:</span>
-                        <strong>${{ "%.2f"|format(nn_train_final) }}</strong>
+                        <strong>${{ "%.2f"|format(nn_train_final) }} <span class="percentage">({{ "%.1f"|format(nn_train_pct) }}%)</span></strong>
                     </div>
                     <div class="metric-row">
                         <span>Perfect Strategy:</span>
@@ -314,15 +479,15 @@ def index():
                     <h3>Test Performance</h3>
                     <div class="metric-row">
                         <span>Naive Bayes:</span>
-                        <strong>${{ "%.2f"|format(nb_test_final) }}</strong>
+                        <strong>${{ "%.2f"|format(nb_test_final) }} <span class="percentage">({{ "%.1f"|format(nb_test_pct) }}%)</span></strong>
                     </div>
                     <div class="metric-row">
                         <span>Random Forest:</span>
-                        <strong>${{ "%.2f"|format(rf_test_final) }}</strong>
+                        <strong>${{ "%.2f"|format(rf_test_final) }} <span class="percentage">({{ "%.1f"|format(rf_test_pct) }}%)</span></strong>
                     </div>
                     <div class="metric-row">
                         <span>Neural Network:</span>
-                        <strong>${{ "%.2f"|format(nn_test_final) }}</strong>
+                        <strong>${{ "%.2f"|format(nn_test_final) }} <span class="percentage">({{ "%.1f"|format(nn_test_pct) }}%)</span></strong>
                     </div>
                     <div class="metric-row">
                         <span>Perfect Strategy:</span>
@@ -347,7 +512,13 @@ def index():
         nb_test_final=nb_test_capital[-1],
         rf_test_final=rf_test_capital[-1],
         nn_test_final=nn_test_capital[-1],
-        perfect_test_final=perfect_test_capital[-1]
+        perfect_test_final=perfect_test_capital[-1],
+        nb_train_pct=nb_train_capital[-1]/perfect_train_capital[-1]*100,
+        rf_train_pct=rf_train_capital[-1]/perfect_train_capital[-1]*100,
+        nn_train_pct=nn_train_capital[-1]/perfect_train_capital[-1]*100,
+        nb_test_pct=nb_test_capital[-1]/perfect_test_capital[-1]*100,
+        rf_test_pct=rf_test_capital[-1]/perfect_test_capital[-1]*100,
+        nn_test_pct=nn_test_capital[-1]/perfect_test_capital[-1]*100
     )
 
 if __name__ == '__main__':
