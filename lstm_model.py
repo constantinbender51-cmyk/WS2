@@ -169,6 +169,7 @@ def train_model():
 
     # Load the CSV data
     data = pd.read_csv(output)
+    print(f"Debug: Loaded data with shape {data.shape} and columns {list(data.columns)}")
 
     # Ensure the data has OHLCV columns and sma_position; adjust column names if necessary
     # Assuming columns: 'date', 'open', 'high', 'low', 'close', 'volume', 'sma_position'
@@ -186,10 +187,12 @@ def train_model():
 
     # Calculate 120-day SMA and handle NaN values
     data['sma_120'] = data['close'].rolling(window=120).mean()
+    print(f"Debug: Calculated SMA_120, NaN count: {data['sma_120'].isna().sum()}")
     
     # Create sequences of 22 days for features (reduced by factor of 2)
     X = []
     y = []
+    skipped_count = 0
     for i in range(120, len(close_prices)):
         # Features: close prices and SMA values for past 22 days
         close_features = close_prices[i-22:i]
@@ -197,6 +200,7 @@ def train_model():
         
         # Skip if any NaN values in the sequence
         if np.any(np.isnan(close_features)) or np.any(np.isnan(sma_features)):
+            skipped_count += 1
             continue
             
         # Combine close prices and SMA as features
@@ -204,8 +208,10 @@ def train_model():
         X.append(combined_features)
         y.append(sma_positions[i])
 
+    print(f"Debug: Created sequences, total skipped due to NaN: {skipped_count}, X length: {len(X)}, y length: {len(y)}")
     X = np.array(X)
     y = np.array(y)
+    print(f"Debug: X shape after array conversion: {X.shape}, y shape: {y.shape}")
 
     # Reshape X for LSTM input: (samples, time steps, features)
     # Now we have 2 features per time step (close price and SMA value)
