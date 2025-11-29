@@ -174,11 +174,11 @@ def train_model():
     close_prices = data['close'].values
     sma_positions = data['sma_position'].values
 
-    # Create sequences of 91 days for features
+    # Create sequences of 45 days for features
     X = []
     y = []
-    for i in range(91, len(close_prices)):
-        X.append(close_prices[i-91:i])
+    for i in range(45, len(close_prices)):
+        X.append(close_prices[i-45:i])
         y.append(sma_positions[i])
 
     X = np.array(X)
