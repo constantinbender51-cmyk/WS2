@@ -245,9 +245,9 @@ def train_model():
     # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
         LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 3), kernel_regularizer=l1_l2(l1=2e-4, l2=1e-4)),
-        Dropout(0.3),
+        Dropout(0.6),
         LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=2e-4, l2=1e-4)),
-        Dropout(0.3),
+        Dropout(0.6),
         Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=2e-4, l2=1e-4)),
         Dense(1, activation='linear')  # Linear activation for regression
     ])
