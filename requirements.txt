@@ -4,3 +4,4 @@ numpy
 gdown
 scikit-learn
 matplotlib
+tqdm
