@@ -149,19 +149,25 @@ html_template = '''
             if (window.capitalChartInstance) {
                 window.capitalChartInstance.destroy();
             }
-            if (data.test_capital && data.test_capital.length > 0) {
+            if ((data.train_capital && data.train_capital.length > 0) || (data.test_capital && data.test_capital.length > 0)) {
+                const datasets = [];
+                if (data.train_capital && data.train_capital.length > 0) {
+                    datasets.push({ label: 'Training Capital', data: data.train_capital, borderColor: 'green', fill: false });
+                }
+                if (data.test_capital && data.test_capital.length > 0) {
+                    datasets.push({ label: 'Test Capital', data: data.test_capital, borderColor: 'blue', fill: false });
+                }
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
                     data: {
-                        labels: Array.from({length: data.test_capital.length}, (_, i) => i),
-                        datasets: [
-                            { label: 'Test Capital', data: data.test_capital, borderColor: 'blue', fill: false }
-                        ]
+                        labels: Array.from({length: Math.max(data.train_capital?.length || 0, data.test_capital?.length || 0)}, (_, i) => i),
+                        datasets: datasets
                     },
                     options: { responsive: true }
                 });
             } else {
-                console.warn('Test capital data not available or empty:', {
+                console.warn('Capital data not available or empty:', {
+                    train_capital: data.train_capital,
                     test_capital: data.test_capital
                 });
             }
