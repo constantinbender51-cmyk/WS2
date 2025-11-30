@@ -23,7 +23,9 @@ training_progress = {
     'train_predictions': [],
     'train_actual': [],
     'test_predictions': [],
-    'test_actual': []
+    'test_actual': [],
+    'train_capital': [],
+    'test_capital': []
 }
 
 app = Flask(__name__)
@@ -59,6 +61,8 @@ html_template = '''
         <canvas id="trainPredictionChart" width="400" height="200"></canvas>
         <h2>Test Predictions vs Actual</h2>
         <canvas id="testPredictionChart" width="400" height="200"></canvas>
+        <h2>Capital Evolution</h2>
+        <canvas id="capitalChart" width="400" height="200"></canvas>
     </div>
     <script>
         function updateProgress() {
@@ -276,11 +280,33 @@ def train_model():
             test_pred = self.model.predict(X_test_scaled, verbose=0)
             test_pred_continuous = test_pred.flatten()
             
-            # Store training and test predictions and actual values
+            # Calculate capital evolution for training period
+            train_capital = [1000.0]  # Start with $1000
+            train_prices = data['close'].values[len(data) - len(y_train):len(data) - len(y_train) + len(y_train)]
+            
+            for i in range(1, len(y_train)):
+                signal = y_train[i-1]  # Use previous day's signal
+                price_change = (train_prices[i] - train_prices[i-1]) / train_prices[i-1]
+                capital = train_capital[-1] * (1 + signal * price_change)
+                train_capital.append(capital)
+
+            # Calculate capital evolution for testing period
+            test_capital = [1000.0]  # Start with $1000
+            test_prices = data['close'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)]
+            
+            for i in range(1, len(y_test)):
+                signal = test_pred_continuous[i-1]  # Use previous day's predicted signal
+                price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
+                capital = test_capital[-1] * (1 + signal * price_change)
+                test_capital.append(capital)
+
+            # Store training and test predictions, actual values, and capital
             training_progress['train_predictions'] = train_pred_continuous.tolist()
             training_progress['train_actual'] = y_train.tolist()
             training_progress['test_predictions'] = test_pred_continuous.tolist()
             training_progress['test_actual'] = y_test.tolist()
+            training_progress['train_capital'] = train_capital
+            training_progress['test_capital'] = test_capital
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
@@ -292,6 +318,30 @@ def train_model():
 
     # Use raw continuous predictions for sma_position in range [-1, 1]
     y_pred_continuous = y_pred.flatten()
+
+    # Calculate capital evolution for training period
+    train_capital = [1000.0]  # Start with $1000
+    train_prices = data['close'].values[len(data) - len(y_train):len(data) - len(y_train) + len(y_train)]
+    
+    for i in range(1, len(y_train)):
+        signal = y_train[i-1]  # Use previous day's signal
+        price_change = (train_prices[i] - train_prices[i-1]) / train_prices[i-1]
+        capital = train_capital[-1] * (1 + signal * price_change)
+        train_capital.append(capital)
+
+    # Calculate capital evolution for testing period
+    test_capital = [1000.0]  # Start with $1000
+    test_prices = data['close'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)]
+    
+    for i in range(1, len(y_test)):
+        signal = y_pred_continuous[i-1]  # Use previous day's predicted signal
+        price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
+        capital = test_capital[-1] * (1 + signal * price_change)
+        test_capital.append(capital)
+
+    # Store capital data
+    training_progress['train_capital'] = train_capital
+    training_progress['test_capital'] = test_capital
 
     # Calculate performance metrics using continuous predictions (e.g., MSE, MAE)
     mse = np.mean((y_test - y_pred_continuous) ** 2)
