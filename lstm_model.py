@@ -332,16 +332,16 @@ def train_model():
     training_progress['status'] = 'completed'
     
     # Prepare data for CSV download: combine original data with model predictions
-    # Align predictions with original datetime indices for both training and test sets
+    # Align predictions with original datetime indices, starting from row 365
     data_with_predictions = data.copy()
     data_with_predictions['model_output'] = np.nan  # Initialize with NaN
-    # Map training predictions back to original indices
-    train_indices = range(len(X_train))
+    # Map training predictions back to original indices, offset by 365
+    train_indices = range(365, 365 + len(X_train))
     for idx, pred in zip(train_indices, y_train_pred_continuous):
         if idx < len(data_with_predictions):
             data_with_predictions.loc[idx, 'model_output'] = pred
-    # Map test predictions back to original indices
-    test_indices = range(len(X_train), len(X_train) + len(X_test))
+    # Map test predictions back to original indices, offset by 365
+    test_indices = range(365 + len(X_train), 365 + len(X_train) + len(X_test))
     for idx, pred in zip(test_indices, y_test_pred_continuous):
         if idx < len(data_with_predictions):
             data_with_predictions.loc[idx, 'model_output'] = pred
