@@ -185,11 +185,11 @@ def train_model():
     close_prices = data['close'].values
     sma_positions = data['sma_position'].values
 
-    # Calculate 365-day SMA, 120-day SMA, close / sma_365, and close / sma_120, then handle NaN values
+    # Calculate 365-day SMA, 120-day SMA, (close - SMA) / SMA for both, then handle NaN values
     data['sma_365'] = data['close'].rolling(window=365).mean()
     data['sma_120'] = data['close'].rolling(window=120).mean()
-    data['close_over_sma_365'] = data['close'] / data['sma_365']
-    data['close_over_sma_120'] = data['close'] / data['sma_120']
+    data['close_over_sma_365'] = (data['close'] - data['sma_365']) / data['sma_365']
+    data['close_over_sma_120'] = (data['close'] - data['sma_120']) / data['sma_120']
     print(f"Debug: Calculated SMA_365, NaN count: {data['sma_365'].isna().sum()}")
     print(f"Debug: Calculated SMA_120, NaN count: {data['sma_120'].isna().sum()}")
     print(f"Debug: Calculated close / sma_365, NaN count: {data['close_over_sma_365'].isna().sum()}")
@@ -200,7 +200,7 @@ def train_model():
     y = []
     skipped_count = 0
     for i in range(365, len(close_prices)):
-        # Features: SMA_365, SMA_120, close / sma_365, and close / sma_120 values for the past 2 days
+        # Features: SMA_365, SMA_120, (close - SMA) / SMA for both, values for the past 2 days
         sma_365_features = data['sma_365'].values[i-2:i]
         sma_120_features = data['sma_120'].values[i-2:i]
         close_over_sma_365_features = data['close_over_sma_365'].values[i-2:i]
@@ -211,7 +211,7 @@ def train_model():
             skipped_count += 1
             continue
             
-        # Combine SMA_365, SMA_120, close / sma_365, and close / sma_120 as features
+        # Combine SMA_365, SMA_120, (close - SMA) / SMA for both, as features
         combined_features = np.column_stack((sma_365_features, sma_120_features, close_over_sma_365_features, close_over_sma_120_features))
         X.append(combined_features)
         y.append(sma_positions[i])
@@ -222,7 +222,7 @@ def train_model():
     print(f"Debug: X shape after array conversion: {X.shape}, y shape: {y.shape}")
 
     # Reshape X for LSTM input: (samples, time steps, features)
-    # Now we have 4 features per time step (SMA_365, SMA_120, close / sma_365, close / sma_120)
+    # Now we have 4 features per time step (SMA_365, SMA_120, (close - SMA) / SMA for both)
     X = X.reshape((X.shape[0], X.shape[1], 4))
 
     # Split the data into training and testing sets (80% train, 20% test)
