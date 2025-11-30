@@ -380,23 +380,23 @@ def train_model():
         X_test_scaled = np.nan_to_num(X_test_scaled)
         y_test = np.nan_to_num(y_test)
 
-    # Convert SMA positions from -1,0,1 to 0,1,2 for sparse categorical crossentropy
-    y_train_encoded = y_train + 1  # Convert -1,0,1 to 0,1,2
-    y_test_encoded = y_test + 1    # Convert -1,0,1 to 0,1,2
+    # Use continuous SMA position values directly (no encoding needed for regression)
+    y_train_continuous = y_train.astype(np.float32)
+    y_test_continuous = y_test.astype(np.float32)
     
-    # Build the LSTM model with reduced complexity and L1/L2 regularization
+    # Build the LSTM model for regression with continuous values
     model = Sequential([
         LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
         Dropout(0.6),
         LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
         Dropout(0.6),
         Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
-        Dense(3, activation='softmax')  # 3 classes for SMA positions: 0,1,2 (mapped from -1,0,1)
+        Dense(1, activation='linear')  # Single output for continuous SMA position prediction
     ])
 
-    # Compile the model with gradient clipping
+    # Compile the model with gradient clipping for regression
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, clipvalue=1.0)
-    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
 
     # Custom callback to update progress
     class ProgressCallback(tf.keras.callbacks.Callback):
@@ -405,13 +405,13 @@ def train_model():
             training_progress['train_loss'].append(logs.get('loss'))
             training_progress['val_loss'].append(logs.get('val_loss'))
             
-            # Get training predictions for this epoch
+            # Get training predictions for this epoch (continuous values)
             train_pred = self.model.predict(X_train_scaled, verbose=0)
-            train_pred_classes = np.argmax(train_pred, axis=1) - 1  # Convert from 0,1,2 to -1,0,1
+            train_pred_continuous = train_pred.flatten()  # Continuous predictions
             
-            # Get test predictions for this epoch
+            # Get test predictions for this epoch (continuous values)
             test_pred = self.model.predict(X_test_scaled, verbose=0)
-            test_pred_classes = np.argmax(test_pred, axis=1) - 1  # Convert from 0,1,2 to -1,0,1
+            test_pred_continuous = test_pred.flatten()  # Continuous predictions
             
             # Calculate capital evolution for training period
             train_capital = [1000.0]  # Start with $1000
@@ -421,7 +421,7 @@ def train_model():
             print(f"Debug: Training capital calculation - y_train length: {len(y_train)}, train_prices length: {len(train_prices)}")
             
             for i in range(1, len(y_train)):
-                signal = train_pred_classes[i-1]  # Use previous day's predicted signal (-1, 0, 1)
+                signal = train_pred_continuous[i-1]  # Use previous day's predicted continuous signal
                 price_change = (train_prices[i] - train_prices[i-1]) / train_prices[i-1]
                 capital = train_capital[-1] * (1 + signal * price_change)
                 train_capital.append(capital)
@@ -434,15 +434,15 @@ def train_model():
             print(f"Debug: Test capital calculation - y_test length: {len(y_test)}, test_prices length: {len(test_prices)}")
             
             for i in range(1, len(y_test)):
-                signal = test_pred_classes[i-1]  # Use previous day's predicted signal (-1, 0, 1)
+                signal = test_pred_continuous[i-1]  # Use previous day's predicted continuous signal
                 price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
                 capital = test_capital[-1] * (1 + signal * price_change)
                 test_capital.append(capital)
 
             # Store training and test predictions, actual values, capital, prices, and dates
-            training_progress['train_predictions'] = train_pred_classes.tolist()
+            training_progress['train_predictions'] = train_pred_continuous.tolist()
             training_progress['train_actual'] = y_train.tolist()
-            training_progress['test_predictions'] = test_pred_classes.tolist()
+            training_progress['test_predictions'] = test_pred_continuous.tolist()
             training_progress['test_actual'] = y_test.tolist()
             training_progress['train_capital'] = train_capital
             training_progress['test_capital'] = test_capital
@@ -453,14 +453,12 @@ def train_model():
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
-    # Train the model with encoded labels
-    history = model.fit(X_train_scaled, y_train_encoded, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test_encoded), verbose=1, callbacks=[ProgressCallback()])
+    # Train the model with continuous values
+    history = model.fit(X_train_scaled, y_train_continuous, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test_continuous), verbose=1, callbacks=[ProgressCallback()])
 
-    # Predict on the test set
+    # Predict on the test set (continuous values)
     y_pred = model.predict(X_test_scaled)
-
-    # Convert predictions to discrete SMA positions (-1, 0, 1)
-    y_pred_classes = np.argmax(y_pred, axis=1) - 1
+    y_pred_continuous = y_pred.flatten()  # Continuous predictions
 
     # Calculate capital evolution for training period
     train_capital = [1000.0]  # Start with $1000
@@ -477,7 +475,7 @@ def train_model():
     test_prices = data['close'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)]
     
     for i in range(1, len(y_test)):
-        signal = y_pred_classes[i-1]  # Use previous day's predicted signal (-1, 0, 1)
+        signal = y_pred_continuous[i-1]  # Use previous day's predicted continuous signal
         price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
         capital = test_capital[-1] * (1 + signal * price_change)
         test_capital.append(capital)
@@ -492,20 +490,18 @@ def train_model():
     training_progress['train_sma_positions'] = y_train.tolist()
     training_progress['test_sma_positions'] = y_test.tolist()
 
-    # Calculate performance metrics for classification
-    accuracy = accuracy_score(y_test, y_pred_classes)
-    precision = precision_score(y_test, y_pred_classes, average='weighted', zero_division=0)
-    recall = recall_score(y_test, y_pred_classes, average='weighted', zero_division=0)
-    f1 = f1_score(y_test, y_pred_classes, average='weighted', zero_division=0)
+    # Calculate performance metrics for regression
+    mse = np.mean((y_test - y_pred_continuous) ** 2)
+    mae = np.mean(np.abs(y_test - y_pred_continuous))
+    r2 = 1 - np.sum((y_test - y_pred_continuous) ** 2) / np.sum((y_test - np.mean(y_test)) ** 2)
 
     # Print metrics
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
+    print(f"Mean Squared Error: {mse:.4f}")
+    print(f"Mean Absolute Error: {mae:.4f}")
+    print(f"R-squared: {r2:.4f}")
 
     # Update progress with predictions and test data
-    training_progress['test_predictions'] = y_pred_classes.tolist()
+    training_progress['test_predictions'] = y_pred_continuous.tolist()
     training_progress['test_actual'] = y_test.tolist()
     training_progress['status'] = 'completed'
 
