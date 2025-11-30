@@ -195,16 +195,16 @@ def train_model():
     print(f"Debug: Calculated close / sma_365, NaN count: {data['close_over_sma_365'].isna().sum()}")
     print(f"Debug: Calculated close / sma_120, NaN count: {data['close_over_sma_120'].isna().sum()}")
     
-    # Create sequences of 8 days for features
+    # Create sequences of 2 days for features
     X = []
     y = []
     skipped_count = 0
     for i in range(365, len(close_prices)):
-        # Features: SMA_365, SMA_120, (close - SMA) / SMA for both, values for the past 8 days
-        sma_365_features = data['sma_365'].values[i-8:i]
-        sma_120_features = data['sma_120'].values[i-8:i]
-        close_over_sma_365_features = data['close_over_sma_365'].values[i-8:i]
-        close_over_sma_120_features = data['close_over_sma_120'].values[i-8:i]
+        # Features: SMA_365, SMA_120, (close - SMA) / SMA for both, values for the past 2 days
+        sma_365_features = data['sma_365'].values[i-2:i]
+        sma_120_features = data['sma_120'].values[i-2:i]
+        close_over_sma_365_features = data['close_over_sma_365'].values[i-2:i]
+        close_over_sma_120_features = data['close_over_sma_120'].values[i-2:i]
         
         # Skip if any NaN values in the sequence
         if np.any(np.isnan(sma_365_features)) or np.any(np.isnan(sma_120_features)) or np.any(np.isnan(close_over_sma_365_features)) or np.any(np.isnan(close_over_sma_120_features)):
@@ -247,13 +247,13 @@ def train_model():
         X_test_scaled = np.nan_to_num(X_test_scaled)
         y_test = np.nan_to_num(y_test)
 
-    # Build the LSTM model with reduced complexity and L1/L2 regularization
+    # Build the LSTM model with specified architecture
     model = Sequential([
-        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=4e-4, l2=2e-4)),
+        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=0.0004, l2=0.0002)),
         Dropout(0.6),
-        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=4e-4, l2=2e-4)),
+        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=0.0004, l2=0.0002)),
         Dropout(0.6),
-        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=4e-4, l2=2e-4)),
+        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=0.0004, l2=0.0002)),
         Dense(1, activation='tanh')  # Tanh activation for bounded predictions [-1, 1]
     ])
 
