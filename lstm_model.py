@@ -201,11 +201,22 @@ html_template = '''
                     }
                 }
                 
+                // Add background dataset for SMA position colors
+                const backgroundDataset = {
+                    label: 'SMA Position Background',
+                    data: Array(maxLength).fill(null), // Null data points
+                    backgroundColor: backgroundColors,
+                    type: 'bar',
+                    barPercentage: 1.0,
+                    categoryPercentage: 1.0,
+                    order: 0 // Render behind other datasets
+                };
+                
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
                     data: {
                         labels: labels,
-                        datasets: datasets
+                        datasets: [backgroundDataset, ...datasets]
                     },
                     options: {
                         responsive: true,
@@ -214,12 +225,7 @@ html_template = '''
                                 type: 'linear',
                                 display: true,
                                 title: { display: true, text: 'Day Index' },
-                                grid: {
-                                    color: function(context) {
-                                        const index = context.tick.value;
-                                        return backgroundColors[index] || 'transparent';
-                                    }
-                                }
+                                grid: { display: false } // Disable grid lines to avoid overlap
                             },
                             y: {
                                 type: 'linear',
