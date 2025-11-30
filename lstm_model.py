@@ -149,7 +149,7 @@ html_template = '''
             if (window.capitalChartInstance) {
                 window.capitalChartInstance.destroy();
             }
-            if ((data.train_capital && data.train_capital.length > 0) || (data.test_capital && data.test_capital.length > 0)) {
+            if ((data.train_capital && data.train_capital.length > 0) || (data.test_capital && data.test_capital.length > 0) || (data.train_prices && data.train_prices.length > 0) || (data.test_prices && data.test_prices.length > 0)) {
                 const datasets = [];
                 if (data.train_capital && data.train_capital.length > 0) {
                     datasets.push({ label: 'Training Capital', data: data.train_capital, borderColor: 'green', fill: false });
@@ -157,18 +157,43 @@ html_template = '''
                 if (data.test_capital && data.test_capital.length > 0) {
                     datasets.push({ label: 'Test Capital', data: data.test_capital, borderColor: 'blue', fill: false });
                 }
+                if (data.train_prices && data.train_prices.length > 0) {
+                    datasets.push({ label: 'Training Price', data: data.train_prices, borderColor: 'orange', fill: false, yAxisID: 'y1' });
+                }
+                if (data.test_prices && data.test_prices.length > 0) {
+                    datasets.push({ label: 'Test Price', data: data.test_prices, borderColor: 'red', fill: false, yAxisID: 'y1' });
+                }
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
                     data: {
-                        labels: Array.from({length: Math.max(data.train_capital?.length || 0, data.test_capital?.length || 0)}, (_, i) => i),
+                        labels: Array.from({length: Math.max(data.train_capital?.length || 0, data.test_capital?.length || 0, data.train_prices?.length || 0, data.test_prices?.length || 0)}, (_, i) => i),
                         datasets: datasets
                     },
-                    options: { responsive: true }
+                    options: {
+                        responsive: true,
+                        scales: {
+                            y: {
+                                type: 'linear',
+                                display: true,
+                                position: 'left',
+                                title: { display: true, text: 'Capital ($)' }
+                            },
+                            y1: {
+                                type: 'linear',
+                                display: true,
+                                position: 'right',
+                                title: { display: true, text: 'Price ($)' },
+                                grid: { drawOnChartArea: false }
+                            }
+                        }
+                    }
                 });
             } else {
-                console.warn('Capital data not available or empty:', {
+                console.warn('Capital or price data not available or empty:', {
                     train_capital: data.train_capital,
-                    test_capital: data.test_capital
+                    test_capital: data.test_capital,
+                    train_prices: data.train_prices,
+                    test_prices: data.test_prices
                 });
             }
         }
@@ -340,13 +365,15 @@ def train_model():
                 capital = test_capital[-1] * (1 + signal * price_change)
                 test_capital.append(capital)
 
-            # Store training and test predictions, actual values, and capital
+            # Store training and test predictions, actual values, capital, and prices
             training_progress['train_predictions'] = train_pred_continuous.tolist()
             training_progress['train_actual'] = y_train.tolist()
             training_progress['test_predictions'] = test_pred_continuous.tolist()
             training_progress['test_actual'] = y_test.tolist()
             training_progress['train_capital'] = train_capital
             training_progress['test_capital'] = test_capital
+            training_progress['train_prices'] = train_prices.tolist()
+            training_progress['test_prices'] = test_prices.tolist()
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
@@ -379,9 +406,11 @@ def train_model():
         capital = test_capital[-1] * (1 + signal * price_change)
         test_capital.append(capital)
 
-    # Store capital data
+    # Store capital and price data
     training_progress['train_capital'] = train_capital
     training_progress['test_capital'] = test_capital
+    training_progress['train_prices'] = train_prices.tolist()
+    training_progress['test_prices'] = test_prices.tolist()
 
     # Calculate performance metrics using continuous predictions (e.g., MSE, MAE)
     mse = np.mean((y_test - y_pred_continuous) ** 2)
