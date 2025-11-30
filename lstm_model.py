@@ -39,7 +39,6 @@ html_template = '''
 <head>
     <title>Training Progress</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
     <meta http-equiv="refresh" content="60">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
@@ -177,47 +176,6 @@ html_template = '''
                 // Use numerical indices for labels, adjusted for test capital offset
                 const maxLength = Math.max(data.train_capital?.length || 0, (data.test_capital?.length || 0) + (data.train_capital?.length || 0), data.train_prices?.length || 0, data.test_prices?.length || 0);
                 const labels = Array.from({length: maxLength}, (_, i) => i);
-                
-                // Create SMA position background annotations
-                const annotations = [];
-                
-                // Process training SMA positions
-                if (data.train_sma_positions && data.train_sma_positions.length > 0) {
-                    data.train_sma_positions.forEach((smaPos, index) => {
-                        const color = smaPos === 1 ? 'rgba(0, 255, 0, 0.2)' : 
-                                     smaPos === -1 ? 'rgba(255, 0, 0, 0.2)' : 
-                                     'rgba(255, 255, 0, 0.2)';
-                        annotations.push({
-                            type: 'box',
-                            xMin: index - 0.5,
-                            xMax: index + 0.5,
-                            yMin: 'min',
-                            yMax: 'max',
-                            backgroundColor: color,
-                            borderWidth: 0
-                        });
-                    });
-                }
-                
-                // Process test SMA positions with offset
-                if (data.test_sma_positions && data.test_sma_positions.length > 0) {
-                    const testStartIndex = data.train_sma_positions ? data.train_sma_positions.length : 0;
-                    data.test_sma_positions.forEach((smaPos, index) => {
-                        const color = smaPos === 1 ? 'rgba(0, 255, 0, 0.2)' : 
-                                     smaPos === -1 ? 'rgba(255, 0, 0, 0.2)' : 
-                                     'rgba(255, 255, 0, 0.2)';
-                        annotations.push({
-                            type: 'box',
-                            xMin: testStartIndex + index - 0.5,
-                            xMax: testStartIndex + index + 0.5,
-                            yMin: 'min',
-                            yMax: 'max',
-                            backgroundColor: color,
-                            borderWidth: 0
-                        });
-                    });
-                }
-                
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
                     data: {
@@ -226,11 +184,6 @@ html_template = '''
                     },
                     options: {
                         responsive: true,
-                        plugins: {
-                            annotation: {
-                                annotations: annotations
-                            }
-                        },
                         scales: {
                             x: {
                                 type: 'linear',
@@ -380,23 +333,19 @@ def train_model():
         X_test_scaled = np.nan_to_num(X_test_scaled)
         y_test = np.nan_to_num(y_test)
 
-    # Use continuous SMA position values directly (no encoding needed for regression)
-    y_train_continuous = y_train.astype(np.float32)
-    y_test_continuous = y_test.astype(np.float32)
-    
-    # Build the LSTM model for regression with continuous values
+    # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
         LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
         Dropout(0.6),
         LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
         Dropout(0.6),
         Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
-        Dense(1, activation='linear')  # Single output for continuous SMA position prediction
+        Dense(1, activation='tanh')  # Tanh activation for bounded predictions [-1, 1]
     ])
 
-    # Compile the model with gradient clipping for regression
+    # Compile the model with gradient clipping
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, clipvalue=1.0)
-    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+    model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mae'])
 
     # Custom callback to update progress
     class ProgressCallback(tf.keras.callbacks.Callback):
@@ -405,13 +354,13 @@ def train_model():
             training_progress['train_loss'].append(logs.get('loss'))
             training_progress['val_loss'].append(logs.get('val_loss'))
             
-            # Get training predictions for this epoch (continuous values)
+            # Get training predictions for this epoch
             train_pred = self.model.predict(X_train_scaled, verbose=0)
-            train_pred_continuous = train_pred.flatten()  # Continuous predictions
+            train_pred_continuous = train_pred.flatten()
             
-            # Get test predictions for this epoch (continuous values)
+            # Get test predictions for this epoch
             test_pred = self.model.predict(X_test_scaled, verbose=0)
-            test_pred_continuous = test_pred.flatten()  # Continuous predictions
+            test_pred_continuous = test_pred.flatten()
             
             # Calculate capital evolution for training period
             train_capital = [1000.0]  # Start with $1000
@@ -421,7 +370,7 @@ def train_model():
             print(f"Debug: Training capital calculation - y_train length: {len(y_train)}, train_prices length: {len(train_prices)}")
             
             for i in range(1, len(y_train)):
-                signal = train_pred_continuous[i-1]  # Use previous day's predicted continuous signal
+                signal = train_pred_continuous[i-1]  # Use previous day's predicted signal
                 price_change = (train_prices[i] - train_prices[i-1]) / train_prices[i-1]
                 capital = train_capital[-1] * (1 + signal * price_change)
                 train_capital.append(capital)
@@ -434,7 +383,7 @@ def train_model():
             print(f"Debug: Test capital calculation - y_test length: {len(y_test)}, test_prices length: {len(test_prices)}")
             
             for i in range(1, len(y_test)):
-                signal = test_pred_continuous[i-1]  # Use previous day's predicted continuous signal
+                signal = test_pred_continuous[i-1]  # Use previous day's predicted signal
                 price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
                 capital = test_capital[-1] * (1 + signal * price_change)
                 test_capital.append(capital)
@@ -453,12 +402,14 @@ def train_model():
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
-    # Train the model with continuous values
-    history = model.fit(X_train_scaled, y_train_continuous, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test_continuous), verbose=1, callbacks=[ProgressCallback()])
+    # Train the model
+    history = model.fit(X_train_scaled, y_train, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
 
-    # Predict on the test set (continuous values)
+    # Predict on the test set
     y_pred = model.predict(X_test_scaled)
-    y_pred_continuous = y_pred.flatten()  # Continuous predictions
+
+    # Use raw continuous predictions for sma_position in range [-1, 1]
+    y_pred_continuous = y_pred.flatten()
 
     # Calculate capital evolution for training period
     train_capital = [1000.0]  # Start with $1000
@@ -475,30 +426,26 @@ def train_model():
     test_prices = data['close'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)]
     
     for i in range(1, len(y_test)):
-        signal = y_pred_continuous[i-1]  # Use previous day's predicted continuous signal
+        signal = y_pred_continuous[i-1]  # Use previous day's predicted signal
         price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
         capital = test_capital[-1] * (1 + signal * price_change)
         test_capital.append(capital)
 
-    # Store capital, price, date data, and SMA positions
+    # Store capital, price, and date data
     training_progress['train_capital'] = train_capital
     training_progress['test_capital'] = test_capital
     training_progress['train_prices'] = train_prices.tolist()
     training_progress['test_prices'] = test_prices.tolist()
     training_progress['train_dates'] = data['datetime'].values[len(data) - len(y_train):len(data) - len(y_train) + len(y_train)].tolist()
     training_progress['test_dates'] = data['datetime'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)].tolist()
-    training_progress['train_sma_positions'] = y_train.tolist()
-    training_progress['test_sma_positions'] = y_test.tolist()
 
-    # Calculate performance metrics for regression
+    # Calculate performance metrics using continuous predictions (e.g., MSE, MAE)
     mse = np.mean((y_test - y_pred_continuous) ** 2)
     mae = np.mean(np.abs(y_test - y_pred_continuous))
-    r2 = 1 - np.sum((y_test - y_pred_continuous) ** 2) / np.sum((y_test - np.mean(y_test)) ** 2)
 
     # Print metrics
     print(f"Mean Squared Error: {mse:.4f}")
     print(f"Mean Absolute Error: {mae:.4f}")
-    print(f"R-squared: {r2:.4f}")
 
     # Update progress with predictions and test data
     training_progress['test_predictions'] = y_pred_continuous.tolist()
