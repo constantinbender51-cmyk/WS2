@@ -17,13 +17,14 @@ import json
 training_progress = {
     'status': 'not_started',  # 'not_started', 'running', 'completed'
     'current_epoch': 0,
-    'total_epochs': 800,
+    'total_epochs': 1600,
     'train_loss': [],
     'val_loss': [],
     'train_predictions': [],
     'train_actual': [],
     'test_predictions': [],
-    'test_actual': []
+    'test_actual': [],
+    'data_with_predictions': None
 }
 
 app = Flask(__name__)
@@ -60,6 +61,10 @@ html_template = '''
         <h2>Test Predictions vs Actual</h2>
         <canvas id="testPredictionChart" width="400" height="200"></canvas>
     </div>
+    <div id="download_section" style="display: {{ charts_display }};">
+        <h2>Download Data</h2>
+        <p><a href="/download" id="download_link">Download CSV with OHLCV, SMA Position, and Model Output</a></p>
+    </div>
     <script>
         function updateProgress() {
             fetch('/progress')
@@ -73,9 +78,11 @@ html_template = '''
                     
                     if (data.status === 'running' || data.status === 'completed') {
                         document.getElementById('charts').style.display = 'block';
+                        document.getElementById('download_section').style.display = 'block';
                         updateCharts(data);
                     } else {
                         document.getElementById('charts').style.display = 'none';
+                        document.getElementById('download_section').style.display = 'none';
                     }
                 })
                 .catch(error => console.error('Error fetching progress:', error));
@@ -157,6 +164,14 @@ def index():
 @app.route('/progress')
 def progress():
     return json.dumps(training_progress)
+
+@app.route('/download')
+def download_csv():
+    if training_progress['status'] != 'completed' or training_progress['data_with_predictions'] is None:
+        return "Training not completed or data not available", 400
+    data_df = pd.DataFrame(training_progress['data_with_predictions'])
+    csv_data = data_df.to_csv(index=False)
+    return csv_data, 200, {'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=ohlcv_sma_model_predictions.csv'}
 
 def train_model():
     global training_progress
@@ -285,7 +300,7 @@ def train_model():
             time.sleep(0.1)  # Small delay to allow progress updates
 
     # Train the model
-    history = model.fit(X_train_scaled, y_train, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
+    history = model.fit(X_train_scaled, y_train, batch_size=64, epochs=1600, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
 
     # Predict on the test set
     y_pred = model.predict(X_test_scaled)
@@ -305,6 +320,17 @@ def train_model():
     training_progress['test_predictions'] = y_pred_continuous.tolist()
     training_progress['test_actual'] = y_test.tolist()
     training_progress['status'] = 'completed'
+    
+    # Prepare data for CSV download: combine original data with model predictions
+    # Note: Predictions are for test set; align with original data indices
+    data_with_predictions = data.copy()
+    data_with_predictions['model_output'] = np.nan  # Initialize with NaN
+    # Map test predictions back to original indices
+    test_indices = range(len(X_train), len(X_train) + len(X_test))
+    for idx, pred in zip(test_indices, y_pred_continuous):
+        if idx < len(data_with_predictions):
+            data_with_predictions.loc[idx, 'model_output'] = pred
+    training_progress['data_with_predictions'] = data_with_predictions.to_dict()
 
     # Save the model if needed
     # model.save('lstm_model.h5')
