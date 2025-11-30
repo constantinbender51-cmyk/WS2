@@ -222,7 +222,7 @@ def train_model():
     X = []
     y = []
     skipped_count = 0
-    for i in range(365, len(close_prices)):
+    for i in range(367, len(close_prices)):
         # Features: SMA_365, SMA_120, (close - SMA) / SMA for both, values for the past 2 days
         sma_365_features = data['sma_365'].values[i-2:i]
         sma_120_features = data['sma_120'].values[i-2:i]
@@ -332,16 +332,16 @@ def train_model():
     training_progress['status'] = 'completed'
     
     # Prepare data for CSV download: combine original data with model predictions
-    # Align predictions with original datetime indices, starting from row 365
+    # Align predictions with original datetime indices, starting from row 367
     data_with_predictions = data.copy()
     data_with_predictions['model_output'] = np.nan  # Initialize with NaN
-    # Map training predictions back to original indices, offset by 365
-    train_indices = range(365, 365 + len(X_train))
+    # Map training predictions back to original indices, offset by 367
+    train_indices = range(367, 367 + len(X_train))
     for idx, pred in zip(train_indices, y_train_pred_continuous):
         if idx < len(data_with_predictions):
             data_with_predictions.loc[idx, 'model_output'] = pred
-    # Map test predictions back to original indices, offset by 365
-    test_indices = range(365 + len(X_train), 365 + len(X_train) + len(X_test))
+    # Map test predictions back to original indices, offset by 367
+    test_indices = range(367 + len(X_train), 367 + len(X_train) + len(X_test))
     for idx, pred in zip(test_indices, y_test_pred_continuous):
         if idx < len(data_with_predictions):
             data_with_predictions.loc[idx, 'model_output'] = pred
