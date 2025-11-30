@@ -249,11 +249,11 @@ def train_model():
 
     # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
-        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=8e-4, l2=2e-4)),
+        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=4e-4, l2=2e-4)),
         Dropout(0.6),
-        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=8e-4, l2=2e-4)),
+        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=4e-4, l2=2e-4)),
         Dropout(0.6),
-        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=8e-4, l2=2e-4)),
+        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=4e-4, l2=2e-4)),
         Dense(1, activation='tanh')  # Tanh activation for bounded predictions [-1, 1]
     ])
 
