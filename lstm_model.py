@@ -17,7 +17,7 @@ import json
 training_progress = {
     'status': 'not_started',  # 'not_started', 'running', 'completed'
     'current_epoch': 0,
-    'total_epochs': 800,
+    'total_epochs': 1600,
     'train_loss': [],
     'val_loss': [],
     'train_predictions': [],
@@ -247,11 +247,11 @@ def train_model():
 
     # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
-        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=2e-4, l2=1e-4)),
+        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=4e-4, l2=1e-4)),
         Dropout(0.3),
-        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=2e-4, l2=1e-4)),
+        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=4e-4, l2=1e-4)),
         Dropout(0.3),
-        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=2e-4, l2=1e-4)),
+        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=4e-4, l2=1e-4)),
         Dense(1, activation='linear')  # Linear activation for regression
     ])
 
@@ -283,7 +283,7 @@ def train_model():
             time.sleep(0.1)  # Small delay to allow progress updates
 
     # Train the model
-    history = model.fit(X_train_scaled, y_train, batch_size=128, epochs=800, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
+    history = model.fit(X_train_scaled, y_train, batch_size=128, epochs=1600, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
 
     # Predict on the test set
     y_pred = model.predict(X_test_scaled)
