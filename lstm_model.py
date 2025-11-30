@@ -23,9 +23,7 @@ training_progress = {
     'train_predictions': [],
     'train_actual': [],
     'test_predictions': [],
-    'test_actual': [],
-    'train_dates': [],
-    'test_dates': []
+    'test_actual': []
 }
 
 app = Flask(__name__)
@@ -56,12 +54,11 @@ html_template = '''
     </div>
     <div id="charts" style="display: {{ charts_display }};">
         <h2>Loss Over Epochs</h2>
-        <canvas id="lossChart" width="400" height="145"></canvas>
+        <canvas id="lossChart" width="400" height="200"></canvas>
         <h2>Training Predictions vs Actual</h2>
-        <canvas id="trainPredictionChart" width="400" height="145"></canvas>
+        <canvas id="trainPredictionChart" width="400" height="200"></canvas>
         <h2>Test Predictions vs Actual</h2>
-        <canvas id="testPredictionChart" width="400" height="145"></canvas>
-
+        <canvas id="testPredictionChart" width="400" height="200"></canvas>
     </div>
     <script>
         function updateProgress() {
@@ -85,12 +82,6 @@ html_template = '''
         }
         
         function updateCharts(data) {
-            console.log('Updating charts with data:', {
-                train_loss_length: data.train_loss?.length,
-                train_capital_length: data.train_capital?.length,
-                test_capital_length: data.test_capital?.length
-            });
-            
             // Loss chart
             const lossCtx = document.getElementById('lossChart').getContext('2d');
             // Destroy existing chart if it exists to avoid duplicates
@@ -142,8 +133,6 @@ html_template = '''
                 },
                 options: { responsive: true }
             });
-            
-
         }
         
         // Update every second
@@ -189,11 +178,6 @@ def train_model():
     for col in required_columns:
         if col not in data.columns:
             raise ValueError(f"Column '{col}' not found in the data. Please check the CSV structure.")
-    
-    # Check if 'datetime' column exists; if not, create a dummy date column using the index
-    if 'datetime' not in data.columns:
-        print("Warning: 'datetime' column not found. Creating a dummy date column based on index.")
-        data['datetime'] = pd.date_range(start='2000-01-01', periods=len(data), freq='D')
 
     # Prepare features and target
     # Features: past 365 days of close prices for each day i (i-1 to i-365)
@@ -265,11 +249,11 @@ def train_model():
 
     # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
-        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
+        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=8e-4, l2=2e-4)),
         Dropout(0.6),
-        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
+        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=8e-4, l2=2e-4)),
         Dropout(0.6),
-        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
+        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=8e-4, l2=2e-4)),
         Dense(1, activation='tanh')  # Tanh activation for bounded predictions [-1, 1]
     ])
 
@@ -292,43 +276,11 @@ def train_model():
             test_pred = self.model.predict(X_test_scaled, verbose=0)
             test_pred_continuous = test_pred.flatten()
             
-            # Calculate capital evolution for training period
-            train_capital = [1000.0]  # Start with $1000
-            train_start_idx = len(data) - len(y_train)
-            train_prices = data['close'].values[train_start_idx:train_start_idx + len(y_train)]
-            
-            print(f"Debug: Training capital calculation - y_train length: {len(y_train)}, train_prices length: {len(train_prices)}")
-            
-            for i in range(1, len(y_train)):
-                signal = train_pred_continuous[i-1]  # Use previous day's predicted signal
-                price_change = (train_prices[i] - train_prices[i-1]) / train_prices[i-1]
-                capital = train_capital[-1] * (1 + signal * price_change)
-                train_capital.append(capital)
-
-            # Calculate capital evolution for testing period
-            test_capital = [1000.0]  # Start with $1000
-            test_start_idx = len(data) - len(y_test)
-            test_prices = data['close'].values[test_start_idx:test_start_idx + len(y_test)]
-            
-            print(f"Debug: Test capital calculation - y_test length: {len(y_test)}, test_prices length: {len(test_prices)}")
-            
-            for i in range(1, len(y_test)):
-                signal = test_pred_continuous[i-1]  # Use previous day's predicted signal
-                price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
-                capital = test_capital[-1] * (1 + signal * price_change)
-                test_capital.append(capital)
-
-            # Store training and test predictions, actual values, capital, prices, and dates
+            # Store training and test predictions and actual values
             training_progress['train_predictions'] = train_pred_continuous.tolist()
             training_progress['train_actual'] = y_train.tolist()
             training_progress['test_predictions'] = test_pred_continuous.tolist()
             training_progress['test_actual'] = y_test.tolist()
-            training_progress['train_capital'] = train_capital
-            training_progress['test_capital'] = test_capital
-            training_progress['train_prices'] = train_prices.tolist()
-            training_progress['test_prices'] = test_prices.tolist()
-            training_progress['train_dates'] = data['datetime'].values[train_start_idx:train_start_idx + len(y_train)].tolist()
-            training_progress['test_dates'] = data['datetime'].values[test_start_idx:test_start_idx + len(y_test)].tolist()
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
@@ -340,34 +292,6 @@ def train_model():
 
     # Use raw continuous predictions for sma_position in range [-1, 1]
     y_pred_continuous = y_pred.flatten()
-
-    # Calculate capital evolution for training period
-    train_capital = [1000.0]  # Start with $1000
-    train_prices = data['close'].values[len(data) - len(y_train):len(data) - len(y_train) + len(y_train)]
-    
-    for i in range(1, len(y_train)):
-        signal = y_train[i-1]  # Use previous day's signal
-        price_change = (train_prices[i] - train_prices[i-1]) / train_prices[i-1]
-        capital = train_capital[-1] * (1 + signal * price_change)
-        train_capital.append(capital)
-
-    # Calculate capital evolution for testing period
-    test_capital = [1000.0]  # Start with $1000
-    test_prices = data['close'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)]
-    
-    for i in range(1, len(y_test)):
-        signal = y_pred_continuous[i-1]  # Use previous day's predicted signal
-        price_change = (test_prices[i] - test_prices[i-1]) / test_prices[i-1]
-        capital = test_capital[-1] * (1 + signal * price_change)
-        test_capital.append(capital)
-
-    # Store capital, price, and date data
-    training_progress['train_capital'] = train_capital
-    training_progress['test_capital'] = test_capital
-    training_progress['train_prices'] = train_prices.tolist()
-    training_progress['test_prices'] = test_prices.tolist()
-    training_progress['train_dates'] = data['datetime'].values[len(data) - len(y_train):len(data) - len(y_train) + len(y_train)].tolist()
-    training_progress['test_dates'] = data['datetime'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)].tolist()
 
     # Calculate performance metrics using continuous predictions (e.g., MSE, MAE)
     mse = np.mean((y_test - y_pred_continuous) ** 2)
