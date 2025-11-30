@@ -86,6 +86,12 @@ html_template = '''
         }
         
         function updateCharts(data) {
+            console.log('Updating charts with data:', {
+                train_loss_length: data.train_loss?.length,
+                train_capital_length: data.train_capital?.length,
+                test_capital_length: data.test_capital?.length
+            });
+            
             // Loss chart
             const lossCtx = document.getElementById('lossChart').getContext('2d');
             // Destroy existing chart if it exists to avoid duplicates
@@ -137,6 +143,30 @@ html_template = '''
                 },
                 options: { responsive: true }
             });
+            
+            // Capital Evolution chart
+            const capitalCtx = document.getElementById('capitalChart').getContext('2d');
+            if (window.capitalChartInstance) {
+                window.capitalChartInstance.destroy();
+            }
+            if (data.train_capital && data.test_capital && data.train_capital.length > 0 && data.test_capital.length > 0) {
+                window.capitalChartInstance = new Chart(capitalCtx, {
+                    type: 'line',
+                    data: {
+                        labels: Array.from({length: Math.max(data.train_capital.length, data.test_capital.length)}, (_, i) => i),
+                        datasets: [
+                            { label: 'Training Capital', data: data.train_capital, borderColor: 'green', fill: false },
+                            { label: 'Test Capital', data: data.test_capital, borderColor: 'blue', fill: false }
+                        ]
+                    },
+                    options: { responsive: true }
+                });
+            } else {
+                console.warn('Capital data not available or empty:', {
+                    train_capital: data.train_capital,
+                    test_capital: data.test_capital
+                });
+            }
         }
         
         // Update every second
@@ -282,7 +312,10 @@ def train_model():
             
             # Calculate capital evolution for training period
             train_capital = [1000.0]  # Start with $1000
-            train_prices = data['close'].values[len(data) - len(y_train):len(data) - len(y_train) + len(y_train)]
+            train_start_idx = len(data) - len(y_train)
+            train_prices = data['close'].values[train_start_idx:train_start_idx + len(y_train)]
+            
+            print(f"Debug: Training capital calculation - y_train length: {len(y_train)}, train_prices length: {len(train_prices)}")
             
             for i in range(1, len(y_train)):
                 signal = y_train[i-1]  # Use previous day's signal
@@ -292,7 +325,10 @@ def train_model():
 
             # Calculate capital evolution for testing period
             test_capital = [1000.0]  # Start with $1000
-            test_prices = data['close'].values[len(data) - len(y_test):len(data) - len(y_test) + len(y_test)]
+            test_start_idx = len(data) - len(y_test)
+            test_prices = data['close'].values[test_start_idx:test_start_idx + len(y_test)]
+            
+            print(f"Debug: Test capital calculation - y_test length: {len(y_test)}, test_prices length: {len(test_prices)}")
             
             for i in range(1, len(y_test)):
                 signal = test_pred_continuous[i-1]  # Use previous day's predicted signal
