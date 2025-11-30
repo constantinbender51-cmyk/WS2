@@ -120,7 +120,7 @@ html_template = '''
             window.trainPredictionChartInstance = new Chart(trainPredCtx, {
                 type: 'line',
                 data: {
-                    labels: data.train_dates || Array.from({length: data.train_predictions.length}, (_, i) => i),
+                    labels: Array.from({length: data.train_predictions.length}, (_, i) => i),
                     datasets: [
                         { label: 'Training Predictions', data: data.train_predictions, borderColor: 'green', fill: false },
                         { label: 'Training Actual', data: data.train_actual, borderColor: 'orange', fill: false }
@@ -137,7 +137,7 @@ html_template = '''
             window.testPredictionChartInstance = new Chart(testPredCtx, {
                 type: 'line',
                 data: {
-                    labels: data.test_dates || Array.from({length: data.test_predictions.length}, (_, i) => i),
+                    labels: Array.from({length: data.test_predictions.length}, (_, i) => i),
                     datasets: [
                         { label: 'Test Predictions', data: data.test_predictions, borderColor: 'blue', fill: false },
                         { label: 'Test Actual', data: data.test_actual, borderColor: 'red', fill: false }
@@ -157,7 +157,11 @@ html_template = '''
                     datasets.push({ label: 'Training Capital', data: data.train_capital, borderColor: 'green', fill: false });
                 }
                 if (data.test_capital && data.test_capital.length > 0) {
-                    datasets.push({ label: 'Test Capital', data: data.test_capital, borderColor: 'blue', fill: false });
+                    // Offset test capital indices to start after training capital
+                    const testCapitalData = data.test_capital;
+                    const trainCapitalLength = data.train_capital ? data.train_capital.length : 0;
+                    const testIndices = Array.from({length: testCapitalData.length}, (_, i) => i + trainCapitalLength);
+                    datasets.push({ label: 'Test Capital', data: testCapitalData.map((value, index) => ({ x: testIndices[index], y: value })), borderColor: 'blue', fill: false });
                 }
                 if (data.train_prices && data.train_prices.length > 0) {
                     datasets.push({ label: 'Training Price', data: data.train_prices, borderColor: 'orange', fill: false, yAxisID: 'y1' });
@@ -165,8 +169,8 @@ html_template = '''
                 if (data.test_prices && data.test_prices.length > 0) {
                     datasets.push({ label: 'Test Price', data: data.test_prices, borderColor: 'red', fill: false, yAxisID: 'y1' });
                 }
-                // Use numerical indices for labels to avoid overlap
-                const maxLength = Math.max(data.train_capital?.length || 0, data.test_capital?.length || 0, data.train_prices?.length || 0, data.test_prices?.length || 0);
+                // Use numerical indices for labels, adjusted for test capital offset
+                const maxLength = Math.max(data.train_capital?.length || 0, (data.test_capital?.length || 0) + (data.train_capital?.length || 0), data.train_prices?.length || 0, data.test_prices?.length || 0);
                 const labels = Array.from({length: maxLength}, (_, i) => i);
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
@@ -177,6 +181,11 @@ html_template = '''
                     options: {
                         responsive: true,
                         scales: {
+                            x: {
+                                type: 'linear',
+                                display: true,
+                                title: { display: true, text: 'Index' }
+                            },
                             y: {
                                 type: 'linear',
                                 display: true,
