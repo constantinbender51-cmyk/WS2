@@ -195,16 +195,16 @@ def train_model():
     print(f"Debug: Calculated close / sma_365, NaN count: {data['close_over_sma_365'].isna().sum()}")
     print(f"Debug: Calculated close / sma_120, NaN count: {data['close_over_sma_120'].isna().sum()}")
     
-    # Create sequences of 4 days for features
+    # Create sequences of 8 days for features
     X = []
     y = []
     skipped_count = 0
     for i in range(365, len(close_prices)):
-        # Features: SMA_365, SMA_120, (close - SMA) / SMA for both, values for the past 4 days
-        sma_365_features = data['sma_365'].values[i-4:i]
-        sma_120_features = data['sma_120'].values[i-4:i]
-        close_over_sma_365_features = data['close_over_sma_365'].values[i-4:i]
-        close_over_sma_120_features = data['close_over_sma_120'].values[i-4:i]
+        # Features: SMA_365, SMA_120, (close - SMA) / SMA for both, values for the past 8 days
+        sma_365_features = data['sma_365'].values[i-8:i]
+        sma_120_features = data['sma_120'].values[i-8:i]
+        close_over_sma_365_features = data['close_over_sma_365'].values[i-8:i]
+        close_over_sma_120_features = data['close_over_sma_120'].values[i-8:i]
         
         # Skip if any NaN values in the sequence
         if np.any(np.isnan(sma_365_features)) or np.any(np.isnan(sma_120_features)) or np.any(np.isnan(close_over_sma_365_features)) or np.any(np.isnan(close_over_sma_120_features)):
