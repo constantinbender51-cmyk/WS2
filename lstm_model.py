@@ -309,32 +309,39 @@ def train_model():
     # Train the model
     history = model.fit(X_train_scaled, y_train, batch_size=64, epochs=160, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
 
-    # Predict on the test set
-    y_pred = model.predict(X_test_scaled)
+    # Predict on the training and test sets
+    y_train_pred = model.predict(X_train_scaled)
+    y_test_pred = model.predict(X_test_scaled)
 
     # Use raw continuous predictions for sma_position in range [-1, 1]
-    y_pred_continuous = y_pred.flatten()
+    y_train_pred_continuous = y_train_pred.flatten()
+    y_test_pred_continuous = y_test_pred.flatten()
 
     # Calculate performance metrics using continuous predictions (e.g., MSE, MAE)
-    mse = np.mean((y_test - y_pred_continuous) ** 2)
-    mae = np.mean(np.abs(y_test - y_pred_continuous))
+    mse = np.mean((y_test - y_test_pred_continuous) ** 2)
+    mae = np.mean(np.abs(y_test - y_test_pred_continuous))
 
     # Print metrics
     print(f"Mean Squared Error: {mse:.4f}")
     print(f"Mean Absolute Error: {mae:.4f}")
 
     # Update progress with predictions and test data
-    training_progress['test_predictions'] = y_pred_continuous.tolist()
+    training_progress['test_predictions'] = y_test_pred_continuous.tolist()
     training_progress['test_actual'] = y_test.tolist()
     training_progress['status'] = 'completed'
     
     # Prepare data for CSV download: combine original data with model predictions
-    # Note: Predictions are for test set; align with original data indices
+    # Align predictions with original datetime indices for both training and test sets
     data_with_predictions = data.copy()
     data_with_predictions['model_output'] = np.nan  # Initialize with NaN
+    # Map training predictions back to original indices
+    train_indices = range(len(X_train))
+    for idx, pred in zip(train_indices, y_train_pred_continuous):
+        if idx < len(data_with_predictions):
+            data_with_predictions.loc[idx, 'model_output'] = pred
     # Map test predictions back to original indices
     test_indices = range(len(X_train), len(X_train) + len(X_test))
-    for idx, pred in zip(test_indices, y_pred_continuous):
+    for idx, pred in zip(test_indices, y_test_pred_continuous):
         if idx < len(data_with_predictions):
             data_with_predictions.loc[idx, 'model_output'] = pred
     training_progress['data_with_predictions'] = data_with_predictions.to_dict()
