@@ -185,34 +185,34 @@ def train_model():
     close_prices = data['close'].values
     sma_positions = data['sma_position'].values
 
-    # Calculate 365-day, 120-day SMAs, SMA 365 - close, and close minus 120 SMA, then handle NaN values
+    # Calculate 365-day SMA, 120-day SMA, (close - 365 SMA) / 365, and (close - 120 SMA) / 120, then handle NaN values
     data['sma_365'] = data['close'].rolling(window=365).mean()
     data['sma_120'] = data['close'].rolling(window=120).mean()
-    data['sma_365_minus_close'] = data['sma_365'] - data['close']
-    data['close_minus_sma_120'] = data['close'] - data['sma_120']
+    data['close_minus_365_over_365'] = (data['close'] - data['sma_365']) / 365
+    data['close_minus_120_over_120'] = (data['close'] - data['sma_120']) / 120
     print(f"Debug: Calculated SMA_365, NaN count: {data['sma_365'].isna().sum()}")
     print(f"Debug: Calculated SMA_120, NaN count: {data['sma_120'].isna().sum()}")
-    print(f"Debug: Calculated SMA_365_minus_close, NaN count: {data['sma_365_minus_close'].isna().sum()}")
-    print(f"Debug: Calculated close_minus_sma_120, NaN count: {data['close_minus_sma_120'].isna().sum()}")
+    print(f"Debug: Calculated (close - 365 SMA) / 365, NaN count: {data['close_minus_365_over_365'].isna().sum()}")
+    print(f"Debug: Calculated (close - 120 SMA) / 120, NaN count: {data['close_minus_120_over_120'].isna().sum()}")
     
     # Create sequences of 2 days for features
     X = []
     y = []
     skipped_count = 0
     for i in range(365, len(close_prices)):
-        # Features: SMA 365 - close, SMA_365, SMA_120, and close minus 120 SMA values for the past 2 days
-        sma_365_minus_close_features = data['sma_365_minus_close'].values[i-2:i]
+        # Features: SMA_365, SMA_120, (close - 365 SMA) / 365, and (close - 120 SMA) / 120 values for the past 2 days
         sma_365_features = data['sma_365'].values[i-2:i]
         sma_120_features = data['sma_120'].values[i-2:i]
-        close_minus_sma_120_features = data['close_minus_sma_120'].values[i-2:i]
+        close_minus_365_over_365_features = data['close_minus_365_over_365'].values[i-2:i]
+        close_minus_120_over_120_features = data['close_minus_120_over_120'].values[i-2:i]
         
         # Skip if any NaN values in the sequence
-        if np.any(np.isnan(sma_365_minus_close_features)) or np.any(np.isnan(sma_365_features)) or np.any(np.isnan(sma_120_features)) or np.any(np.isnan(close_minus_sma_120_features)):
+        if np.any(np.isnan(sma_365_features)) or np.any(np.isnan(sma_120_features)) or np.any(np.isnan(close_minus_365_over_365_features)) or np.any(np.isnan(close_minus_120_over_120_features)):
             skipped_count += 1
             continue
             
-        # Combine SMA 365 - close, SMA_365, SMA_120, and close minus 120 SMA as features
-        combined_features = np.column_stack((sma_365_minus_close_features, sma_365_features, sma_120_features, close_minus_sma_120_features))
+        # Combine SMA_365, SMA_120, (close - 365 SMA) / 365, and (close - 120 SMA) / 120 as features
+        combined_features = np.column_stack((sma_365_features, sma_120_features, close_minus_365_over_365_features, close_minus_120_over_120_features))
         X.append(combined_features)
         y.append(sma_positions[i])
 
@@ -222,7 +222,7 @@ def train_model():
     print(f"Debug: X shape after array conversion: {X.shape}, y shape: {y.shape}")
 
     # Reshape X for LSTM input: (samples, time steps, features)
-    # Now we have 4 features per time step (SMA 365 - close, SMA_365, SMA_120, close minus 120 SMA)
+    # Now we have 4 features per time step (SMA_365, SMA_120, (close - 365 SMA) / 365, (close - 120 SMA) / 120)
     X = X.reshape((X.shape[0], X.shape[1], 4))
 
     # Split the data into training and testing sets (80% train, 20% test)
