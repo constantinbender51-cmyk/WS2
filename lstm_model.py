@@ -63,7 +63,7 @@ html_template = '''
     </div>
     <div id="download_section" style="display: {{ charts_display }};">
         <h2>Download Data</h2>
-        <p><a href="/download" id="download_link">Download CSV with OHLCV, SMA Position, and Model Output</a></p>
+        <p><a href="/download" id="download_link">Download CSV with OHLCV, SMA Position, and Features</a></p>
     </div>
     <script>
         function updateProgress() {
@@ -170,8 +170,13 @@ def download_csv():
     if training_progress['status'] != 'completed' or training_progress['data_with_predictions'] is None:
         return "Training not completed or data not available", 400
     data_df = pd.DataFrame(training_progress['data_with_predictions'])
+    # Select columns: OHLCV, sma_position, and features (SMA_365, SMA_120, close_over_sma_365, close_over_sma_120)
+    columns_to_include = ['date', 'open', 'high', 'low', 'close', 'volume', 'sma_position', 'sma_365', 'sma_120', 'close_over_sma_365', 'close_over_sma_120']
+    # Filter to available columns to avoid KeyError
+    available_columns = [col for col in columns_to_include if col in data_df.columns]
+    data_df = data_df[available_columns]
     csv_data = data_df.to_csv(index=False)
-    return csv_data, 200, {'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=ohlcv_sma_model_predictions.csv'}
+    return csv_data, 200, {'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=ohlcv_sma_features.csv'}
 
 def train_model():
     global training_progress
