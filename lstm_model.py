@@ -153,70 +153,74 @@ html_template = '''
             }
             if ((data.train_capital && data.train_capital.length > 0) || (data.test_capital && data.test_capital.length > 0) || (data.train_prices && data.train_prices.length > 0) || (data.test_prices && data.test_prices.length > 0)) {
                 const datasets = [];
+                
+                // Add baseline capital line (grey)
+                const maxLength = Math.max(data.train_capital?.length || 0, (data.test_capital?.length || 0) + (data.train_capital?.length || 0));
+                const baselineCapital = Array(maxLength).fill(1000);
+                datasets.push({ 
+                    label: 'Baseline Capital', 
+                    data: baselineCapital, 
+                    borderColor: 'grey', 
+                    borderDash: [5, 5],
+                    fill: false,
+                    pointRadius: 0
+                });
+                
                 if (data.train_capital && data.train_capital.length > 0) {
-                    datasets.push({ label: 'Training Capital', data: data.train_capital, borderColor: 'green', fill: false });
+                    datasets.push({ 
+                        label: 'Training Capital', 
+                        data: data.train_capital, 
+                        borderColor: 'blue', 
+                        fill: false,
+                        borderWidth: 2
+                    });
                 }
                 if (data.test_capital && data.test_capital.length > 0) {
                     // Offset test capital indices to start after training capital
                     const testCapitalData = data.test_capital;
                     const trainCapitalLength = data.train_capital ? data.train_capital.length : 0;
                     const testIndices = Array.from({length: testCapitalData.length}, (_, i) => i + trainCapitalLength);
-                    datasets.push({ label: 'Test Capital', data: testCapitalData.map((value, index) => ({ x: testIndices[index], y: value })), borderColor: 'blue', fill: false });
+                    datasets.push({ 
+                        label: 'Test Capital', 
+                        data: testCapitalData.map((value, index) => ({ x: testIndices[index], y: value })), 
+                        borderColor: 'orange', 
+                        fill: false,
+                        borderWidth: 2
+                    });
                 }
                 if (data.train_prices && data.train_prices.length > 0) {
-                    datasets.push({ label: 'Training Price', data: data.train_prices, borderColor: 'orange', fill: false, yAxisID: 'y1' });
+                    datasets.push({ 
+                        label: 'Training Price', 
+                        data: data.train_prices, 
+                        borderColor: 'green', 
+                        fill: false, 
+                        yAxisID: 'y1',
+                        borderWidth: 1
+                    });
                 }
                 if (data.test_prices && data.test_prices.length > 0) {
                     // Offset test price indices to start after training price
                     const testPriceData = data.test_prices;
                     const trainPriceLength = data.train_prices ? data.train_prices.length : 0;
                     const testPriceIndices = Array.from({length: testPriceData.length}, (_, i) => i + trainPriceLength);
-                    datasets.push({ label: 'Test Price', data: testPriceData.map((value, index) => ({ x: testPriceIndices[index], y: value })), borderColor: 'red', fill: false, yAxisID: 'y1' });
+                    datasets.push({ 
+                        label: 'Test Price', 
+                        data: testPriceData.map((value, index) => ({ x: testPriceIndices[index], y: value })), 
+                        borderColor: 'red', 
+                        fill: false, 
+                        yAxisID: 'y1',
+                        borderWidth: 1
+                    });
                 }
+                
                 // Use numerical indices for labels, adjusted for test capital offset
-                const maxLength = Math.max(data.train_capital?.length || 0, (data.test_capital?.length || 0) + (data.train_capital?.length || 0), data.train_prices?.length || 0, data.test_prices?.length || 0);
                 const labels = Array.from({length: maxLength}, (_, i) => i);
-                
-                // Create background colors based on SMA positions
-                const backgroundColors = [];
-                const trainSmaPositions = data.train_actual || [];
-                const testSmaPositions = data.test_actual || [];
-                
-                // Combine training and test SMA positions
-                const allSmaPositions = [...trainSmaPositions, ...testSmaPositions];
-                
-                // Create background color for each data point
-                for (let i = 0; i < maxLength; i++) {
-                    if (i < allSmaPositions.length) {
-                        const smaPosition = allSmaPositions[i];
-                        if (smaPosition === -1) {
-                            backgroundColors.push('rgba(255, 165, 0, 0.3)'); // Orange
-                        } else if (smaPosition === 1) {
-                            backgroundColors.push('rgba(0, 0, 255, 0.3)'); // Blue
-                        } else {
-                            backgroundColors.push('rgba(128, 128, 128, 0.3)'); // Grey
-                        }
-                    } else {
-                        backgroundColors.push('transparent');
-                    }
-                }
-                
-                // Add background dataset for SMA position colors
-                const backgroundDataset = {
-                    label: 'SMA Position Background',
-                    data: Array(maxLength).fill(null), // Null data points
-                    backgroundColor: backgroundColors,
-                    type: 'bar',
-                    barPercentage: 1.0,
-                    categoryPercentage: 1.0,
-                    order: 0 // Render behind other datasets
-                };
                 
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
                     data: {
                         labels: labels,
-                        datasets: [backgroundDataset, ...datasets]
+                        datasets: datasets
                     },
                     options: {
                         responsive: true,
@@ -224,8 +228,7 @@ html_template = '''
                             x: {
                                 type: 'linear',
                                 display: true,
-                                title: { display: true, text: 'Day Index' },
-                                grid: { display: false } // Disable grid lines to avoid overlap
+                                title: { display: true, text: 'Day Index' }
                             },
                             y: {
                                 type: 'linear',
@@ -247,6 +250,8 @@ html_template = '''
                                     label: function(context) {
                                         const index = context.dataIndex;
                                         let smaPosition = 'N/A';
+                                        const trainSmaPositions = data.train_actual || [];
+                                        const testSmaPositions = data.test_actual || [];
                                         
                                         if (index < trainSmaPositions.length) {
                                             smaPosition = trainSmaPositions[index];
