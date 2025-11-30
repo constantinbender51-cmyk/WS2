@@ -209,8 +209,8 @@ def train_model():
             skipped_count += 1
             continue
             
-        # Combine close prices and the 3 SMA values as features
-        combined_features = np.column_stack((close_features, sma_365_features, sma_120_features, sma_difference_features))
+        # Combine close prices and the 2 SMA values as features (sma_difference removed)
+        combined_features = np.column_stack((close_features, sma_365_features, sma_120_features))
         X.append(combined_features)
         y.append(sma_positions[i])
 
@@ -220,8 +220,8 @@ def train_model():
     print(f"Debug: X shape after array conversion: {X.shape}, y shape: {y.shape}")
 
     # Reshape X for LSTM input: (samples, time steps, features)
-    # Now we have 4 features per time step (close price, SMA_365, SMA_120, and SMA_difference)
-    X = X.reshape((X.shape[0], X.shape[1], 4))
+    # Now we have 3 features per time step (close price, SMA_365, SMA_120) - sma_difference removed
+    X = X.reshape((X.shape[0], X.shape[1], 3))
 
     # Split the data into training and testing sets (80% train, 20% test)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
@@ -247,11 +247,13 @@ def train_model():
 
     # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
-        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=4e-4, l2=1e-4)),
+        LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 3), kernel_regularizer=l1_l2(l1=4e-4, l2=5e-5)),
         Dropout(0.3),
-        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=4e-4, l2=1e-4)),
+        LSTM(8, return_sequences=True, kernel_regularizer=l1_l2(l1=4e-4, l2=5e-5)),
         Dropout(0.3),
-        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=4e-4, l2=1e-4)),
+        LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=4e-4, l2=5e-5)),
+        Dropout(0.3),
+        Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=4e-4, l2=5e-5)),
         Dense(1, activation='linear')  # Linear activation for regression
     ])
 
