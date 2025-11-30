@@ -171,12 +171,12 @@ def download_csv():
         return "Training not completed or data not available", 400
     data_df = pd.DataFrame(training_progress['data_with_predictions'])
     # Select columns: datetime, OHLCV, sma_position, and model_output
-    columns_to_include = ['date', 'open', 'high', 'low', 'close', 'sma_position', 'model_output']
+    columns_to_include = ['timestamp', 'open', 'high', 'low', 'close', 'sma_position', 'model_output']
     # Filter to available columns to avoid KeyError
     available_columns = [col for col in columns_to_include if col in data_df.columns]
     data_df = data_df[available_columns]
-    # Rename 'date' to 'datetime' for clarity
-    data_df = data_df.rename(columns={'date': 'datetime'})
+    # Rename 'timestamp' to 'datetime' for clarity
+    data_df = data_df.rename(columns={'timestamp': 'datetime'})
     # Only drop rows where model_output is NaN to preserve historical data
     # This keeps rows with NaN in sma_position (first 365 rows) but removes rows without predictions
     data_df = data_df.dropna(subset=['model_output'])
@@ -197,9 +197,9 @@ def train_model():
     print(f"Debug: Loaded data with shape {data.shape} and columns {list(data.columns)}")
 
     # Ensure the data has OHLCV columns and sma_position; adjust column names if necessary
-    # Assuming columns: 'date', 'open', 'high', 'low', 'close', 'volume', 'sma_position'
+    # Assuming columns: 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'sma_position'
     # If column names differ, update accordingly
-    required_columns = ['open', 'high', 'low', 'close', 'volume', 'sma_position']
+    required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'sma_position']
     for col in required_columns:
         if col not in data.columns:
             raise ValueError(f"Column '{col}' not found in the data. Please check the CSV structure.")
