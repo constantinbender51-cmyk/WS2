@@ -165,11 +165,9 @@ html_template = '''
                 if (data.test_prices && data.test_prices.length > 0) {
                     datasets.push({ label: 'Test Price', data: data.test_prices, borderColor: 'red', fill: false, yAxisID: 'y1' });
                 }
-                // Use dates for labels; fallback to indices if dates not available
+                // Use numerical indices for labels to avoid overlap
                 const maxLength = Math.max(data.train_capital?.length || 0, data.test_capital?.length || 0, data.train_prices?.length || 0, data.test_prices?.length || 0);
-                const labels = data.train_dates && data.train_dates.length >= maxLength ? data.train_dates : 
-                              (data.test_dates && data.test_dates.length >= maxLength ? data.test_dates : 
-                              Array.from({length: maxLength}, (_, i) => i));
+                const labels = Array.from({length: maxLength}, (_, i) => i);
                 window.capitalChartInstance = new Chart(capitalCtx, {
                     type: 'line',
                     data: {
