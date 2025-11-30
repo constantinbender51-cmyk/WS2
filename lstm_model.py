@@ -380,6 +380,10 @@ def train_model():
         X_test_scaled = np.nan_to_num(X_test_scaled)
         y_test = np.nan_to_num(y_test)
 
+    # Convert SMA positions from -1,0,1 to 0,1,2 for sparse categorical crossentropy
+    y_train_encoded = y_train + 1  # Convert -1,0,1 to 0,1,2
+    y_test_encoded = y_test + 1    # Convert -1,0,1 to 0,1,2
+    
     # Build the LSTM model with reduced complexity and L1/L2 regularization
     model = Sequential([
         LSTM(16, return_sequences=True, input_shape=(X_train_scaled.shape[1], 4), kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
@@ -387,7 +391,7 @@ def train_model():
         LSTM(8, return_sequences=False, kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
         Dropout(0.6),
         Dense(4, activation='relu', kernel_regularizer=l1_l2(l1=16e-4, l2=2e-4)),
-        Dense(3, activation='softmax')  # 3 classes for SMA positions: -1, 0, 1
+        Dense(3, activation='softmax')  # 3 classes for SMA positions: 0,1,2 (mapped from -1,0,1)
     ])
 
     # Compile the model with gradient clipping
@@ -403,11 +407,11 @@ def train_model():
             
             # Get training predictions for this epoch
             train_pred = self.model.predict(X_train_scaled, verbose=0)
-            train_pred_classes = np.argmax(train_pred, axis=1) - 1  # Convert to -1, 0, 1
+            train_pred_classes = np.argmax(train_pred, axis=1) - 1  # Convert from 0,1,2 to -1,0,1
             
             # Get test predictions for this epoch
             test_pred = self.model.predict(X_test_scaled, verbose=0)
-            test_pred_classes = np.argmax(test_pred, axis=1) - 1  # Convert to -1, 0, 1
+            test_pred_classes = np.argmax(test_pred, axis=1) - 1  # Convert from 0,1,2 to -1,0,1
             
             # Calculate capital evolution for training period
             train_capital = [1000.0]  # Start with $1000
@@ -449,8 +453,8 @@ def train_model():
             
             time.sleep(0.1)  # Small delay to allow progress updates
 
-    # Train the model
-    history = model.fit(X_train_scaled, y_train, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test), verbose=1, callbacks=[ProgressCallback()])
+    # Train the model with encoded labels
+    history = model.fit(X_train_scaled, y_train_encoded, batch_size=64, epochs=800, validation_data=(X_test_scaled, y_test_encoded), verbose=1, callbacks=[ProgressCallback()])
 
     # Predict on the test set
     y_pred = model.predict(X_test_scaled)
