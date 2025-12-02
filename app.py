@@ -171,10 +171,10 @@ def calculate_compounded_returns(df):
     below_both = (df['open'] < sma_120) & (df['open'] < sma_365)
     
     # Calculate stop loss conditions
-    # For long positions: low is 1% below open
-    long_stop_loss = (df['low'] <= df['open'] * 0.99)
-    # For short positions: high is 1% above open
-    short_stop_loss = (df['high'] >= df['open'] * 1.01)
+    # For long positions: low is 5% below open
+    long_stop_loss = (df['low'] <= df['open'] * 0.95)
+    # For short positions: high is 5% above open
+    short_stop_loss = (df['high'] >= df['open'] * 1.05)
     
     # Apply conditions with stop loss
     # When above both SMAs (long position)
@@ -402,7 +402,7 @@ def index():
             <div class="info">
                 <h3>About This Visualization</h3>
                 <p><strong>Data Source:</strong> Binance API (BTC/USDT daily OHLCV from 2018-01-01 to present)</p>
-                <p><strong>Compounded Returns:</strong> Calculated based on conditions: positive returns when open price > 365-day and 120-day SMAs (long), negative returns when open price < both SMAs (short), otherwise 0. Stop loss triggers at 1%: long positions stop if low ≤ open * 0.99, short positions stop if high ≥ open * 1.01. Returns are multiplied by fixed leverage = 4.</p>
+                <p><strong>Compounded Returns:</strong> Calculated based on conditions: positive returns when open price > 365-day and 120-day SMAs (long), negative returns when open price < both SMAs (short), otherwise 0. Stop loss triggers at 5%: long positions stop if low ≤ open * 0.95, short positions stop if high ≥ open * 1.05. Returns are multiplied by fixed leverage = 4.</p>
                 <p><strong>Plot Details:</strong> Top chart shows BTC closing price with 120-day and 365-day SMAs. Bottom chart shows compounded returns (normalized to start at 1).</p>
                 <p><strong>Note:</strong> This is a technical implementation for educational purposes only.</p>
             </div>
