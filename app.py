@@ -282,10 +282,11 @@ def create_plot(df, rs_estimator, compounded_returns):
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc='upper left')
     
-    # Plot compounded returns
+    # Plot compounded returns with log scale
     ax3.plot(compounded_returns.index, compounded_returns, 
              label='Compounded Returns (Leverage = 4)', color='purple', linewidth=2)
-    ax3.set_ylabel('Compounded Returns (Normalized)', fontsize=12)
+    ax3.set_yscale('log')
+    ax3.set_ylabel('Compounded Returns (Normalized, Log Scale)', fontsize=12)
     ax3.set_xlabel('Date', fontsize=12)
     ax3.grid(True, alpha=0.3)
     ax3.legend(loc='upper left')
