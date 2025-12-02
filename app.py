@@ -249,7 +249,7 @@ def create_plot(df, compounded_returns):
     
     # Plot compounded returns with log scale
     ax2.plot(compounded_returns.index, compounded_returns, 
-             label='Compounded Returns (Fixed Leverage = 4, Stop Loss 3%)', color='purple', linewidth=2)
+             label='Compounded Returns (Fixed Leverage = 4, Stop Loss 1%)', color='purple', linewidth=2)
     ax2.set_yscale('log')
     ax2.set_ylabel('Compounded Returns (Normalized, Log Scale)', fontsize=12)
     ax2.set_xlabel('Date', fontsize=12)
@@ -400,7 +400,7 @@ def index():
             <div class="info">
                 <h3>About This Visualization</h3>
                 <p><strong>Data Source:</strong> Binance API (BTC/USDT daily OHLCV from 2018-01-01 to present)</p>
-                <p><strong>Compounded Returns:</strong> Calculated based on conditions: positive returns when price > 365-day and 120-day SMAs, negative returns when price < both SMAs, otherwise 0. Returns are multiplied by fixed leverage = 4 with a 3% stop loss.</p>
+                <p><strong>Compounded Returns:</strong> Calculated based on conditions: positive returns when price > 365-day and 120-day SMAs, negative returns when price < both SMAs, otherwise 0. Returns are multiplied by fixed leverage = 4 with a 1% stop loss.</p>
                 <p><strong>Plot Details:</strong> Top chart shows BTC closing price with 120-day and 365-day SMAs. Bottom chart shows compounded returns (normalized to start at 1).</p>
                 <p><strong>Note:</strong> This is a technical implementation for educational purposes only.</p>
             </div>
