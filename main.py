@@ -163,9 +163,6 @@ def calculate_returns(df):
 def index():
     """Main endpoint that displays the analysis"""
     try:
-        # Fetch data
-        df = fetch_binance_ohlcv()
-        
         # Fetch data with earlier start date for better SMA calculations
         df = fetch_binance_ohlcv(start_date='2017-01-01')
         
