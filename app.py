@@ -139,16 +139,13 @@ def calculate_sharpe_ratio(compounded_returns):
     # Calculate Sharpe ratio (annualized)
     sharpe_ratio = (mean_daily_return / std_daily_return) * np.sqrt(252)
     
-    return sharpe_ratio# Function to calculate compounded returns with fixed leverage and stop loss
+    return sharpe_ratio# Function to calculate compounded returns with fixed leverage
 def calculate_compounded_returns(df):
     """
     Calculate compounded returns based on conditions:
     - When open price > 365 SMA and > 120 SMA: use positive returns (long position)
     - When open price < 365 SMA and < 120 SMA: use negative returns (short position)
     - Otherwise: 0
-    Apply stop loss: 
-      For long positions: if low is 1% below open, returns = -1%
-      For short positions: if high is 1% above open, returns = -1%
     Multiply returns by fixed leverage = 4
     
     Parameters:
@@ -170,33 +167,14 @@ def calculate_compounded_returns(df):
     above_both = (df['open'] > sma_120) & (df['open'] > sma_365)
     below_both = (df['open'] < sma_120) & (df['open'] < sma_365)
     
-    # Calculate stop loss conditions
-    # For long positions: low is 16% below open
-    long_stop_loss = (df['low'] <= df['open'] * 0.84)
-    # For short positions: high is 16% above open
-    short_stop_loss = (df['high'] >= df['open'] * 1.16)
-    
-    # Apply conditions with stop loss
-    # When above both SMAs (long position)
-    long_positions = above_both & ~long_stop_loss
-    long_stopped = above_both & long_stop_loss
-    
-    # When below both SMAs (short position)
-    short_positions = below_both & ~short_stop_loss
-    short_stopped = below_both & short_stop_loss
-    
-    # Apply returns
-    # Normal long positions: positive returns from open to close
+    # Apply returns based on conditions
+    # When above both SMAs (long position): positive returns from open to close
     # For long positions, return = (close - open) / open = close/open - 1
-    adjusted_returns[long_positions] = (df['close'][long_positions] / df['open'][long_positions]) - 1
-    # Stopped long positions: -16% return (matching trigger)
-    adjusted_returns[long_stopped] = -0.16
+    adjusted_returns[above_both] = (df['close'][above_both] / df['open'][above_both]) - 1
     
-    # Normal short positions: negative returns from open to close
+    # When below both SMAs (short position): negative returns from open to close
     # For short positions, return = (open - close) / open = 1 - close/open
-    adjusted_returns[short_positions] = 1 - (df['close'][short_positions] / df['open'][short_positions])
-    # Stopped short positions: -16% return (matching trigger)
-    adjusted_returns[short_stopped] = -0.16
+    adjusted_returns[below_both] = 1 - (df['close'][below_both] / df['open'][below_both])
     
     # Otherwise: already 0
     
@@ -251,7 +229,7 @@ def create_plot(df, compounded_returns):
     
     # Plot compounded returns with log scale
     ax2.plot(compounded_returns.index, compounded_returns, 
-             label='Compounded Returns (Fixed Leverage = 4, Stop Loss 1%)', color='purple', linewidth=2)
+             label='Compounded Returns (Fixed Leverage = 4)', color='purple', linewidth=2)
     ax2.set_yscale('log')
     ax2.set_ylabel('Compounded Returns (Normalized, Log Scale)', fontsize=12)
     ax2.set_xlabel('Date', fontsize=12)
@@ -402,7 +380,7 @@ def index():
             <div class="info">
                 <h3>About This Visualization</h3>
                 <p><strong>Data Source:</strong> Binance API (BTC/USDT daily OHLCV from 2018-01-01 to present)</p>
-                <p><strong>Compounded Returns:</strong> Calculated based on conditions: positive returns when open price > 365-day and 120-day SMAs (long), negative returns when open price < both SMAs (short), otherwise 0. Stop loss triggers at 16%: long positions stop if low ≤ open * 0.84, short positions stop if high ≥ open * 1.16. Stop loss returns are -16% (matching trigger, multiplied by leverage = 4). Returns are multiplied by fixed leverage = 4.</p>
+                <p><strong>Compounded Returns:</strong> Calculated based on conditions: positive returns when open price > 365-day and 120-day SMAs (long), negative returns when open price < both SMAs (short), otherwise 0. Returns are multiplied by fixed leverage = 4.</p>
                 <p><strong>Plot Details:</strong> Top chart shows BTC closing price with 120-day and 365-day SMAs. Bottom chart shows compounded returns (normalized to start at 1).</p>
                 <p><strong>Note:</strong> This is a technical implementation for educational purposes only.</p>
             </div>
