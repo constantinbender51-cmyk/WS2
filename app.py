@@ -189,13 +189,13 @@ def calculate_compounded_returns(df):
     # Normal long positions: positive returns from open to close
     # For long positions, return = (close - open) / open = close/open - 1
     adjusted_returns[long_positions] = (df['close'][long_positions] / df['open'][long_positions]) - 1
-    # Stopped long positions: -5% return (will be multiplied by leverage)
+    # Stopped long positions: -5% return
     adjusted_returns[long_stopped] = -0.05
     
     # Normal short positions: negative returns from open to close
     # For short positions, return = (open - close) / open = 1 - close/open
     adjusted_returns[short_positions] = 1 - (df['close'][short_positions] / df['open'][short_positions])
-    # Stopped short positions: -5% return (will be multiplied by leverage)
+    # Stopped short positions: -5% return
     adjusted_returns[short_stopped] = -0.05
     
     # Otherwise: already 0
