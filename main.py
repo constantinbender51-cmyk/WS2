@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 import requests
 import io
+import sys
 
 app = Flask(__name__)
 
@@ -95,9 +96,16 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
 
 def calculate_returns(df):
     """Calculate returns based on SMA conditions"""
+    print(f"\n=== CALCULATING RETURNS ===")
+    print(f"Input DataFrame shape: {df.shape}")
+    
     # Calculate SMAs
     df['sma_120'] = df['close'].rolling(window=120).mean()
     df['sma_365'] = df['close'].rolling(window=365).mean()
+    
+    print(f"\nSMA calculation complete")
+    print(f"First few SMA values:")
+    print(df[['close', 'sma_120', 'sma_365']].head(10))
     
     # Calculate daily returns
     df['daily_return'] = df['close'].pct_change()
@@ -116,11 +124,20 @@ def calculate_returns(df):
     
     # All other days remain 0 (already initialized)
     
+    print(f"\nStrategy conditions:")
+    print(f"Days above both SMAs: {above_both.sum()}")
+    print(f"Days below both SMAs: {below_both.sum()}")
+    print(f"Days with zero returns: {(df['strategy_return'] == 0).sum()}")
+    
     # Calculate cumulative returns
     df['cumulative_return'] = (1 + df['strategy_return']).cumprod() - 1
     
     # Calculate buy and hold returns for comparison
     df['buy_hold_return'] = (1 + df['daily_return']).cumprod() - 1
+    
+    print(f"\nReturn statistics:")
+    print(f"Final strategy return: {df['cumulative_return'].iloc[-1]*100:.2f}%")
+    print(f"Final buy & hold return: {df['buy_hold_return'].iloc[-1]*100:.2f}%")
     
     return df
 
@@ -242,4 +259,10 @@ def index():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    print("Starting Flask server on port 8080...")
+    print(f"Python version: {sys.version}")
+    print(f"Pandas version: {pd.__version__}")
+    print(f"Flask version: {Flask.__version__}")
+    print("\nServer will output detailed console logs for debugging.")
+    print("Visit http://localhost:8080 to see the analysis.\n")
+    app.run(host='0.0.0.0', port=8080, debug=True)
