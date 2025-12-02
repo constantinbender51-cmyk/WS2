@@ -202,8 +202,8 @@ def calculate_compounded_returns(df, rs_estimator, factor=3):
     # Otherwise: already 0
     
     # Calculate leverage (using rs_estimator, fill NaN with 0)
-    # Use 3 / rs_estimator for inverse scaling
-    leverage = 3 / rs_estimator.fillna(0)
+    # Use 1 / rs_estimator for inverse scaling
+    leverage = 1 / rs_estimator.fillna(0)
     
     # Apply leverage
     leveraged_returns = adjusted_returns * leverage.shift(1)  # Use previous day's leverage
@@ -258,7 +258,7 @@ def create_plot(df, rs_estimator, compounded_returns):
     
     # Plot compounded returns
     ax3.plot(compounded_returns.index, compounded_returns, 
-             label='Compounded Returns (Leverage = 3 / RS)', color='purple', linewidth=2)
+             label='Compounded Returns (Leverage = 1 / RS)', color='purple', linewidth=2)
     ax3.set_ylabel('Compounded Returns (Normalized)', fontsize=12)
     ax3.set_xlabel('Date', fontsize=12)
     ax3.grid(True, alpha=0.3)
