@@ -25,6 +25,8 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
     current_start = start_timestamp
     limit = 1000  # Binance max per request
     
+    print(f"Fetching data from {start_date} to now...")
+    
     while current_start < end_timestamp:
         params = {
             'symbol': symbol,
@@ -33,22 +35,37 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
             'limit': limit
         }
         
-        response = requests.get(base_url, params=params)
-        if response.status_code != 200:
-            raise Exception(f"API request failed: {response.status_code}")
-        
-        data = response.json()
-        if not data:
-            break
+        try:
+            response = requests.get(base_url, params=params, timeout=10)
+            response.raise_for_status()
             
-        all_data.extend(data)
-        
-        # Update start time for next batch
-        current_start = data[-1][0] + 1
-        
-        # If we got less than limit, we're done
-        if len(data) < limit:
+            data = response.json()
+            if not data:
+                print(f"No data returned for batch starting at {current_start}")
+                break
+                
+            all_data.extend(data)
+            print(f"Fetched {len(data)} candles, total so far: {len(all_data)}")
+            
+            # Update start time for next batch
+            current_start = data[-1][0] + 1
+            
+            # If we got less than limit, we're done
+            if len(data) < limit:
+                print(f"Received less than limit ({len(data)} < {limit}), ending fetch")
+                break
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Request error: {e}")
             break
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            break
+    
+    if not all_data:
+        raise Exception("No data fetched from Binance API")
+    
+    print(f"Total candles fetched: {len(all_data)}")
     
     # Convert to DataFrame
     columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -66,6 +83,12 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
     df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('date', inplace=True)
     df.sort_index(inplace=True)
+    
+    print(f"Data range: {df.index[0]} to {df.index[-1]}")
+    print(f"Total rows: {len(df)}")
+    
+    if len(df) < 365:
+        print(f"Warning: Only {len(df)} data points, need at least 365 for full SMA calculations")
     
     return df[['open', 'high', 'low', 'close', 'volume']]
 
@@ -109,11 +132,19 @@ def index():
         # Fetch data
         df = fetch_binance_ohlcv()
         
+        if len(df) == 0:
+            return "Error: No data fetched from Binance"
+        
         # Calculate returns
         df = calculate_returns(df)
         
         # Drop NaN values (from SMA calculations)
         df_clean = df.dropna()
+        
+        if len(df_clean) == 0:
+            return "Error: No valid data after SMA calculations. Need at least 365 days of data."
+        
+        print(f"Clean data points for charts: {len(df_clean)}")
         
         # Create price chart
         price_trace = go.Scatter(
@@ -198,12 +229,15 @@ def index():
             'current_price': round(df_clean['close'].iloc[-1], 2)
         }
         
+        print(f"Stats calculated: {stats}")
+        
         return render_template('index.html', 
                              price_graph=price_graph,
                              returns_graph=returns_graph,
                              stats=stats)
         
     except Exception as e:
+        print(f"Error in index route: {str(e)}")
         return f"Error: {str(e)}"
 
 
