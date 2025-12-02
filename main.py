@@ -12,15 +12,21 @@ import sys
 app = Flask(__name__)
 
 
-def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'):
+def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2017-01-01'):
     """Fetch OHLCV data from Binance public API"""
     base_url = 'https://api.binance.com/api/v3/klines'
+    
+    # Validate symbol format
+    if not symbol.isupper() or not symbol.endswith('USDT'):
+        print(f"Warning: Symbol {symbol} may not be valid Binance format")
     
     # Convert start_date to timestamp
     start_timestamp = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
     
     # Get current timestamp
     end_timestamp = int(datetime.now().timestamp() * 1000)
+    
+    print(f"Fetching {symbol} data from {start_date} to now...")
     
     all_data = []
     current_start = start_timestamp
@@ -92,6 +98,13 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
         print(f"Warning: Only {len(df)} data points, need at least 365 for full SMA calculations")
     
     return df[['open', 'high', 'low', 'close', 'volume']]
+    
+    # Check if we have enough data for SMA calculations
+    if len(df) < 365:
+        print(f"Warning: Only {len(df)} data points, need at least 365 for full SMA calculations")
+        print(f"Consider using an earlier start_date or different interval")
+    
+    return df[['open', 'high', 'low', 'close', 'volume']]
 
 
 def calculate_returns(df):
@@ -118,9 +131,12 @@ def calculate_returns(df):
     above_both = (df['close'] > df['sma_120']) & (df['close'] > df['sma_365'])
     df.loc[above_both, 'strategy_return'] = df.loc[above_both, 'daily_return']
     
-    # Condition 2: Price below both SMAs -> negative returns
+    # Condition 2: Price below both SMAs -> negative returns (inverse of daily return)
     below_both = (df['close'] < df['sma_120']) & (df['close'] < df['sma_365'])
     df.loc[below_both, 'strategy_return'] = -df.loc[below_both, 'daily_return']
+    
+    # Debug: Show strategy return distribution
+    print(f"Strategy return range: [{df['strategy_return'].min():.4f}, {df['strategy_return'].max():.4f}]")
     
     # All other days remain 0 (already initialized)
     
@@ -148,6 +164,9 @@ def index():
     try:
         # Fetch data
         df = fetch_binance_ohlcv()
+        
+        # Fetch data with earlier start date for better SMA calculations
+        df = fetch_binance_ohlcv(start_date='2017-01-01')
         
         if len(df) == 0:
             return "Error: No data fetched from Binance"
