@@ -21,7 +21,7 @@ file_id = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
 url = f'https://drive.google.com/uc?id={file_id}'
 csv_filename = 'data.csv'
 processed_filename = 'processed_data.csv'
-plot_filename = 'sma_plot.png'
+plot_filename = 'data_plot.png'
 
 # Global variables to store precomputed data
 processing_details = None
@@ -40,10 +40,10 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Processed CSV Data</h1>
-    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range and SMAs computed.</p>
+    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range and volume metrics computed.</p>
     <p><a href="/download">Download Processed CSV</a></p>
-    <h2>SMA Plot:</h2>
-    <img src="data:image/png;base64,{{ plot_image }}" alt="SMA Plot" style="max-width: 100%; height: auto;">
+    <h2>Data Plot:</h2>
+    <img src="data:image/png;base64,{{ plot_image }}" alt="Data Plot" style="max-width: 100%; height: auto;">
     <p><a href="/plot">Download Plot Image</a></p>
     <h2>Processing Details:</h2>
     <pre>{{ details }}</pre>
@@ -124,15 +124,14 @@ def download_and_process_csv():
         resampled['range_to_volume'] = resampled['range'] / resampled['volume']
         resampled.loc[(resampled['range'].isna()) | (resampled['volume'] == 0) | (resampled['volume'].isna()), 'range_to_volume'] = pd.NA
 
-        # Compute SMAs for specified periods
-        # 288 candles/day * 365 days = 104,400 candles for a 365-day SMA
-        # 288 candles/day * 4 months (approx 121.67 days) = 34,800 candles
-        sma_periods = [104400, 34800]
-        for period in sma_periods:
-            if len(resampled) >= period:
-                resampled[f'SMA_{period}'] = resampled['close'].rolling(window=period, min_periods=1).mean()
-            else:
-                resampled[f'SMA_{period}'] = None  # Handle cases with insufficient data
+        # Calculate the maximum range_to_volume over the last 4 days (1152 intervals)
+        # 4 days * 24 hours/day * 60 minutes/hour = 5760 minutes
+        # 5760 minutes / 5 minutes per interval = 1152 intervals
+        window_size = 1152
+        if len(resampled) >= window_size:
+            resampled['max_range_vol_4d'] = resampled['range_to_volume'].rolling(window=window_size, min_periods=1).max()
+        else:
+            resampled['max_range_vol_4d'] = pd.NA # Handle cases with insufficient data
         
         # Reset index to make datetime a column
         resampled.reset_index(inplace=True)
@@ -156,25 +155,13 @@ First few rows:
         plot_data_close = resampled.dropna(subset=['close'])
         plot_data_metrics = resampled.dropna(subset=['range', 'range_to_volume'])
         
-        # Add SMAs to plot_data_metrics, dropping rows where SMA is NaN
-        for period in sma_periods:
-            sma_col = f'SMA_{period}'
-            if sma_col in resampled.columns:
-                plot_data_metrics = plot_data_metrics.dropna(subset=[sma_col])
-                plot_data_metrics[f'{sma_col}_scaled'] = resampled[sma_col] # Store original for potential later use if needed
-            else:
-                plot_data_metrics[f'{sma_col}_scaled'] = pd.NA
+        # Filter out NaNs for plotting to avoid errors
+        plot_data_close = resampled.dropna(subset=['close'])
+        plot_data_metrics = resampled.dropna(subset=['range', 'range_to_volume', 'max_range_vol_4d'])
 
-        # Apply Min-Max scaling to 'range_to_volume' and SMAs for the secondary axis
+        # Apply Min-Max scaling to 'range_to_volume' and 'max_range_vol_4d' for the secondary axis
         scaler = MinMaxScaler()
-        metrics_to_scale = ['range_to_volume'] # Only 'range_to_volume' is scaled from this group
-        
-        # Add SMAs to the list of metrics to be scaled and plotted on the secondary axis
-        for period in sma_periods:
-            sma_col = f'SMA_{period}'
-            # Check if the SMA column exists and has non-NaN values before adding to scaling list
-            if sma_col in plot_data_metrics.columns and not plot_data_metrics[sma_col].isnull().all(): 
-                metrics_to_scale.append(sma_col)
+        metrics_to_scale = ['range_to_volume', 'max_range_vol_4d']
         
         # Ensure we only attempt to scale columns that actually exist in plot_data_metrics
         existing_metrics_to_scale = [col for col in metrics_to_scale if col in plot_data_metrics.columns]
@@ -203,11 +190,11 @@ First few rows:
         if 'range_to_volume_scaled' in plot_data_metrics.columns:
             ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
         
-        # Plot SMAs on the secondary y-axis
-        for period in sma_periods:
-            sma_col_scaled = f'SMA_{period}_scaled'
-            if sma_col_scaled in plot_data_metrics.columns:
-                ax2.plot(plot_data_metrics.index, plot_data_metrics[sma_col_scaled], label=f'SMA {period} (0-1)', linewidth=1, linestyle='--')
+        # Plot scaled 'range_to_volume' and 'max_range_vol_4d' on the secondary y-axis
+        if 'range_to_volume_scaled' in plot_data_metrics.columns:
+            ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
+        if 'max_range_vol_4d_scaled' in plot_data_metrics.columns:
+            ax2.plot(plot_data_metrics.index, plot_data_metrics['max_range_vol_4d_scaled'], label='Max Range/Volume (4d, 0-1)', color='green', linewidth=1, linestyle='-.')
 
         ax2.set_ylabel('Scaled Value (0-1)', color='purple') # Using purple for this axis label
         ax2.tick_params(axis='y', labelcolor='purple')
@@ -218,7 +205,7 @@ First few rows:
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
 
-        plt.title('Close Price, Ratio, and SMAs')
+        plt.title('Close Price and Range/Volume Metrics')
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout() # Adjust layout to prevent overlap
         
@@ -260,7 +247,7 @@ def plot_download():
     """Endpoint to download the plot image."""
     if not os.path.exists(plot_filename):
         return "Plot file not found. Please visit the main page first.", 404
-    return send_file(plot_filename, as_attachment=True, download_name='sma_plot.png')
+    return send_file(plot_filename, as_attachment=True, download_name='data_plot.png')
 
 
 if __name__ == '__main__':
