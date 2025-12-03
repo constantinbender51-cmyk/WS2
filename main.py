@@ -165,18 +165,25 @@ First few rows:
             else:
                 plot_data_metrics[f'{sma_col}_scaled'] = pd.NA
 
-        # Apply Min-Max scaling to 'range', 'range_to_volume', and SMAs for the secondary axis
-        scaler_range_vol_sma = MinMaxScaler()
-        metrics_to_scale = ['range', 'range_to_volume']
+        # Apply Min-Max scaling to 'range_to_volume' and SMAs for the secondary axis
+        scaler = MinMaxScaler()
+        metrics_to_scale = ['range_to_volume'] # Only 'range_to_volume' is scaled from this group
+        
+        # Add SMAs to the list of metrics to be scaled and plotted on the secondary axis
         for period in sma_periods:
             sma_col = f'SMA_{period}'
-            if sma_col in plot_data_metrics.columns and not plot_data_metrics[sma_col].isnull().all(): # Check if column exists and is not all NaNs
+            # Check if the SMA column exists and has non-NaN values before adding to scaling list
+            if sma_col in plot_data_metrics.columns and not plot_data_metrics[sma_col].isnull().all(): 
                 metrics_to_scale.append(sma_col)
         
-        # Ensure we only try to scale columns that actually exist in plot_data_metrics
+        # Ensure we only attempt to scale columns that actually exist in plot_data_metrics
         existing_metrics_to_scale = [col for col in metrics_to_scale if col in plot_data_metrics.columns]
+        
         if existing_metrics_to_scale:
-            scaled_values = scaler_range_vol_sma.fit_transform(plot_data_metrics[existing_metrics_to_scale])
+            # Perform scaling
+            scaled_values = scaler.fit_transform(plot_data_metrics[existing_metrics_to_scale])
+            
+            # Create new columns for scaled data and add them to plot_data_metrics
             scaled_df = pd.DataFrame(scaled_values, columns=[f'{col}_scaled' for col in existing_metrics_to_scale], index=plot_data_metrics.index)
             plot_data_metrics = pd.concat([plot_data_metrics, scaled_df], axis=1)
         
@@ -189,16 +196,14 @@ First few rows:
         ax1.set_ylabel('Close Price', color='blue')
         ax1.tick_params(axis='y', labelcolor='blue')
 
-        # Create a secondary y-axis for scaled metrics
+        # Create a secondary y-axis for scaled metrics ('range_to_volume' and SMAs)
         ax2 = ax1.twinx()
         
-        # Plot scaled metrics on the secondary y-axis
-        if 'range_scaled' in plot_data_metrics.columns:
-            ax2.plot(plot_data_metrics.index, plot_data_metrics['range_scaled'], label='Scaled Range (0-1)', color='purple', linewidth=1)
+        # Plot scaled 'range_to_volume' on the secondary y-axis
         if 'range_to_volume_scaled' in plot_data_metrics.columns:
             ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
         
-        # Plot SMAs on the secondary y-axis if they exist and are scaled
+        # Plot SMAs on the secondary y-axis
         for period in sma_periods:
             sma_col_scaled = f'SMA_{period}_scaled'
             if sma_col_scaled in plot_data_metrics.columns:
@@ -213,7 +218,7 @@ First few rows:
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
 
-        plt.title('Close Price vs. Scaled Metrics')
+        plt.title('Close Price, Ratio, and SMAs')
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout() # Adjust layout to prevent overlap
         
