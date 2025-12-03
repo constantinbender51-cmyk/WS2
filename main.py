@@ -40,7 +40,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Processed CSV Data</h1>
-    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range and volume metrics computed.</p>
+    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range, volume, and ratio (range/volume) metrics computed, including a 4-day SMA of the ratio.</p>
     <p><a href="/download">Download Processed CSV</a></p>
     <h2>Data Plot:</h2>
     <img src="data:image/png;base64,{{ plot_image }}" alt="Data Plot" style="max-width: 100%; height: auto;">
@@ -124,14 +124,13 @@ def download_and_process_csv():
         resampled['range_to_volume'] = resampled['range'] / resampled['volume']
         resampled.loc[(resampled['range'].isna()) | (resampled['volume'] == 0) | (resampled['volume'].isna()), 'range_to_volume'] = pd.NA
 
-        # Calculate the maximum range_to_volume over the last 4 days (1152 intervals)
-        # 4 days * 24 hours/day * 60 minutes/hour = 5760 minutes
-        # 5760 minutes / 5 minutes per interval = 1152 intervals
-        window_size = 1152
-        if len(resampled) >= window_size:
-            resampled['max_range_vol_4d'] = resampled['range_to_volume'].rolling(window=window_size, min_periods=1).max()
+        # Calculate the 4-day Simple Moving Average (SMA) of 'range_to_volume'
+        # 4 days * 288 (5-min intervals/day) = 1152 intervals.
+        window_size_4d = 1152
+        if len(resampled) >= window_size_4d:
+            resampled['SMA_range_to_volume_4d'] = resampled['range_to_volume'].rolling(window=window_size_4d, min_periods=1).mean()
         else:
-            resampled['max_range_vol_4d'] = pd.NA # Handle cases with insufficient data
+            resampled['SMA_range_to_volume_4d'] = pd.NA # Handle cases with insufficient data
         
         # Reset index to make datetime a column
         resampled.reset_index(inplace=True)
@@ -157,11 +156,11 @@ First few rows:
         
         # Filter out NaNs for plotting to avoid errors
         plot_data_close = resampled.dropna(subset=['close'])
-        plot_data_metrics = resampled.dropna(subset=['range', 'range_to_volume', 'max_range_vol_4d'])
+        plot_data_metrics = resampled.dropna(subset=['range', 'range_to_volume', 'SMA_range_to_volume_4d'])
 
-        # Apply Min-Max scaling to 'range_to_volume' and 'max_range_vol_4d' for the secondary axis
+        # Apply Min-Max scaling to 'range_to_volume' and 'SMA_range_to_volume_4d' for the secondary axis
         scaler = MinMaxScaler()
-        metrics_to_scale = ['range_to_volume', 'max_range_vol_4d']
+        metrics_to_scale = ['range_to_volume', 'SMA_range_to_volume_4d']
         
         # Ensure we only attempt to scale columns that actually exist in plot_data_metrics
         existing_metrics_to_scale = [col for col in metrics_to_scale if col in plot_data_metrics.columns]
@@ -190,11 +189,11 @@ First few rows:
         if 'range_to_volume_scaled' in plot_data_metrics.columns:
             ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
         
-        # Plot scaled 'range_to_volume' and 'max_range_vol_4d' on the secondary y-axis
+        # Plot scaled 'range_to_volume' and 'SMA_range_to_volume_4d' on the secondary y-axis
         if 'range_to_volume_scaled' in plot_data_metrics.columns:
             ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
-        if 'max_range_vol_4d_scaled' in plot_data_metrics.columns:
-            ax2.plot(plot_data_metrics.index, plot_data_metrics['max_range_vol_4d_scaled'], label='Max Range/Volume (4d, 0-1)', color='green', linewidth=1, linestyle='-.')
+        if 'SMA_range_to_volume_4d_scaled' in plot_data_metrics.columns:
+            ax2.plot(plot_data_metrics.index, plot_data_metrics['SMA_range_to_volume_4d_scaled'], label='Scaled 4d SMA Range/Volume (0-1)', color='green', linewidth=1, linestyle='-.')
 
         ax2.set_ylabel('Scaled Value (0-1)', color='purple') # Using purple for this axis label
         ax2.tick_params(axis='y', labelcolor='purple')
