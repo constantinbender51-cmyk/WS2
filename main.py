@@ -118,7 +118,7 @@ def download_and_process_csv():
         resampled['range'] = resampled['high'] - resampled['low']
         
         # Compute SMAs for specified periods
-        sma_periods = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+        sma_periods = [2, 4]
         for period in sma_periods:
             if len(resampled) >= period:
                 resampled[f'SMA_{period}'] = resampled['close'].rolling(window=period, min_periods=1).mean()
