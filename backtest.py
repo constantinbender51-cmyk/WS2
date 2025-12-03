@@ -143,48 +143,87 @@ def calculate_sharpe_ratio(returns, periods_per_year=252):
 def create_plots(df, weekly_returns, monthly_returns):
     """Create matplotlib plots"""
     
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    fig, axes = plt.subplots(4, 1, figsize=(14, 16))
     
-    # Plot 1: Equity Curve
-    axes[0].plot(df.index, df['equity'], linewidth=2, color='blue')
-    axes[0].set_title('Equity Curve (5x Leveraged, Stop Loss at 5%)', fontsize=14, fontweight='bold')
-    axes[0].set_ylabel('Equity (Starting at 1.0)', fontsize=12)
-    axes[0].grid(True, alpha=0.3)
+    # Plot 1: BTC Price with Position Background Colors
+    axes[0].plot(df.index, df['close'], linewidth=1.5, color='black', label='BTC Price')
+    axes[0].set_title('BTC/USD Price with Position Colors', fontsize=14, fontweight='bold')
+    axes[0].set_ylabel('Price (USD)', fontsize=12)
     axes[0].set_xlabel('Date', fontsize=12)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_yscale('log')
+    
+    # Add background colors for positions
+    position_changes = df['position'].diff().fillna(df['position'])
+    current_position = 0
+    start_idx = df.index[0]
+    
+    for idx, pos in zip(df.index, df['position']):
+        if df.loc[idx, 'position'] != current_position or idx == df.index[-1]:
+            if idx != df.index[0]:
+                # Plot the previous position's background
+                if current_position == 1:
+                    axes[0].axvspan(start_idx, idx, alpha=0.2, color='blue', label='Long' if start_idx == df.index[0] else '')
+                elif current_position == -1:
+                    axes[0].axvspan(start_idx, idx, alpha=0.2, color='orange', label='Short' if start_idx == df.index[0] else '')
+                elif current_position == 0:
+                    axes[0].axvspan(start_idx, idx, alpha=0.2, color='grey', label='Cash' if start_idx == df.index[0] else '')
+            
+            start_idx = idx
+            current_position = df.loc[idx, 'position']
+    
+    # Handle last position
+    if current_position == 1:
+        axes[0].axvspan(start_idx, df.index[-1], alpha=0.2, color='blue')
+    elif current_position == -1:
+        axes[0].axvspan(start_idx, df.index[-1], alpha=0.2, color='orange')
+    elif current_position == 0:
+        axes[0].axvspan(start_idx, df.index[-1], alpha=0.2, color='grey')
+    
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    axes[0].legend(by_label.values(), by_label.keys(), loc='upper left')
+    
+    # Plot 2: Equity Curve
+    axes[1].plot(df.index, df['equity'], linewidth=2, color='blue')
+    axes[1].set_title('Equity Curve (5x Leveraged, Stop Loss at 5%)', fontsize=14, fontweight='bold')
+    axes[1].set_ylabel('Equity (Starting at 1.0)', fontsize=12)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_xlabel('Date', fontsize=12)
     
     # Add final equity value
     final_equity = df['equity'].iloc[-1]
-    axes[0].text(0.02, 0.98, f'Final Equity: {final_equity:.2f}x', 
-                transform=axes[0].transAxes, fontsize=11,
+    axes[1].text(0.02, 0.98, f'Final Equity: {final_equity:.2f}x', 
+                transform=axes[1].transAxes, fontsize=11,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # Plot 2: Weekly Returns
+    # Plot 3: Weekly Returns
     weekly_returns_df = weekly_returns.reset_index()
     weekly_returns_df['week_start'] = weekly_returns_df['week'].dt.start_time
     weekly_returns_df.columns = ['week', 'returns', 'week_start']
     
     colors = ['green' if x >= 0 else 'red' for x in weekly_returns_df['returns']]
-    axes[1].bar(weekly_returns_df['week_start'], weekly_returns_df['returns'], 
+    axes[2].bar(weekly_returns_df['week_start'], weekly_returns_df['returns'], 
                width=5, color=colors, alpha=0.7)
-    axes[1].set_title('Weekly Returns', fontsize=14, fontweight='bold')
-    axes[1].set_ylabel('Return', fontsize=12)
-    axes[1].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-    axes[1].grid(True, alpha=0.3, axis='y')
-    axes[1].set_xlabel('Date', fontsize=12)
+    axes[2].set_title('Weekly Returns', fontsize=14, fontweight='bold')
+    axes[2].set_ylabel('Return', fontsize=12)
+    axes[2].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    axes[2].grid(True, alpha=0.3, axis='y')
+    axes[2].set_xlabel('Date', fontsize=12)
     
-    # Plot 3: Monthly Returns
+    # Plot 4: Monthly Returns
     monthly_returns_df = monthly_returns.reset_index()
     monthly_returns_df['month_start'] = monthly_returns_df['month'].dt.start_time
     monthly_returns_df.columns = ['month', 'returns', 'month_start']
     
     colors = ['green' if x >= 0 else 'red' for x in monthly_returns_df['returns']]
-    axes[2].bar(monthly_returns_df['month_start'], monthly_returns_df['returns'], 
+    axes[3].bar(monthly_returns_df['month_start'], monthly_returns_df['returns'], 
                width=20, color=colors, alpha=0.7)
-    axes[2].set_title('Monthly Returns', fontsize=14, fontweight='bold')
-    axes[2].set_ylabel('Return', fontsize=12)
-    axes[2].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-    axes[2].grid(True, alpha=0.3, axis='y')
-    axes[2].set_xlabel('Date', fontsize=12)
+    axes[3].set_title('Monthly Returns', fontsize=14, fontweight='bold')
+    axes[3].set_ylabel('Return', fontsize=12)
+    axes[3].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    axes[3].grid(True, alpha=0.3, axis='y')
+    axes[3].set_xlabel('Date', fontsize=12)
     
     plt.tight_layout()
     
