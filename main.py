@@ -118,7 +118,8 @@ def download_and_process_csv():
         resampled['range'] = resampled['high'] - resampled['low']
         
         # Compute SMAs for specified periods
-        sma_periods = [365]
+        # 288 candles/day * 365 days = 104,400 candles for a 365-day SMA
+        sma_periods = [104400]
         for period in sma_periods:
             if len(resampled) >= period:
                 resampled[f'SMA_{period}'] = resampled['close'].rolling(window=period, min_periods=1).mean()
@@ -150,7 +151,7 @@ First few rows:
         for i, period in enumerate(sma_periods):
             if f'SMA_{period}' in resampled.columns:
                 plt.plot(resampled[datetime_col], resampled[f'SMA_{period}'], label=f'SMA {period}', color=colors[i % len(colors)], linewidth=1)
-        plt.title('Close Price and 2-Day SMA')
+        plt.title('Close Price and 365-Day SMA')
         plt.xlabel('Date/Time')
         plt.ylabel('Price')
         plt.legend(loc='best')
