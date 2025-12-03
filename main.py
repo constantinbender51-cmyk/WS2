@@ -148,6 +148,7 @@ First few rows:
         # Create matplotlib plot for SMAs
         plt.figure(figsize=(12, 6))
         plt.plot(resampled[datetime_col], resampled['close'], label='Close', color='black', linewidth=1)
+        plt.plot(resampled[datetime_col], resampled['range'], label='Range', color='purple', linewidth=1) # Plot range
         colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'cyan', 'magenta', 'yellow']
         for i, period in enumerate(sma_periods):
             if f'SMA_{period}' in resampled.columns:
