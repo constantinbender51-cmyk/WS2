@@ -163,18 +163,18 @@ def run_grid_search(df):
                 count += 1
                 
                 # 1. Calculate Signals
-                # Long: Open > SMA1 & Open > SMA2 & Open > SMA3
+                # Long: Open > SMA1 & Open > SMA2 & Open < SMA3
                 mask_long = (
                     (opens > sma1_arr) & 
                     (opens > sma2_arr) & 
-                    (opens > sma3_arr)
+                    (opens < sma3_arr)
                 ).astype(int)
                 
-                # Short: Open < SMA1 & Open < SMA2 & Open < SMA3
+                # Short: Open < SMA1 & Open < SMA2 & Open > SMA3
                 mask_short = (
                     (opens < sma1_arr) & 
                     (opens < sma2_arr) & 
-                    (opens < sma3_arr)
+                    (opens > sma3_arr)
                 ).astype(int)
                 
                 # Skip if minimal activity
