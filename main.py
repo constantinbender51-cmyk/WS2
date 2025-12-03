@@ -40,7 +40,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Processed CSV Data</h1>
-    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range, volume, and a 7-day SMA of the range computed.</p>
+    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range, volume, and a 12-day SMA of the range computed.</p>
     <p><a href="/download">Download Processed CSV</a></p>
     <h2>Data Plot:</h2>
     <img src="data:image/png;base64,{{ plot_image }}" alt="Data Plot" style="max-width: 100%; height: auto;">
@@ -118,13 +118,13 @@ def download_and_process_csv():
         # Compute range (high - low)
         resampled['range'] = resampled['high'] - resampled['low']
         
-        # Calculate the 7-day Simple Moving Average (SMA) of 'range'
-        # 7 days * 288 (5-min intervals/day) = 2016 intervals.
-        window_size_7d = 2016
-        if len(resampled) >= window_size_7d:
-            resampled['SMA_range_7d'] = resampled['range'].rolling(window=window_size_7d, min_periods=1).mean()
+        # Calculate the 12-day Simple Moving Average (SMA) of 'range'
+        # 12 days * 288 (5-min intervals/day) = 3456 intervals.
+        window_size_12d = 3456
+        if len(resampled) >= window_size_12d:
+            resampled['SMA_range_12d'] = resampled['range'].rolling(window=window_size_12d, min_periods=1).mean()
         else:
-            resampled['SMA_range_7d'] = pd.NA # Handle cases with insufficient data
+            resampled['SMA_range_12d'] = pd.NA # Handle cases with insufficient data
         
         # Reset index to make datetime a column
         resampled.reset_index(inplace=True)
@@ -146,11 +146,11 @@ First few rows:
         
         # Filter out NaNs for plotting to avoid errors
         plot_data_close = resampled.dropna(subset=['close'])
-        plot_data_metrics = resampled.dropna(subset=['range', 'SMA_range_7d'])
+        plot_data_metrics = resampled.dropna(subset=['range', 'SMA_range_12d'])
 
         # Apply Min-Max scaling to 'SMA_range_7d' for the secondary axis
         scaler = MinMaxScaler()
-        metrics_to_scale = ['SMA_range_7d']
+        metrics_to_scale = ['SMA_range_12d']
         
         # Ensure we only attempt to scale columns that actually exist in plot_data_metrics
         existing_metrics_to_scale = [col for col in metrics_to_scale if col in plot_data_metrics.columns]
@@ -175,9 +175,9 @@ First few rows:
         # Create a secondary y-axis for scaled metrics ('range_to_volume' and SMAs)
         ax2 = ax1.twinx()
         
-        # Plot scaled 'SMA_range_7d' on the secondary y-axis
-        if 'SMA_range_7d_scaled' in plot_data_metrics.columns:
-            ax2.plot(plot_data_metrics.index, plot_data_metrics['SMA_range_7d_scaled'], label='Scaled 7d SMA Range (0-1)', color='green', linewidth=1, linestyle='-.')
+        # Plot scaled 'SMA_range_12d' on the secondary y-axis
+        if 'SMA_range_12d_scaled' in plot_data_metrics.columns:
+            ax2.plot(plot_data_metrics.index, plot_data_metrics['SMA_range_12d_scaled'], label='Scaled 12d SMA Range (0-1)', color='green', linewidth=1, linestyle='-.')
 
         ax2.set_ylabel('Scaled Value (0-1)', color='purple') # Using purple for this axis label
         ax2.tick_params(axis='y', labelcolor='purple')
@@ -188,7 +188,7 @@ First few rows:
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
 
-        plt.title('Close Price and 7-day SMA of Range')
+        plt.title('Close Price and 12-day SMA of Range')
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout() # Adjust layout to prevent overlap
         
