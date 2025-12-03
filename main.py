@@ -3,9 +3,11 @@ import gdown
 import os
 from flask import Flask, send_file, render_template_string
 import logging
-import plotly.graph_objs as go
-import plotly.utils
-import json
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import base64
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -25,18 +27,14 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <title>Processed CSV Download</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
     <h1>Processed CSV Data</h1>
     <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range and SMAs computed.</p>
     <p><a href="/download">Download Processed CSV</a></p>
     <h2>SMA Plot:</h2>
-    <div id="plot"></div>
-    <script>
-        var plotData = {{ plot_json|safe }};
-        Plotly.newPlot('plot', plotData.data, plotData.layout);
-    </script>
+    <img src="data:image/png;base64,{{ plot_image }}" alt="SMA Plot" style="max-width: 100%; height: auto;">
+    <p><a href="/plot">Download Plot Image</a></p>
     <h2>Processing Details:</h2>
     <pre>{{ details }}</pre>
 </body>
@@ -136,22 +134,33 @@ First few rows:
 {resampled.head().to_string()}
 """
         
-        # Create Plotly figure for SMAs
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=resampled[datetime_col], y=resampled['close'], mode='lines', name='Close', line=dict(color='black', width=1)))
+        # Create matplotlib plot for SMAs
+        plt.figure(figsize=(12, 6))
+        plt.plot(resampled[datetime_col], resampled['close'], label='Close', color='black', linewidth=1)
         colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'cyan', 'magenta', 'yellow']
         for i, period in enumerate(sma_periods):
             if f'SMA_{period}' in resampled.columns:
-                fig.add_trace(go.Scatter(x=resampled[datetime_col], y=resampled[f'SMA_{period}'], mode='lines', name=f'SMA {period}', line=dict(color=colors[i % len(colors)], width=1)))
-        fig.update_layout(
-            title='Close Price and SMAs',
-            xaxis_title='Date/Time',
-            yaxis_title='Price',
-            hovermode='x unified'
-        )
-        plot_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+                plt.plot(resampled[datetime_col], resampled[f'SMA_{period}'], label=f'SMA {period}', color=colors[i % len(colors)], linewidth=1)
+        plt.title('Close Price and SMAs')
+        plt.xlabel('Date/Time')
+        plt.ylabel('Price')
+        plt.legend(loc='best')
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.tight_layout()
         
-        return details, plot_json
+        # Save plot to a bytes buffer and encode as base64
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close()
+        buf.seek(0)
+        plot_image = base64.b64encode(buf.read()).decode('utf-8')
+        
+        # Save plot to file for download
+        plot_filename = 'sma_plot.png'
+        with open(plot_filename, 'wb') as f:
+            f.write(base64.b64decode(plot_image))
+        
+        return details, plot_image
     
     except Exception as e:
         logger.error(f"Error in processing: {e}")
@@ -162,8 +171,8 @@ First few rows:
 def index():
     """Main page with download link, SMA plot, and processing details."""
     try:
-        details, plot_json = download_and_process_csv()
-        return render_template_string(HTML_TEMPLATE, details=details, plot_json=plot_json)
+        details, plot_image = download_and_process_csv()
+        return render_template_string(HTML_TEMPLATE, details=details, plot_image=plot_image)
     except Exception as e:
         return f"<h1>Error</h1><p>{e}</p>", 500
 
@@ -174,6 +183,14 @@ def download():
     if not os.path.exists(processed_filename):
         return "Processed file not found. Please visit the main page first.", 404
     return send_file(processed_filename, as_attachment=True, download_name='processed_5min_data.csv')
+
+@app.route('/plot')
+def plot_download():
+    """Endpoint to download the plot image."""
+    plot_filename = 'sma_plot.png'
+    if not os.path.exists(plot_filename):
+        return "Plot file not found. Please visit the main page first.", 404
+    return send_file(plot_filename, as_attachment=True, download_name='sma_plot.png')
 
 
 if __name__ == '__main__':
