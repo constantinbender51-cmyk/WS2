@@ -29,15 +29,6 @@ plot_image_base64 = None
 # Define the processing function first
 
 
-# Perform computation at startup
-try:
-    logger.info("Starting data processing at startup...")
-    processing_details, plot_image_base64 = download_and_process_csv()
-    logger.info("Data processing completed successfully at startup.")
-except Exception as e:
-    logger.error(f"Startup processing failed: {e}")
-    processing_details = f"Startup processing failed: {e}"
-    plot_image_base64 = None
 
 # HTML template for the web page
 HTML_TEMPLATE = """
@@ -208,6 +199,16 @@ def plot_download():
 
 
 if __name__ == '__main__':
+    # Perform computation at startup
+    try:
+        logger.info("Starting data processing at startup...")
+        processing_details, plot_image_base64 = download_and_process_csv()
+        logger.info("Data processing completed successfully at startup.")
+    except Exception as e:
+        logger.error(f"Startup processing failed: {e}")
+        processing_details = f"Startup processing failed: {e}"
+        plot_image_base64 = None
+    
     # Run Flask app on port 8080
     logger.info("Starting web server on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)
