@@ -194,13 +194,6 @@ First few rows:
         plt.savefig(buf, format='png')
         plt.close()
         buf.seek(0)
-        plot_image = base64.b64encode(buf.read()).decode('utf-8')        plt.tight_layout()
-        
-        # Save plot to a bytes buffer and encode as base64
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        plt.close()
-        buf.seek(0)
         plot_image = base64.b64encode(buf.read()).decode('utf-8')
         
         # Save plot to file for download
