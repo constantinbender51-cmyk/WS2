@@ -47,16 +47,25 @@ def process_data():
         print(f"Error loading CSV file: {e}")
         return None
     
-    # Check required columns
-    required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    # Check required columns, handle 'datetime' as an alternative to 'timestamp'
+    required_columns = ['open', 'high', 'low', 'close', 'volume']
+    timestamp_col = None
+    if 'timestamp' in df.columns:
+        timestamp_col = 'timestamp'
+    elif 'datetime' in df.columns:
+        timestamp_col = 'datetime'
+    else:
+        print("Missing timestamp column: expected 'timestamp' or 'datetime'")
+        return None
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         print(f"Missing required columns: {missing_columns}")
         return None
     
     # Convert timestamp to datetime and set as index
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.set_index('timestamp', inplace=True)
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+    df.set_index(timestamp_col, inplace=True)
+    df.index.name = 'timestamp'  # Standardize index name for consistency
     
     # Ensure data is sorted by timestamp
     df.sort_index(inplace=True)
@@ -119,6 +128,7 @@ def process_data():
     print(f"Data processing complete. File saved: {OUTPUT_FILENAME}")
     print(f"Total rows: {len(merged_df)}")
     print(f"Total columns: {len(merged_df.columns)}")
+    print(f"Note: Original data had {len(df)} entries, which may affect resampling for longer timeframes.")
     
     return merged_df
 
