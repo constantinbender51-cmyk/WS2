@@ -40,7 +40,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Processed CSV Data</h1>
-    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range, volume, and ratio (range/volume) metrics computed, including a 4-day SMA of the ratio.</p>
+    <p>The CSV has been downloaded, processed, and resampled to 5-minute intervals with range, volume, and a 4-day SMA of the range/volume ratio computed.</p>
     <p><a href="/download">Download Processed CSV</a></p>
     <h2>Data Plot:</h2>
     <img src="data:image/png;base64,{{ plot_image }}" alt="Data Plot" style="max-width: 100%; height: auto;">
@@ -152,15 +152,11 @@ First few rows:
         
         # Filter out NaNs for plotting to avoid errors
         plot_data_close = resampled.dropna(subset=['close'])
-        plot_data_metrics = resampled.dropna(subset=['range', 'range_to_volume'])
-        
-        # Filter out NaNs for plotting to avoid errors
-        plot_data_close = resampled.dropna(subset=['close'])
         plot_data_metrics = resampled.dropna(subset=['range', 'range_to_volume', 'SMA_range_to_volume_4d'])
 
-        # Apply Min-Max scaling to 'range_to_volume' and 'SMA_range_to_volume_4d' for the secondary axis
+        # Apply Min-Max scaling to 'SMA_range_to_volume_4d' for the secondary axis
         scaler = MinMaxScaler()
-        metrics_to_scale = ['range_to_volume', 'SMA_range_to_volume_4d']
+        metrics_to_scale = ['SMA_range_to_volume_4d']
         
         # Ensure we only attempt to scale columns that actually exist in plot_data_metrics
         existing_metrics_to_scale = [col for col in metrics_to_scale if col in plot_data_metrics.columns]
@@ -185,13 +181,7 @@ First few rows:
         # Create a secondary y-axis for scaled metrics ('range_to_volume' and SMAs)
         ax2 = ax1.twinx()
         
-        # Plot scaled 'range_to_volume' on the secondary y-axis
-        if 'range_to_volume_scaled' in plot_data_metrics.columns:
-            ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
-        
-        # Plot scaled 'range_to_volume' and 'SMA_range_to_volume_4d' on the secondary y-axis
-        if 'range_to_volume_scaled' in plot_data_metrics.columns:
-            ax2.plot(plot_data_metrics.index, plot_data_metrics['range_to_volume_scaled'], label='Scaled Range/Volume (0-1)', color='orange', linewidth=1)
+        # Plot scaled 'SMA_range_to_volume_4d' on the secondary y-axis
         if 'SMA_range_to_volume_4d_scaled' in plot_data_metrics.columns:
             ax2.plot(plot_data_metrics.index, plot_data_metrics['SMA_range_to_volume_4d_scaled'], label='Scaled 4d SMA Range/Volume (0-1)', color='green', linewidth=1, linestyle='-.')
 
@@ -204,7 +194,7 @@ First few rows:
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
 
-        plt.title('Close Price and Range/Volume Metrics')
+        plt.title('Close Price and 4-day SMA of Range/Volume')
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout() # Adjust layout to prevent overlap
         
