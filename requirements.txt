@@ -1,4 +1,4 @@
 pandas
 gdown
 flask
-plotly
+matplotlib
