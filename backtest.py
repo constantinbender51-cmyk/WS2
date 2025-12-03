@@ -18,9 +18,9 @@ RISK_FREE_RATE = 0.0      # Assuming 0% for simple crypto backtesting
 ANNUALIZATION_FACTOR = 365 # Crypto trades 365 days a year
 
 # Grid Search Ranges
-EMA1_RANGE = range(10, 501, 10) 
-EMA2_RANGE = range(10, 181, 10)
-EMA3_RANGE = range(10, 181, 10) # Added 3rd EMA
+SMA1_RANGE = range(10, 501, 10) 
+SMA2_RANGE = range(10, 181, 10)
+SMA3_RANGE = range(10, 181, 10) # Added 3rd SMA
 STOP_LOSS_RANGE = np.arange(0.01, 0.105, 0.005) # 1% to 10% step 0.5%
 LEVERAGE_RANGE = np.arange(1.0, 5.5, 0.5)       # 1x to 5x step 0.5
 
@@ -106,14 +106,14 @@ def run_grid_search(df):
     closes = df['Close'].values
     
     # -----------------------------------
-    # A. Pre-calculate EMAs
+    # A. Pre-calculate SMAs
     # -----------------------------------
-    # Collect all unique periods needed for EMA1, EMA2, and EMA3
-    all_periods = sorted(list(set(list(EMA1_RANGE) + list(EMA2_RANGE) + list(EMA3_RANGE))))
-    emas = {}
+    # Collect all unique periods needed for SMA1, SMA2, and SMA3
+    all_periods = sorted(list(set(list(SMA1_RANGE) + list(SMA2_RANGE) + list(SMA3_RANGE))))
+    smas = {}
     
     for p in all_periods:
-        emas[p] = df['Open'].ewm(span=p, adjust=False).mean().values
+        smas[p] = df['Open'].rolling(window=p).mean().values
         
     # -----------------------------------
     # B. Pre-calculate Base Returns (Unleveraged)
@@ -143,38 +143,38 @@ def run_grid_search(df):
     best_sharpe = -999.0
     best_params = {}
     
-    total_iter = len(EMA1_RANGE) * len(EMA2_RANGE) * len(EMA3_RANGE)
-    print(f"Starting Sharpe Optimization over {total_iter} EMA triplets...")
+    total_iter = len(SMA1_RANGE) * len(SMA2_RANGE) * len(SMA3_RANGE)
+    print(f"Starting Sharpe Optimization over {total_iter} SMA triplets...")
     
     count = 0
     start_time = time.time()
     
-    for ema1_p in EMA1_RANGE:
-        ema1_arr = emas[ema1_p]
+    for sma1_p in SMA1_RANGE:
+        sma1_arr = smas[sma1_p]
         
-        for ema2_p in EMA2_RANGE:
-            ema2_arr = emas[ema2_p]
+        for sma2_p in SMA2_RANGE:
+            sma2_arr = smas[sma2_p]
             
-            for ema3_p in EMA3_RANGE:
-                # Redundancy check: If periods are identical, logic is same as 2 EMAs, but we allow it for completeness.
+            for sma3_p in SMA3_RANGE:
+                # Redundancy check: If periods are identical, logic is same as 2 SMAs, but we allow it for completeness.
                 # Optimization: Condition is "Above All". Order doesn't matter, but ranges differ.
                 
-                ema3_arr = emas[ema3_p]
+                sma3_arr = smas[sma3_p]
                 count += 1
                 
                 # 1. Calculate Signals
-                # Long: Open > EMA1 & Open > EMA2 & Open > EMA3
+                # Long: Open > SMA1 & Open > SMA2 & Open > SMA3
                 mask_long = (
-                    (opens > ema1_arr) & 
-                    (opens > ema2_arr) & 
-                    (opens > ema3_arr)
+                    (opens > sma1_arr) & 
+                    (opens > sma2_arr) & 
+                    (opens > sma3_arr)
                 ).astype(int)
                 
-                # Short: Open < EMA1 & Open < EMA2 & Open < EMA3
+                # Short: Open < SMA1 & Open < SMA2 & Open < SMA3
                 mask_short = (
-                    (opens < ema1_arr) & 
-                    (opens < ema2_arr) & 
-                    (opens < ema3_arr)
+                    (opens < sma1_arr) & 
+                    (opens < sma2_arr) & 
+                    (opens < sma3_arr)
                 ).astype(int)
                 
                 # Skip if minimal activity
@@ -211,9 +211,9 @@ def run_grid_search(df):
                         if current_sharpe > best_sharpe:
                             best_sharpe = current_sharpe
                             best_params = {
-                                'EMA1': ema1_p,
-                                'EMA2': ema2_p,
-                                'EMA3': ema3_p,
+                                'SMA1': sma1_p,
+                                'SMA2': sma2_p,
+                                'SMA3': sma3_p,
                                 'StopLoss': round(s_val * 100, 2),
                                 'Leverage': lev,
                                 'Sharpe': round(current_sharpe, 4),
@@ -242,9 +242,9 @@ if __name__ == "__main__":
     print("------------------------------------------------")
     print(f"Best Sharpe Ratio: {result['Sharpe']}")
     print(f"Parameters:")
-    print(f"  EMA 1 Period:    {result['EMA1']}")
-    print(f"  EMA 2 Period:    {result['EMA2']}")
-    print(f"  EMA 3 Period:    {result['EMA3']}")
+    print(f"  SMA 1 Period:    {result['SMA1']}")
+    print(f"  SMA 2 Period:    {result['SMA2']}")
+    print(f"  SMA 3 Period:    {result['SMA3']}")
     print(f"  Stop Loss:       {result['StopLoss']}%")
     print(f"  Leverage:        {result['Leverage']}x")
     print("------------------------------------------------")
