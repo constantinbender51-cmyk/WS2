@@ -119,9 +119,8 @@ def download_and_process_csv():
         
         # Compute SMAs for specified periods
         # 288 candles/day * 365 days = 104,400 candles for a 365-day SMA
-        # 288 candles/day * 6 months (approx 182.5 days) = 52,200 candles
         # 288 candles/day * 4 months (approx 121.67 days) = 34,800 candles
-        sma_periods = [104400, 52200, 34800]
+        sma_periods = [104400, 34800]
         for period in sma_periods:
             if len(resampled) >= period:
                 resampled[f'SMA_{period}'] = resampled['close'].rolling(window=period, min_periods=1).mean()
