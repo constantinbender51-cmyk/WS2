@@ -118,7 +118,10 @@ def download_and_process_csv():
         resampled['range'] = resampled['high'] - resampled['low']
         
         # Compute range divided by volume, handling potential division by zero
-        resampled['range_to_volume'] = resampled['range'] / resampled['volume'].replace(0, pd.NA) # Replace 0 volume with NA to avoid division by zero
+        # Replace 0 volume with pd.NA to avoid division by zero, and ensure range is not NA
+        # If range is NA or volume is NA (or 0), the result should be NA
+        resampled['range_to_volume'] = resampled['range'] / resampled['volume']
+        resampled.loc[(resampled['range'].isna()) | (resampled['volume'] == 0) | (resampled['volume'].isna()), 'range_to_volume'] = pd.NA
 
         # Compute SMAs for specified periods
         # 288 candles/day * 365 days = 104,400 candles for a 365-day SMA
@@ -163,7 +166,35 @@ First few rows:
         plt.ylabel('Value')
         plt.legend(loc='best')
         plt.grid(True, linestyle='--', alpha=0.5)
+
+        # Filter out NaNs for plotting to avoid errors
+        plot_data = resampled.dropna(subset=['close', 'range', 'range_to_volume'])
+        for period in sma_periods:
+            if f'SMA_{period}' in resampled.columns:
+                plot_data = plot_data.dropna(subset=[f'SMA_{period}'])
+
+        plt.figure(figsize=(12, 8)) # Increased figure height to accommodate more plots
+        plt.plot(plot_data[datetime_col], plot_data['close'], label='Close', color='black', linewidth=1)
+        plt.plot(plot_data[datetime_col], plot_data['range'], label='Range (High-Low)', color='purple', linewidth=1) # Plot range
+        plt.plot(plot_data[datetime_col], plot_data['range_to_volume'], label='Range/Volume', color='orange', linewidth=1) # Plot range_to_volume
+
+        colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'cyan', 'magenta', 'yellow']
+        for i, period in enumerate(sma_periods):
+            if f'SMA_{period}' in plot_data.columns:
+                plt.plot(plot_data[datetime_col], plot_data[f'SMA_{period}'], label=f'SMA {period}', color=colors[i % len(colors)], linewidth=1)
+        plt.title('Price, Range, Range/Volume, and SMAs')
+        plt.xlabel('Date/Time')
+        plt.ylabel('Value')
+        plt.legend(loc='best')
+        plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout()
+        
+        # Save plot to a bytes buffer and encode as base64
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close()
+        buf.seek(0)
+        plot_image = base64.b64encode(buf.read()).decode('utf-8')        plt.tight_layout()
         
         # Save plot to a bytes buffer and encode as base64
         buf = io.BytesIO()
