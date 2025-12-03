@@ -20,6 +20,21 @@ file_id = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
 url = f'https://drive.google.com/uc?id={file_id}'
 csv_filename = 'data.csv'
 processed_filename = 'processed_data.csv'
+plot_filename = 'sma_plot.png'
+
+# Global variables to store precomputed data
+processing_details = None
+plot_image_base64 = None
+
+# Perform computation at startup
+try:
+    logger.info("Starting data processing at startup...")
+    processing_details, plot_image_base64 = download_and_process_csv()
+    logger.info("Data processing completed successfully at startup.")
+except Exception as e:
+    logger.error(f"Startup processing failed: {e}")
+    processing_details = f"Startup processing failed: {e}"
+    plot_image_base64 = None
 
 # HTML template for the web page
 HTML_TEMPLATE = """
@@ -156,7 +171,6 @@ First few rows:
         plot_image = base64.b64encode(buf.read()).decode('utf-8')
         
         # Save plot to file for download
-        plot_filename = 'sma_plot.png'
         with open(plot_filename, 'wb') as f:
             f.write(base64.b64decode(plot_image))
         
@@ -170,11 +184,9 @@ First few rows:
 @app.route('/')
 def index():
     """Main page with download link, SMA plot, and processing details."""
-    try:
-        details, plot_image = download_and_process_csv()
-        return render_template_string(HTML_TEMPLATE, details=details, plot_image=plot_image)
-    except Exception as e:
-        return f"<h1>Error</h1><p>{e}</p>", 500
+    if processing_details is None or plot_image_base64 is None:
+        return "<h1>Error</h1><p>Data processing failed at startup. Check server logs.</p>", 500
+    return render_template_string(HTML_TEMPLATE, details=processing_details, plot_image=plot_image_base64)
 
 
 @app.route('/download')
@@ -187,7 +199,6 @@ def download():
 @app.route('/plot')
 def plot_download():
     """Endpoint to download the plot image."""
-    plot_filename = 'sma_plot.png'
     if not os.path.exists(plot_filename):
         return "Plot file not found. Please visit the main page first.", 404
     return send_file(plot_filename, as_attachment=True, download_name='sma_plot.png')
