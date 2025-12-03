@@ -21,8 +21,8 @@
 
         <p>This tool fetches daily OHLCV data from Binance, calculates 120-day and 365-day Simple Moving Averages (SMAs) of the close price, and a custom strategy return. The strategy return is defined as:</p>
         <ul>
-            <li><code>(close - open) / open</code> if <code>close &gt; SMA_120</code> AND <code>close &gt; SMA_365</code></li>
-            <li><code>-( (close - open) / open )</code> if <code>close &lt; SMA_120</code> AND <code>close &lt; SMA_365</code></li>
+            <li><code>(close - open) / open</code> if <code>open &gt; SMA_120</code> AND <code>open &gt; SMA_365</code></li>
+            <li><code>-( (close - open) / open )</code> if <code>open &lt; SMA_120</code> AND <code>open &lt; SMA_365</code></li>
             <li><code>0</code> otherwise</li>
         </ul>
 
