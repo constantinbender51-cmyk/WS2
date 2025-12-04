@@ -1,847 +1,329 @@
-#!/usr/bin/env python3
-"""
-web_state.py - Dual SMA Strategy Dashboard with State Machine
-Displays strategy with SMA 1 (57), SMA 2 (124), and cross flag state
-"""
-
-from flask import Flask, render_template_string
-import json
-import os
-import time
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-import logging
 import requests
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional
+import time
+import sys
+from datetime import datetime
+import matplotlib.pyplot as plt
+from numba import jit
+import io
+import base64
+from flask import Flask, render_template
 
+# -----------------------------------------------------------------------------
+# 1. DATA FETCHING
+# -----------------------------------------------------------------------------
+def fetch_binance_data(symbol="BTCUSDT", interval="1d", start_date="2018-01-01"):
+    base_url = "https://api.binance.com/api/v3/klines"
+    start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
+    
+    all_data = []
+    limit = 1000
+    current_start = start_ts
+    
+    print(f"Fetching {symbol} data from {start_date}...")
+    
+    while True:
+        params = {"symbol": symbol, "interval": interval, "startTime": current_start, "limit": limit}
+        try:
+            response = requests.get(base_url, params=params)
+            data = response.json()
+            if not isinstance(data, list) or len(data) == 0: break
+            all_data.extend(data)
+            current_start = data[-1][6] + 1
+            if len(data) < limit: break
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"Error: {e}")
+            break
+            
+    df = pd.DataFrame(all_data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "num_trades", "taker_base_vol", "taker_quote_vol", "ignore"
+    ])
+    
+    numeric_cols = ["open", "high", "low", "close", "volume"]
+    df[numeric_cols] = df[numeric_cols].astype(float)
+    df["date"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("date", inplace=True)
+    
+    return df[["open", "high", "low", "close"]]
+
+# -----------------------------------------------------------------------------
+# 2. NUMBA OPTIMIZED LOGIC (Dual SMA + State Machine)
+# -----------------------------------------------------------------------------
+@jit(nopython=True)
+def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, sma2_arr, x, s):
+    """
+    SMA 1: Handles the 'Just Crossed' State Machine logic and Proximity bands.
+    SMA 2: Acts as a hard filter (Trend Confirmation).
+    """
+    n = len(opens)
+    strategy_returns = np.zeros(n)
+    
+    # State Flag for SMA 1: 0 = None, 1 = Just Crossed Up, -1 = Just Crossed Down
+    cross_flag = 0 
+    
+    for i in range(1, n):
+        # Skip if either SMA is NaN
+        if np.isnan(sma1_arr[i]) or np.isnan(sma2_arr[i]):
+            continue
+            
+        current_open = opens[i]
+        prev_open = opens[i-1]
+        
+        # SMA 1 Values (Primary Logic)
+        cur_sma1 = sma1_arr[i]
+        
+        # SMA 2 Value (Filter)
+        cur_sma2 = sma2_arr[i]
+        
+        # --- SMA 1 STATE MACHINE ---
+        upper_band = cur_sma1 * (1 + x)
+        lower_band = cur_sma1 * (1 - x)
+        
+        # 1. Determine Cross Event (Crossing SMA 1)
+        if (prev_open < cur_sma1) and (current_open > cur_sma1):
+            cross_flag = 1
+        elif (prev_open > cur_sma1) and (current_open < cur_sma1):
+            cross_flag = -1
+            
+        # 2. Check Band Exit (Unset Flag)
+        if (current_open > upper_band) or (current_open < lower_band):
+            cross_flag = 0
+            
+        # 3. Determine Base Signal (SMA 1 Logic)
+        signal = 0
+        
+        # Long Base: Above Band OR (Above SMA1 AND Just Crossed)
+        if (current_open > upper_band) or ((current_open > cur_sma1) and (cross_flag == 1)):
+            signal = 1
+        # Short Base: Below Band OR (Below SMA1 AND Just Crossed)
+        elif (current_open < lower_band) or ((current_open < cur_sma1) and (cross_flag == -1)):
+            signal = -1
+            
+        # --- SMA 2 FILTER ---
+        # Flatten if conflicting with SMA 2
+        
+        if signal == 1:
+            # If Long, must be above SMA 2
+            if current_open < cur_sma2:
+                signal = 0
+        elif signal == -1:
+            # If Short, must be below SMA 2
+            if current_open > cur_sma2:
+                signal = 0
+        
+        # 4. Calculate Return & Stop Loss
+        if signal != 0:
+            daily_ret = signal * intraday_returns[i]
+            
+            # Stop Loss Check
+            if signal == 1:
+                if lows[i] < current_open * (1 - s):
+                    daily_ret = np.log(1 - s)
+            elif signal == -1:
+                if highs[i] > current_open * (1 + s):
+                    daily_ret = np.log(1 - s)
+                    
+            strategy_returns[i] = daily_ret
+            
+    return strategy_returns
+
+# -----------------------------------------------------------------------------
+# 3. GRID SEARCH
+# -----------------------------------------------------------------------------
+def run_dual_sma_grid(df):
+    print("\n--- Starting Grid Search (Dual SMA: Logic + Filter) ---")
+    
+    # --- Parameters ---
+    # Using larger steps to accommodate 4D search space without taking forever
+    # SMA1 (Logic): 5 to 205, step 2
+    sma1_periods = np.arange(5, 205, 2)
+    # SMA2 (Filter): 10 to 370, step 2
+    sma2_periods = np.arange(10, 370, 2)
+    
+    # X: 0% to 6%
+    x_values = np.arange(0.00, 0.061, 0.01) 
+    # S: 2% to 10%
+    s_values = np.arange(0.02, 0.101, 0.02)
+    
+    print(f"Total Combinations: {len(sma1_periods) * len(sma2_periods) * len(x_values) * len(s_values)}")
+    
+    # Pre-convert to Numpy
+    opens = df['open'].to_numpy()
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
+    closes = df['close'].to_numpy()
+    
+    # Pre-calc Intraday Returns
+    with np.errstate(divide='ignore', invalid='ignore'):
+        intraday_returns = np.log(closes / opens)
+    intraday_returns = np.nan_to_num(intraday_returns)
+    
+    benchmark_returns = np.log(df['close'] / df['close'].shift(1)).fillna(0).to_numpy()
+    
+    # Pre-calculate ALL SMAs to avoid re-rolling in loops
+    print("Pre-calculating SMA matrix...")
+    max_period = max(np.max(sma1_periods), np.max(sma2_periods))
+    # Dictionary to store {period: numpy_array}
+    sma_cache = {}
+    needed_periods = set(np.concatenate((sma1_periods, sma2_periods)))
+    
+    for p in needed_periods:
+        # Shift by 1 for lookahead prevention
+        sma_cache[p] = df['close'].rolling(window=p).mean().shift(1).to_numpy()
+    
+    best_sharpe = -np.inf
+    best_params = None
+    best_curve = None
+    
+    # For Heatmap: We'll plot SMA1 vs SMA2 (taking best X/S for each cell)
+    results_matrix = np.zeros((len(sma1_periods), len(sma2_periods)))
+    
+    start_time = time.time()
+    
+    # Loop SMA 1
+    for i, p1 in enumerate(sma1_periods):
+        sma1_arr = sma_cache[p1]
+        
+        # Loop SMA 2
+        for j, p2 in enumerate(sma2_periods):
+            sma2_arr = sma_cache[p2]
+            
+            # Optimization: If p1 == p2, the filter is redundant, but we run it anyway
+            
+            local_best_sharpe = -np.inf
+            
+            # Loop X
+            for x in x_values:
+                # Loop S
+                for s in s_values:
+                    
+                    strat_ret = calculate_dual_sma_strategy(
+                        opens, highs, lows, intraday_returns, 
+                        sma1_arr, sma2_arr, x, s
+                    )
+                    
+                    # Sharpe
+                    start_idx = max(p1, p2)
+                    active_rets = strat_ret[start_idx:]
+                    
+                    if len(active_rets) < 10:
+                        sharpe = 0
+                    else:
+                        mean_r = np.mean(active_rets)
+                        std_r = np.std(active_rets)
+                        sharpe = (mean_r / std_r) * np.sqrt(365) if std_r > 1e-9 else 0
+                    
+                    if sharpe > local_best_sharpe:
+                        local_best_sharpe = sharpe
+                    
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_params = (p1, p2, x, s)
+                        best_curve = np.cumsum(strat_ret)
+            
+            results_matrix[i, j] = local_best_sharpe
+            
+        if i % 5 == 0:
+            print(f"Processed SMA1 period {p1}...")
+
+    print(f"Optimization complete in {time.time() - start_time:.2f}s.")
+    return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma1_periods, sma2_periods
+
+# -----------------------------------------------------------------------------
+# 4. WEB SERVER
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
 
-# Import the Kraken Futures API client
-import kraken_futures as kf
-
-# Configuration
-STATE_FILE = Path("web_state.json")
-UPDATE_INTERVAL = 300  # 5 minutes
-SYMBOL_FUTS_UC = "PF_XBTUSD"
-SYMBOL_OHLC_KRAKEN = "XBTUSD"
-INTERVAL_KRAKEN = 1440
-SMA_PERIOD_1 = 57
-SMA_PERIOD_2 = 124
-BAND_WIDTH = 5.0  # 5% bands
-STATIC_STOP_PCT = 2.0  # 2% static stop
-LEV = 3  # 3x leverage
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("web_dashboard")
-
-class DashboardMonitor:
-    def __init__(self):
-        self.api = None
-        self.last_update = None
-        self.state = self.load_state()
-        
-    def initialize_api(self):
-        """Initialize Kraken API client"""
-        api_key = os.getenv("KRAKEN_API_KEY")
-        api_sec = os.getenv("KRAKEN_API_SECRET")
-        if not api_key or not api_sec:
-            raise ValueError("KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables required")
-        
-        self.api = kf.KrakenFuturesApi(api_key, api_sec)
-        log.info("Kraken API client initialized")
-
-    def load_state(self) -> Dict[str, Any]:
-        """Load state from local file"""
-        if STATE_FILE.exists():
-            try:
-                with open(STATE_FILE, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                log.error(f"Error loading state file: {e}")
-        
-        # Default state
-        return {
-            "trades": [],
-            "performance": {
-                "current_value": 0,
-                "starting_capital": 0,
-                "total_return_pct": 0,
-                "total_trades": 0
-            },
-            "current_position": None,
-            "market_data": {},
-            "strategy_info": {
-                "sma_period_1": SMA_PERIOD_1,
-                "sma_period_2": SMA_PERIOD_2,
-                "band_width_pct": BAND_WIDTH,
-                "stop_loss_pct": STATIC_STOP_PCT,
-                "leverage": LEV
-            },
-            "cross_flag": 0,
-            "last_updated": None
-        }
-
-    def save_state(self):
-        """Save state to local file"""
-        try:
-            with open(STATE_FILE, 'w') as f:
-                json.dump(self.state, f, indent=2)
-            log.info("State saved successfully")
-        except Exception as e:
-            log.error(f"Error saving state file: {e}")
-
-    def get_portfolio_value(self) -> float:
-        """Get current portfolio value"""
-        try:
-            accounts = self.api.get_accounts()
-            return float(accounts["accounts"]["flex"]["portfolioValue"])
-        except Exception as e:
-            log.error(f"Error getting portfolio value: {e}")
-            return 0.0
-
-    def get_mark_price(self) -> float:
-        """Get current mark price"""
-        try:
-            tickers = self.api.get_tickers()
-            for ticker in tickers["tickers"]:
-                if ticker["symbol"] == SYMBOL_FUTS_UC:
-                    return float(ticker["markPrice"])
-            raise RuntimeError("Mark price not found")
-        except Exception as e:
-            log.error(f"Error getting mark price: {e}")
-            return 0.0
-
-    def get_current_position(self) -> Optional[Dict[str, Any]]:
-        """Get current open position"""
-        try:
-            positions = self.api.get_open_positions()
-            for position in positions.get("openPositions", []):
-                if position["symbol"] == SYMBOL_FUTS_UC:
-                    return {
-                        "signal": "LONG" if position["side"] == "long" else "SHORT",
-                        "side": position["side"],
-                        "size_btc": abs(float(position["size"])),
-                        "unrealized_pnl": float(position.get("unrealizedFunding", 0))
-                    }
-            return None
-        except Exception as e:
-            log.error(f"Error getting current position: {e}")
-            return None
-
-    def get_ohlc_data(self) -> pd.DataFrame:
-        """Get OHLC data for analysis"""
-        try:
-            params = {"pair": SYMBOL_OHLC_KRAKEN, "interval": INTERVAL_KRAKEN}
-            response = requests.get("https://api.kraken.com/0/public/OHLC", params=params, timeout=30)
-            response.raise_for_status()
-            payload = response.json()
-            
-            if payload["error"]:
-                raise RuntimeError("Kraken error: " + ", ".join(payload["error"]))
-            
-            key = list(payload["result"].keys())[0]
-            raw = payload["result"][key]
-            
-            df = pd.DataFrame(
-                raw,
-                columns=["time", "open", "high", "low", "close", "vwap", "volume", "trades"],
-            )
-            df["time"] = pd.to_datetime(df["time"], unit="s")
-            df.set_index("time", inplace=True)
-            return df.astype(float)
-        except Exception as e:
-            log.error(f"Error getting OHLC data: {e}")
-            return pd.DataFrame()
-
-    def calculate_smas(self, df: pd.DataFrame) -> tuple:
-        """Calculate SMA 1 (57) and SMA 2 (124)"""
-        if len(df) < SMA_PERIOD_2:
-            return 0, 0
-        
-        df = df.copy()
-        sma_1 = df['close'].rolling(window=SMA_PERIOD_1).mean().iloc[-1]
-        sma_2 = df['close'].rolling(window=SMA_PERIOD_2).mean().iloc[-1]
-        
-        return float(sma_1), float(sma_2)
-
-    def generate_signal(self, current_price: float, sma_1: float, sma_2: float, cross_flag: int) -> str:
-        """Generate trading signal based on dual SMA with state machine"""
-        upper_band = sma_1 * (1 + BAND_WIDTH / 100)
-        lower_band = sma_1 * (1 - BAND_WIDTH / 100)
-        
-        signal = "FLAT"
-        
-        # LONG conditions
-        if current_price > upper_band:
-            signal = "LONG"
-        elif current_price > sma_1 and cross_flag == 1:
-            signal = "LONG"
-        # SHORT conditions
-        elif current_price < lower_band:
-            signal = "SHORT"
-        elif current_price < sma_1 and cross_flag == -1:
-            signal = "SHORT"
-        
-        # Apply SMA 2 filter
-        if signal == "LONG" and current_price < sma_2:
-            signal = "FLAT"
-        elif signal == "SHORT" and current_price > sma_2:
-            signal = "FLAT"
-        
-        return signal
-
-    def update_data(self):
-        """Update all dashboard data"""
-        if not self.api:
-            self.initialize_api()
-
-        log.info("Updating dashboard data...")
-        
-        try:
-            # Get current market data
-            portfolio_value = self.get_portfolio_value()
-            mark_price = self.get_mark_price()
-            current_position = self.get_current_position()
-            ohlc_data = self.get_ohlc_data()
-            
-            # Calculate technical indicators
-            sma_1, sma_2 = self.calculate_smas(ohlc_data)
-            cross_flag = self.state.get("cross_flag", 0)
-            signal = self.generate_signal(mark_price, sma_1, sma_2, cross_flag)
-            
-            # Calculate bands
-            upper_band = sma_1 * (1 + BAND_WIDTH / 100)
-            lower_band = sma_1 * (1 - BAND_WIDTH / 100)
-            
-            # Update performance metrics
-            if self.state["performance"]["starting_capital"] == 0:
-                self.state["performance"]["starting_capital"] = portfolio_value
-            
-            starting_capital = self.state["performance"]["starting_capital"]
-            total_return_pct = 0
-            if starting_capital > 0:
-                total_return_pct = (portfolio_value - starting_capital) / starting_capital * 100
-            
-            # Update state
-            self.state["performance"] = {
-                "current_value": portfolio_value,
-                "starting_capital": starting_capital,
-                "total_return_pct": total_return_pct,
-                "total_trades": len(self.state["trades"])
-            }
-            
-            self.state["current_position"] = current_position
-            self.state["market_data"] = {
-                "current_price": mark_price,
-                "sma_1": sma_1,
-                "sma_2": sma_2,
-                "upper_band": upper_band,
-                "lower_band": lower_band,
-                "signal": signal,
-                "last_updated": datetime.now(timezone.utc).isoformat()
-            }
-            
-            self.state["last_updated"] = datetime.now(timezone.utc).isoformat()
-            
-            # Log new trade if position changed
-            self._detect_new_trade(current_position)
-            
-            self.save_state()
-            self.last_update = time.time()
-            log.info("Dashboard data updated successfully")
-            
-        except Exception as e:
-            log.error(f"Error updating dashboard data: {e}")
-
-    def _detect_new_trade(self, current_position: Optional[Dict]):
-        """Detect and log new trades based on position changes"""
-        old_position = self.state.get("current_position")
-        
-        # If position changed
-        if (old_position is None and current_position is not None) or \
-           (old_position is not None and current_position is None) or \
-           (old_position and current_position and 
-            (old_position["size_btc"] != current_position["size_btc"] or 
-             old_position["side"] != current_position["side"])):
-            
-            # Use current market price
-            current_price = self.state["market_data"].get("current_price", 0)
-            
-            trade_record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "signal": current_position["signal"] if current_position else "FLAT",
-                "side": current_position["side"] if current_position else "none",
-                "size_btc": current_position["size_btc"] if current_position else 0,
-                "fill_price": current_price,
-                "portfolio_value": self.state["performance"]["current_value"],
-                "sma_1": self.state["market_data"].get("sma_1", 0),
-                "sma_2": self.state["market_data"].get("sma_2", 0),
-                "cross_flag": self.state.get("cross_flag", 0),
-                "stop_distance": (current_price * (STATIC_STOP_PCT / 100)) if current_position else 0,
-                "stop_loss_pct": STATIC_STOP_PCT
-            }
-            
-            self.state["trades"].append(trade_record)
-            log.info(f"New trade detected and logged: {trade_record['signal']}")
-
-    def should_update(self) -> bool:
-        """Check if it's time to update data"""
-        if self.last_update is None:
-            return True
-        return (time.time() - self.last_update) >= UPDATE_INTERVAL
-
-# Global monitor instance
-monitor = DashboardMonitor()
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="30">
-    <title>Dual SMA Trading Dashboard</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
-            background: #ffffff;
-            color: #000000;
-            padding: 20px;
-            min-height: 100vh;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background: #ffffff;
-            border: 1px solid #e0e0e0;
-            padding: 40px;
-        }
-        h1 {
-            color: #000000;
-            margin-bottom: 8px;
-            font-size: 2em;
-            text-align: center;
-            font-weight: 600;
-            letter-spacing: -0.5px;
-        }
-        .subtitle {
-            text-align: center;
-            color: #666666;
-            margin-bottom: 40px;
-            font-size: 0.95em;
-            font-weight: 400;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1px;
-            margin-bottom: 40px;
-            border: 1px solid #000000;
-        }
-        .card {
-            background: #ffffff;
-            color: #000000;
-            padding: 30px;
-            border-right: 1px solid #000000;
-            border-bottom: 1px solid #000000;
-        }
-        .card:last-child {
-            border-right: none;
-        }
-        .card h2 {
-            font-size: 0.75em;
-            margin-bottom: 12px;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #666666;
-        }
-        .card-value {
-            font-size: 2.2em;
-            font-weight: 300;
-            margin-bottom: 8px;
-            letter-spacing: -1px;
-        }
-        .card-label {
-            font-size: 0.85em;
-            color: #666666;
-            font-weight: 400;
-        }
-        .section {
-            background: #ffffff;
-            padding: 0;
-            margin-bottom: 40px;
-            border-top: 2px solid #000000;
-        }
-        .section h2 {
-            color: #000000;
-            margin-bottom: 25px;
-            margin-top: 25px;
-            font-size: 1em;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: #ffffff;
-            border: 1px solid #000000;
-        }
-        th {
-            background: #000000;
-            color: #ffffff;
-            padding: 14px 12px;
-            text-align: left;
-            font-weight: 500;
-            font-size: 0.75em;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        td {
-            padding: 14px 12px;
-            border-bottom: 1px solid #e0e0e0;
-            font-size: 0.9em;
-        }
-        tr:last-child td {
-            border-bottom: none;
-        }
-        tr:hover {
-            background: #f9f9f9;
-        }
-        .long {
-            color: #000000;
-            font-weight: 600;
-        }
-        .short {
-            color: #666666;
-            font-weight: 600;
-        }
-        .flat {
-            color: #999999;
-            font-weight: 600;
-        }
-        .positive {
-            color: #000000;
-            font-weight: 600;
-        }
-        .negative {
-            color: #666666;
-            font-weight: 600;
-        }
-        .strategy-info {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1px;
-            border: 1px solid #000000;
-        }
-        .strategy-stat {
-            background: #ffffff;
-            padding: 20px;
-            border-right: 1px solid #000000;
-            border-bottom: 1px solid #000000;
-        }
-        .strategy-stat:last-child {
-            border-right: none;
-        }
-        .strategy-stat-label {
-            font-size: 0.75em;
-            color: #666666;
-            margin-bottom: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            font-weight: 500;
-        }
-        .strategy-stat-value {
-            font-size: 1.4em;
-            font-weight: 300;
-            color: #000000;
-        }
-        .timestamp {
-            text-align: center;
-            color: #999999;
-            margin-top: 40px;
-            font-size: 0.8em;
-            font-weight: 400;
-        }
-        .no-data {
-            text-align: center;
-            padding: 60px 20px;
-            color: #999999;
-            font-style: normal;
-            font-size: 0.9em;
-        }
-        .badge {
-            display: inline-block;
-            padding: 4px 10px;
-            font-size: 0.75em;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            border: 1px solid #000000;
-        }
-        .badge-long {
-            background: #000000;
-            color: #ffffff;
-        }
-        .badge-short {
-            background: #ffffff;
-            color: #000000;
-        }
-        .badge-flat {
-            background: #f0f0f0;
-            color: #666666;
-            border-color: #999999;
-        }
-        .status-indicator {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-        .status-live {
-            background: #00ff00;
-        }
-        .status-offline {
-            background: #ff0000;
-        }
-        .cross-flag {
-            font-weight: 600;
-            padding: 2px 6px;
-            border-radius: 3px;
-        }
-        .cross-up {
-            background: #e8f5e9;
-            color: #2e7d32;
-        }
-        .cross-down {
-            background: #ffebee;
-            color: #c62828;
-        }
-        .cross-none {
-            background: #f5f5f5;
-            color: #757575;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Dual SMA State Machine Strategy</h1>
-        <div class="subtitle">
-            <span class="status-indicator {% if data_fresh %}status-live{% else %}status-offline{% endif %}"></span>
-            SMA1(57) + SMA2(124) with 5% Bands | 2% Stop | 3x Leverage
-        </div>
-        
-        {% if not api_configured %}
-        <div style="background: #fff3cd; color: #856404; padding: 20px; border: 1px solid #ffeaa7; margin-bottom: 40px; text-align: center;">
-            <strong>API Configuration Required</strong><br>
-            Set KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables to enable live data fetching.
-        </div>
-        {% endif %}
-        
-        <!-- Performance Cards -->
-        <div class="grid">
-            <div class="card">
-                <h2>Current Position</h2>
-                <div class="card-value">{{ current_signal }}</div>
-                <div class="card-label">{{ current_size }} BTC @ ${{ current_price }}</div>
-            </div>
-            <div class="card">
-                <h2>Portfolio Value</h2>
-                <div class="card-value">${{ current_value }}</div>
-                <div class="card-label">Started: ${{ starting_capital }}</div>
-            </div>
-            <div class="card">
-                <h2>Total Return</h2>
-                <div class="card-value {{ 'positive' if total_return_raw >= 0 else 'negative' }}">{{ total_return }}%</div>
-                <div class="card-label">{{ total_trades }} trades detected</div>
-            </div>
-        </div>
-
-        <!-- Market Data -->
-        <div class="grid">
-            <div class="card">
-                <h2>Current Price</h2>
-                <div class="card-value">${{ market_price }}</div>
-                <div class="card-label">BTC Mark Price</div>
-            </div>
-            <div class="card">
-                <h2>SMA 1 (Logic)</h2>
-                <div class="card-value">${{ sma_1 }}</div>
-                <div class="card-label">57-day MA with Bands</div>
-            </div>
-            <div class="card">
-                <h2>SMA 2 (Filter)</h2>
-                <div class="card-value">${{ sma_2 }}</div>
-                <div class="card-label">124-day MA Filter</div>
-            </div>
-            <div class="card">
-                <h2>Cross State</h2>
-                <div class="card-value">
-                    <span class="cross-flag {{ cross_flag_class }}">{{ cross_flag_text }}</span>
-                </div>
-                <div class="card-label">State Machine Flag</div>
-            </div>
-        </div>
-
-        <!-- Bands Info -->
-        <div class="grid">
-            <div class="card">
-                <h2>Upper Band</h2>
-                <div class="card-value">${{ upper_band }}</div>
-                <div class="card-label">SMA1 + 5%</div>
-            </div>
-            <div class="card">
-                <h2>Lower Band</h2>
-                <div class="card-value">${{ lower_band }}</div>
-                <div class="card-label">SMA1 - 5%</div>
-            </div>
-            <div class="card">
-                <h2>Signal</h2>
-                <div class="card-value">{{ market_signal }}</div>
-                <div class="card-label">Current Strategy Signal</div>
-            </div>
-        </div>
-
-        <!-- Strategy Information -->
-        <div class="section">
-            <h2>Strategy Configuration</h2>
-            <div class="strategy-info">
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">Strategy Type</div>
-                    <div class="strategy-stat-value">Dual SMA</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">SMA 1 (Logic)</div>
-                    <div class="strategy-stat-value">{{ sma_period_1 }} days</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">SMA 2 (Filter)</div>
-                    <div class="strategy-stat-value">{{ sma_period_2 }} days</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">Band Width</div>
-                    <div class="strategy-stat-value">{{ band_width_pct }}%</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">Stop Loss</div>
-                    <div class="strategy-stat-value">{{ stop_loss_pct }}%</div>
-                </div>
-                <div class="strategy-stat">
-                    <div class="strategy-stat-label">Leverage</div>
-                    <div class="strategy-stat-value">{{ leverage }}x</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Trade History -->
-        <div class="section">
-            <h2>Trade Detection Log</h2>
-            {% if trades %}
-            <table>
-                <thead>
-                    <tr>
-                        <th>Timestamp</th>
-                        <th>Signal</th>
-                        <th>Side</th>
-                        <th>Size (BTC)</th>
-                        <th>Fill Price</th>
-                        <th>SMA 1</th>
-                        <th>SMA 2</th>
-                        <th>Cross Flag</th>
-                        <th>Stop %</th>
-                        <th>Portfolio Value</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for trade in trades|reverse %}
-                    <tr>
-                        <td>{{ trade.timestamp }}</td>
-                        <td><span class="badge badge-{{ trade.signal.lower() }}">{{ trade.signal }}</span></td>
-                        <td class="{{ trade.signal.lower() }}">{{ trade.side.upper() }}</td>
-                        <td>{{ trade.size_btc }}</td>
-                        <td>${{ trade.fill_price }}</td>
-                        <td>${{ trade.sma_1 }}</td>
-                        <td>${{ trade.sma_2 }}</td>
-                        <td>{{ trade.cross_flag }}</td>
-                        <td>{{ trade.stop_loss_pct }}%</td>
-                        <td>${{ trade.portfolio_value }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            {% else %}
-                <div class="no-data">No trades detected yet. Monitoring for position changes...</div>
-            {% endif %}
-        </div>
-
-        <div class="timestamp">
-            Last updated: {{ last_updated }} UTC | Auto-refreshes every 30 seconds | Data updates every 5 minutes
-            {% if not data_fresh %}
-            <br><span style="color: #ff6b6b;">Data may be stale - check API configuration</span>
-            {% endif %}
-        </div>
-    </div>
-</body>
-</html>
-"""
-
 @app.route('/')
-def dashboard():
-    # Update data if needed
-    if monitor.should_update():
-        try:
-            monitor.update_data()
-        except Exception as e:
-            log.error(f"Failed to update data: {e}")
+def index():
+    # Run the grid search
+    SYMBOL = "BTCUSDT"
+    df = fetch_binance_data(SYMBOL)
     
-    state = monitor.state
+    best_params, best_sharpe, best_curve, benchmark_ret, heatmap_data, smas1, smas2 = run_dual_sma_grid(df)
     
-    # Check if API is configured
-    api_configured = bool(os.getenv("KRAKEN_API_KEY") and os.getenv("KRAKEN_API_SECRET"))
+    if best_params is None:
+        return "No valid parameters found.", 500
     
-    # Check data freshness
-    data_fresh = False
-    if state.get("last_updated"):
-        last_update = datetime.fromisoformat(state["last_updated"].replace('Z', '+00:00'))
-        data_fresh = (datetime.now(timezone.utc) - last_update) < timedelta(minutes=10)
+    best_sma1, best_sma2, best_x, best_s = best_params
     
-    # Current position
-    current_position = state.get("current_position")
-    current_signal = "FLAT"
-    current_size = "0.0000"
-    
-    # Use current market price for display
-    market_data = state.get("market_data", {})
-    current_price = f"{market_data.get('current_price', 0):.2f}"
-    
-    if current_position:
-        current_signal = current_position["signal"]
-        current_size = f"{current_position['size_btc']:.4f}"
-    
-    # Performance metrics
-    performance = state.get("performance", {})
-    current_value = f"{performance.get('current_value', 0):.2f}"
-    starting_capital = f"{performance.get('starting_capital', 0):.2f}"
-    total_return_raw = performance.get('total_return_pct', 0)
-    total_return = f"{total_return_raw:.2f}"
-    total_trades = performance.get('total_trades', 0)
-    
-    # Market data
-    market_price = f"{market_data.get('current_price', 0):.2f}"
-    sma_1 = f"{market_data.get('sma_1', 0):.2f}"
-    sma_2 = f"{market_data.get('sma_2', 0):.2f}"
-    upper_band = f"{market_data.get('upper_band', 0):.2f}"
-    lower_band = f"{market_data.get('lower_band', 0):.2f}"
-    market_signal = market_data.get('signal', 'N/A')
-    
-    # Cross flag
-    cross_flag = state.get('cross_flag', 0)
-    if cross_flag == 1:
-        cross_flag_text = "↑ UP"
-        cross_flag_class = "cross-up"
-    elif cross_flag == -1:
-        cross_flag_text = "↓ DOWN"
-        cross_flag_class = "cross-down"
+    # Apply 3x leverage to strategy returns
+    leveraged_curve = best_curve * 3
+    # Compute average return over rolling 4-month periods (approx 120 trading days each)
+    # Calculate returns for each 4-month window and average them
+    window_size = 120  # Approx 4 months in trading days
+    if len(leveraged_curve) >= window_size:
+        # Calculate cumulative returns for each window
+        window_returns = []
+        for i in range(len(leveraged_curve) - window_size + 1):
+            window_cum_return = leveraged_curve[i + window_size - 1] - (leveraged_curve[i - 1] if i > 0 else 0)
+            window_returns.append(window_cum_return)
+        avg_return_4months = np.mean(window_returns) if window_returns else 0
     else:
-        cross_flag_text = "—"
-        cross_flag_class = "cross-none"
+        # If data is shorter than 4 months, use the full period
+        avg_return_4months = leveraged_curve[-1] if len(leveraged_curve) > 0 else 0
     
-    # Strategy info
-    strategy_info = state.get("strategy_info", {})
-    sma_period_1 = strategy_info.get('sma_period_1', 57)
-    sma_period_2 = strategy_info.get('sma_period_2', 124)
-    band_width_pct = strategy_info.get('band_width_pct', 5.0)
-    stop_loss_pct = strategy_info.get('stop_loss_pct', 2.0)
-    leverage = strategy_info.get('leverage', 3)
+    # Create the plot
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(2, 2)
     
-    # Format trades
-    trades = []
-    for trade in state.get("trades", []):
-        trade_copy = trade.copy()
-        try:
-            dt = datetime.fromisoformat(trade['timestamp'].replace('Z', '+00:00'))
-            trade_copy['timestamp'] = dt.strftime('%Y-%m-%d %H:%M:%S')
-        except:
-            trade_copy['timestamp'] = trade['timestamp']
-        trade_copy['size_btc'] = f"{trade.get('size_btc', 0):.4f}"
-        trade_copy['fill_price'] = f"{trade.get('fill_price', 0):.2f}"
-        trade_copy['portfolio_value'] = f"{trade.get('portfolio_value', 0):.2f}"
-        trade_copy['sma_1'] = f"{trade.get('sma_1', 0):.2f}"
-        trade_copy['sma_2'] = f"{trade.get('sma_2', 0):.2f}"
-        trade_copy['cross_flag'] = trade.get('cross_flag', 0)
-        trade_copy['stop_loss_pct'] = f"{trade.get('stop_loss_pct', 2.0):.1f}"
-        trades.append(trade_copy)
+    # Plot A: Equity Curve
+    ax1 = fig.add_subplot(gs[0, :])
+    dates = df.index
+    market_cum = np.exp(np.cumsum(benchmark_ret))
+    strat_cum = np.exp(np.pad(leveraged_curve, (0,0))) 
     
-    # Reverse for display (newest first)
-    trades = list(reversed(trades))
+    ax1.plot(dates, market_cum, label="Buy & Hold", color='gray', alpha=0.5)
+    ax1.plot(dates, strat_cum, label=f"Strategy (SMA{best_sma1} & SMA{best_sma2}) with 3x Leverage", color='darkorange')
+    ax1.set_title(f"Equity Curve: Dual SMA + Band Latch (Log Scale)")
+    ax1.set_yscale('log')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
     
-    return render_template_string(
-        HTML_TEMPLATE,
-        api_configured=api_configured,
-        data_fresh=data_fresh,
-        current_signal=current_signal,
-        current_size=current_size,
-        current_price=current_price,
-        current_value=current_value,
-        starting_capital=starting_capital,
-        total_return=total_return,
-        total_return_raw=total_return_raw,
-        total_trades=total_trades,
-        market_price=market_price,
-        sma_1=sma_1,
-        sma_2=sma_2,
-        upper_band=upper_band,
-        lower_band=lower_band,
-        market_signal=market_signal,
-        cross_flag=cross_flag,
-        cross_flag_text=cross_flag_text,
-        cross_flag_class=cross_flag_class,
-        sma_period_1=sma_period_1,
-        sma_period_2=sma_period_2,
-        band_width_pct=band_width_pct,
-        stop_loss_pct=stop_loss_pct,
-        leverage=leverage,
-        trades=trades,
-        last_updated=state.get("last_updated", "Never").replace('T', ' ').replace('Z', '')
-    )
-
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "last_update": monitor.last_update,
-        "data_fresh": monitor.should_update()
+    # Plot B: Heatmap (SMA1 vs SMA2)
+    ax2 = fig.add_subplot(gs[1, :])
+    X, Y = np.meshgrid(smas2, smas1)
+    
+    c = ax2.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='magma')
+    fig.colorbar(c, ax=ax2, label='Best Sharpe (across X & S)')
+    
+    ax2.plot(best_sma2, best_sma1, 'g*', markersize=15, markeredgecolor='white', label='Optimal')
+    
+    ax2.set_title("Sharpe Landscape: SMA1 (Logic) vs SMA2 (Filter)")
+    ax2.set_xlabel("SMA 2 (Filter)")
+    ax2.set_ylabel("SMA 1 (Logic)")
+    ax2.legend()
+    
+    plt.tight_layout()
+    
+    # Convert plot to base64 for HTML
+    img = io.BytesIO()
+    plt.savefig(img, format='png', dpi=100)
+    img.seek(0)
+    plot_url = base64.b64encode(img.getvalue()).decode('utf8')
+    plt.close(fig)
+    
+    # Prepare data for template
+    data = {
+        'symbol': SYMBOL,
+        'best_sma1': best_sma1,
+        'best_sma2': best_sma2,
+        'best_x': best_x,
+        'best_s': best_s,
+        'best_sharpe': best_sharpe,
+        'avg_return_4months': avg_return_4months,
+        'plot_url': plot_url
     }
-
-@app.route('/force-update')
-def force_update():
-    """Force data update"""
-    try:
-        monitor.update_data()
-        return {"status": "success", "message": "Data updated successfully"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
-if __name__ == '__main__':
-    # Initialize the monitor
-    try:
-        monitor.initialize_api()
-        monitor.update_data()  # Initial data fetch
-    except Exception as e:
-        log.error(f"Initialization failed: {e}")
-        log.info("Dashboard will start in read-only mode")
     
-    port = int(os.getenv('PORT', 8080))
-    log.info(f"Starting web dashboard on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    return render_template('index.html', data=data)
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("Starting web server on port 8080...")
+    print("Open http://localhost:8080 in your browser")
+    app.run(host='0.0.0.0', port=8080, debug=False)
