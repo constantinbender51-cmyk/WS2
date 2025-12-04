@@ -187,7 +187,7 @@ def run_grid_search(df, sma_period=365):
 if __name__ == "__main__":
     # Settings
     SYMBOL = "BTCUSDT"
-    SMA_PERIOD = 365
+    SMA_PERIOD = 120
     
     try:
         # 1. Get Data
