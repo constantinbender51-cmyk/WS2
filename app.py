@@ -8,6 +8,12 @@ from flask import Flask, render_template, send_file
 import io
 import base64
 
+# Create Flask app
+app = Flask(__name__)
+
+# Global variables to store results
+results_data = None
+
 # -----------------------------------------------------------------------------
 # 1. DATA FETCHING
 # -----------------------------------------------------------------------------
