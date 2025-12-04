@@ -5,9 +5,6 @@ import time
 from datetime import datetime
 import matplotlib.pyplot as plt
 from numba import jit
-import io
-import base64
-from flask import Flask, render_template
 
 # -----------------------------------------------------------------------------
 # 1. DATA FETCHING
@@ -49,82 +46,78 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1d", start_date="2018-01-01")
     return df[["open", "high", "low", "close"]]
 
 # -----------------------------------------------------------------------------
-# 2. NUMBA OPTIMIZED LOGIC (State Machine)
+# 2. NUMBA OPTIMIZED LOGIC (Dual SMA + State Machine)
 # -----------------------------------------------------------------------------
 @jit(nopython=True)
-def calculate_strategy_numba(opens, highs, lows, intraday_returns, sma_arr, x, s):
+def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, sma2_arr, x, s):
     """
-    Runs the path-dependent logic loop very fast.
+    SMA 1: Handles the 'Just Crossed' State Machine logic and Proximity bands.
+    SMA 2: Acts as a hard filter (Trend Confirmation).
     """
     n = len(opens)
     strategy_returns = np.zeros(n)
     
-    # State Flag: 0 = None, 1 = Just Crossed Up, -1 = Just Crossed Down
+    # State Flag for SMA 1: 0 = None, 1 = Just Crossed Up, -1 = Just Crossed Down
     cross_flag = 0 
     
-    # Iterate through days (start at 1 for prev comparison)
     for i in range(1, n):
-        # Skip if SMA is NaN
-        if np.isnan(sma_arr[i]):
+        # Skip if either SMA is NaN
+        if np.isnan(sma1_arr[i]) or np.isnan(sma2_arr[i]):
             continue
             
         current_open = opens[i]
         prev_open = opens[i-1]
-        current_sma = sma_arr[i]
-        prev_sma = sma_arr[i-1] # Note: SMA array is already shifted in main loop? 
-                                # No, let's pass raw SMA and handle shift logic here or pre-shift.
-                                # To be safe/clear: logic uses TODAY's open vs YESTERDAY's SMA?
-                                # Previous scripts used Shifted SMA. 
-                                # Let's assume sma_arr passed in is ALREADY shifted (i.e. sma[i] is yesterday's close avg)
         
-        upper_band = current_sma * (1 + x)
-        lower_band = current_sma * (1 - x)
+        # SMA 1 Values (Primary Logic)
+        cur_sma1 = sma1_arr[i]
         
-        # 1. Determine Cross Event (Crossing the CENTER line)
-        # We compare Current Open vs Current SMA line
-        # Logic: Did we flip sides relative to SMA?
-        # Note: Using prev_open to detect cross
+        # SMA 2 Value (Filter)
+        cur_sma2 = sma2_arr[i]
         
-        # Cross UP
-        if (prev_open < current_sma) and (current_open > current_sma):
+        # --- SMA 1 STATE MACHINE ---
+        upper_band = cur_sma1 * (1 + x)
+        lower_band = cur_sma1 * (1 - x)
+        
+        # 1. Determine Cross Event (Crossing SMA 1)
+        if (prev_open < cur_sma1) and (current_open > cur_sma1):
             cross_flag = 1
-        # Cross DOWN
-        elif (prev_open > current_sma) and (current_open < current_sma):
+        elif (prev_open > cur_sma1) and (current_open < cur_sma1):
             cross_flag = -1
             
         # 2. Check Band Exit (Unset Flag)
-        # "Unset when open leaves x% band"
-        # If we are outside the band (Above Upper or Below Lower), the "proximity" flag is cleared.
         if (current_open > upper_band) or (current_open < lower_band):
             cross_flag = 0
             
-        # 3. Determine Signal
+        # 3. Determine Base Signal (SMA 1 Logic)
         signal = 0
         
-        # Long Logic
-        # A: Explicitly Above Band
-        # B: Above SMA AND Flag is Set (Just Crossed)
-        if (current_open > upper_band) or ((current_open > current_sma) and (cross_flag == 1)):
+        # Long Base: Above Band OR (Above SMA1 AND Just Crossed)
+        if (current_open > upper_band) or ((current_open > cur_sma1) and (cross_flag == 1)):
             signal = 1
-            
-        # Short Logic
-        # A: Explicitly Below Band
-        # B: Below SMA AND Flag is Set (Just Crossed)
-        elif (current_open < lower_band) or ((current_open < current_sma) and (cross_flag == -1)):
+        # Short Base: Below Band OR (Below SMA1 AND Just Crossed)
+        elif (current_open < lower_band) or ((current_open < cur_sma1) and (cross_flag == -1)):
             signal = -1
             
-        # Else Flat (signal 0)
+        # --- SMA 2 FILTER ---
+        # Flatten if conflicting with SMA 2
+        
+        if signal == 1:
+            # If Long, must be above SMA 2
+            if current_open < cur_sma2:
+                signal = 0
+        elif signal == -1:
+            # If Short, must be below SMA 2
+            if current_open > cur_sma2:
+                signal = 0
         
         # 4. Calculate Return & Stop Loss
         if signal != 0:
             daily_ret = signal * intraday_returns[i]
             
             # Stop Loss Check
-            # Long Stop: Low < Open * (1-s)
             if signal == 1:
                 if lows[i] < current_open * (1 - s):
                     daily_ret = np.log(1 - s)
-            # Short Stop: High > Open * (1+s)
             elif signal == -1:
                 if highs[i] > current_open * (1 + s):
                     daily_ret = np.log(1 - s)
@@ -136,107 +129,127 @@ def calculate_strategy_numba(opens, highs, lows, intraday_returns, sma_arr, x, s
 # -----------------------------------------------------------------------------
 # 3. GRID SEARCH
 # -----------------------------------------------------------------------------
-def run_state_machine_grid(df):
-    print("\n--- Starting Grid Search (State Machine Logic) ---")
+def run_dual_sma_grid(df):
+    print("\n--- Starting Grid Search (Dual SMA: Logic + Filter) ---")
     
-    # Parameters
-    sma_periods = np.arange(1, 366, 2)
-    # X needs to be positive for "Proximity" logic to make sense (Band Width)
-    # Scanning 0% to 10%
-    x_values = np.arange(0.00, 0.101, 0.005) 
-    s_values = np.arange(0.01, 0.11, 0.01)
+    # --- Parameters ---
+    # Using larger steps to accommodate 4D search space without taking forever
+    # SMA1 (Logic): 5 to 200, step 10
+    sma1_periods = np.arange(5, 205, 10)
+    # SMA2 (Filter): 10 to 365, step 20
+    sma2_periods = np.arange(10, 370, 20)
     
-    # Pre-convert to Numpy for Numba
+    # X: 0% to 6%
+    x_values = np.arange(0.00, 0.061, 0.01) 
+    # S: 2% to 10%
+    s_values = np.arange(0.02, 0.101, 0.02)
+    
+    print(f"Total Combinations: {len(sma1_periods) * len(sma2_periods) * len(x_values) * len(s_values)}")
+    
+    # Pre-convert to Numpy
     opens = df['open'].to_numpy()
     highs = df['high'].to_numpy()
     lows = df['low'].to_numpy()
-    closes = df['close'].to_numpy() # Used for SMA calc only
+    closes = df['close'].to_numpy()
     
     # Pre-calc Intraday Returns
-    # Avoid division by zero
     with np.errstate(divide='ignore', invalid='ignore'):
         intraday_returns = np.log(closes / opens)
     intraday_returns = np.nan_to_num(intraday_returns)
     
     benchmark_returns = np.log(df['close'] / df['close'].shift(1)).fillna(0).to_numpy()
     
+    # Pre-calculate ALL SMAs to avoid re-rolling in loops
+    print("Pre-calculating SMA matrix...")
+    max_period = max(np.max(sma1_periods), np.max(sma2_periods))
+    # Dictionary to store {period: numpy_array}
+    sma_cache = {}
+    needed_periods = set(np.concatenate((sma1_periods, sma2_periods)))
+    
+    for p in needed_periods:
+        # Shift by 1 for lookahead prevention
+        sma_cache[p] = df['close'].rolling(window=p).mean().shift(1).to_numpy()
+    
     best_sharpe = -np.inf
     best_params = None
     best_curve = None
     
-    # For Heatmap (SMA vs X)
-    results_matrix = np.zeros((len(sma_periods), len(x_values)))
+    # For Heatmap: We'll plot SMA1 vs SMA2 (taking best X/S for each cell)
+    results_matrix = np.zeros((len(sma1_periods), len(sma2_periods)))
     
     start_time = time.time()
     
-    # Loop SMAs
-    for i, period in enumerate(sma_periods):
-        # Calculate SMA (shifted by 1 for lookahead prevention)
-        # Numba needs a clean array, so we do rolling in Pandas first
-        sma_series = df['close'].rolling(window=period).mean().shift(1)
-        sma_arr = sma_series.to_numpy() # Contains NaNs at start
+    # Loop SMA 1
+    for i, p1 in enumerate(sma1_periods):
+        sma1_arr = sma_cache[p1]
         
-        # Loop X
-        for j, x in enumerate(x_values):
+        # Loop SMA 2
+        for j, p2 in enumerate(sma2_periods):
+            sma2_arr = sma_cache[p2]
             
-            local_best_s_sharpe = -np.inf
+            # Optimization: If p1 == p2, the filter is redundant, but we run it anyway
             
-            # Loop S
-            for s in s_values:
-                # Run Core Logic (Compiled)
-                strat_ret = calculate_strategy_numba(opens, highs, lows, intraday_returns, sma_arr, x, s)
-                
-                # Sharpe Calc
-                # Exclude initial NaNs (where returns are 0 due to no signal)
-                # We can just ignore 0s if we assume we are in market mostly? 
-                # Better: slice from 'period' onwards
-                active_rets = strat_ret[period:] 
-                
-                if len(active_rets) < 10:
-                    sharpe = 0
-                else:
-                    mean_r = np.mean(active_rets)
-                    std_r = np.std(active_rets)
-                    sharpe = (mean_r / std_r) * np.sqrt(365) if std_r > 1e-9 else 0
-                
-                # Update Bests
-                if sharpe > local_best_s_sharpe:
-                    local_best_s_sharpe = sharpe
-                
-                if sharpe > best_sharpe:
-                    best_sharpe = sharpe
-                    best_params = (period, x, s)
-                    best_curve = np.cumsum(strat_ret)
+            local_best_sharpe = -np.inf
             
-            results_matrix[i, j] = local_best_s_sharpe
+            # Loop X
+            for x in x_values:
+                # Loop S
+                for s in s_values:
+                    
+                    strat_ret = calculate_dual_sma_strategy(
+                        opens, highs, lows, intraday_returns, 
+                        sma1_arr, sma2_arr, x, s
+                    )
+                    
+                    # Sharpe
+                    start_idx = max(p1, p2)
+                    active_rets = strat_ret[start_idx:]
+                    
+                    if len(active_rets) < 10:
+                        sharpe = 0
+                    else:
+                        mean_r = np.mean(active_rets)
+                        std_r = np.std(active_rets)
+                        sharpe = (mean_r / std_r) * np.sqrt(365) if std_r > 1e-9 else 0
+                    
+                    if sharpe > local_best_sharpe:
+                        local_best_sharpe = sharpe
+                    
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_params = (p1, p2, x, s)
+                        best_curve = np.cumsum(strat_ret)
+            
+            results_matrix[i, j] = local_best_sharpe
+            
+        if i % 5 == 0:
+            print(f"Processed SMA1 period {p1}...")
 
     print(f"Optimization complete in {time.time() - start_time:.2f}s.")
-    return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma_periods, x_values
+    return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma1_periods, sma2_periods
 
 # -----------------------------------------------------------------------------
-# 4. WEB SERVER
+# MAIN
 # -----------------------------------------------------------------------------
-app = Flask(__name__)
-
-@app.route('/')
-def index():
+if __name__ == "__main__":
     SYMBOL = "BTCUSDT"
     
-    # 1. Fetch data
+    # 1. Fetch
     df = fetch_binance_data(SYMBOL)
     
-    # 2. Run optimization
-    best_params, best_sharpe, best_curve, benchmark_ret, heatmap_data, smas, xs = run_state_machine_grid(df)
+    # 2. Run
+    best_params, best_sharpe, best_curve, benchmark_ret, heatmap_data, smas1, smas2 = run_dual_sma_grid(df)
     
-    best_sma, best_x, best_s = best_params
+    best_sma1, best_sma2, best_x, best_s = best_params
     
-    print(f"\n--- RESULTS (SMA Cross + Band Latch) ---")
-    print(f"Best SMA Period : {best_sma}")
-    print(f"Best Band Width X: {best_x:.1%}")
-    print(f"Best Stop Loss S : {best_s:.1%}")
-    print(f"Best Sharpe Ratio: {best_sharpe:.4f}")
+    print(f"\n--- RESULTS (Dual SMA) ---")
+    print(f"Best SMA 1 (Logic) : {best_sma1}")
+    print(f"Best SMA 2 (Filter): {best_sma2}")
+    print(f"Best Band Width X  : {best_x:.1%}")
+    print(f"Best Stop Loss S   : {best_s:.1%}")
+    print(f"Best Sharpe Ratio  : {best_sharpe:.4f}")
     
-    # 3. Create visualization
+    # 3. Visualization
     fig = plt.figure(figsize=(14, 10))
     gs = fig.add_gridspec(2, 2)
     
@@ -247,52 +260,25 @@ def index():
     strat_cum = np.exp(np.pad(best_curve, (0,0))) 
     
     ax1.plot(dates, market_cum, label="Buy & Hold", color='gray', alpha=0.5)
-    ax1.plot(dates, strat_cum, label=f"Strategy (SMA {best_sma}, x={best_x:.1%})", color='darkorange')
-    ax1.set_title(f"Equity Curve: Proximity Logic (Cross=Active, Enter=Flat)")
+    ax1.plot(dates, strat_cum, label=f"Strategy (SMA{best_sma1} & SMA{best_sma2})", color='darkorange')
+    ax1.set_title(f"Equity Curve: Dual SMA + Band Latch")
     ax1.set_yscale('log')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # Plot B: Heatmap
+    # Plot B: Heatmap (SMA1 vs SMA2)
     ax2 = fig.add_subplot(gs[1, :])
-    X, Y = np.meshgrid(xs * 100, smas)
+    X, Y = np.meshgrid(smas2, smas1)
     
-    c = ax2.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='magma')
-    fig.colorbar(c, ax=ax2, label='Sharpe Ratio')
+    c = ax2.pcolormesh(X, Y, results_matrix, shading='auto', cmap='magma')
+    fig.colorbar(c, ax=ax2, label='Best Sharpe (across X & S)')
     
-    ax2.plot(best_x*100, best_sma, 'g*', markersize=15, markeredgecolor='white', label='Optimal')
+    ax2.plot(best_sma2, best_sma1, 'g*', markersize=15, markeredgecolor='white', label='Optimal')
     
-    ax2.set_title("Sharpe Ratio Landscape")
-    ax2.set_xlabel("Band Width X (%)")
-    ax2.set_ylabel("SMA Period")
+    ax2.set_title("Sharpe Landscape: SMA1 (Logic) vs SMA2 (Filter)")
+    ax2.set_xlabel("SMA 2 (Filter)")
+    ax2.set_ylabel("SMA 1 (Logic)")
     ax2.legend()
     
     plt.tight_layout()
-    
-    # Convert plot to base64 for HTML embedding
-    img = io.BytesIO()
-    plt.savefig(img, format='png', dpi=100)
-    img.seek(0)
-    plot_url = base64.b64encode(img.getvalue()).decode('utf8')
-    plt.close(fig)
-    
-    # Prepare data for template
-    data = {
-        'symbol': SYMBOL,
-        'best_sma': best_sma,
-        'best_x': best_x,
-        'best_s': best_s,
-        'best_sharpe': best_sharpe,
-        'plot_url': plot_url
-    }
-    
-    return render_template('index.html', data=data)
-
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    # Start web server on port 8080
-    print("Starting web server on port 8080...")
-    print("Open http://localhost:8080 in your browser to view the plots")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    plt.show()
