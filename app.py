@@ -252,16 +252,12 @@ def index():
     
     # Apply 3x leverage to strategy returns
     leveraged_curve = best_curve * 3
-    # Compute average return over rolling 4-month periods (approx 120 trading days each)
-    # Calculate returns for each 4-month window and average them
+    # Compute average return specifically for the last 4 months (approx 120 trading days)
     window_size = 120  # Approx 4 months in trading days
     if len(leveraged_curve) >= window_size:
-        # Calculate cumulative returns for each window
-        window_returns = []
-        for i in range(len(leveraged_curve) - window_size + 1):
-            window_cum_return = leveraged_curve[i + window_size - 1] - (leveraged_curve[i - 1] if i > 0 else 0)
-            window_returns.append(window_cum_return)
-        avg_return_4months = np.mean(window_returns) if window_returns else 0
+        # Calculate the cumulative return for the most recent 4-month window
+        last_window_return = leveraged_curve[-1] - leveraged_curve[-window_size - 1]
+        avg_return_4months = last_window_return
     else:
         # If data is shorter than 4 months, use the full period
         avg_return_4months = leveraged_curve[-1] if len(leveraged_curve) > 0 else 0
