@@ -4,12 +4,6 @@ import numpy as np
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
-import itertools
-import io
-import base64
-from flask import Flask, render_template_string
-
-app = Flask(__name__)
 
 # -----------------------------------------------------------------------------
 # 1. DATA FETCHING
@@ -50,187 +44,149 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1d", start_date="2018-01-01")
     return df[["open", "close"]]
 
 # -----------------------------------------------------------------------------
-# 2. GRID SEARCH OPTIMIZATION
+# 2. GRID SEARCH (SINGLE SMA)
 # -----------------------------------------------------------------------------
-def run_heavy_grid_search(df):
+def run_single_sma_grid(df):
     """
-    Performs a grid search over 4 dimensions: SMA_Z, SMA_O, X%, Y%.
-    Uses Numpy for speed.
+    Optimizes SMA Period (1-365) and X% (-5% to +5%).
     """
-    print("\n--- Pre-calculating Data & SMAs ---")
+    print("\n--- Starting Grid Search (Single SMA) ---")
     
     # 1. Define Parameter Spaces
-    sma_periods = [1, 2, 4, 8, 16, 32, 64, 128]
-    # Scanning X and Y from 0% to 5% in 0.5% steps
-    thresholds = np.arange(0.00, 0.051, 0.005) 
+    # SMA: 1, 3, 5 ... 365
+    sma_periods = np.arange(1, 366, 2)
     
-    # 2. Pre-calculate all SMAs and convert to Numpy
-    # We use 'Close' for SMA calculation, but shift it by 1 so we have "Yesterday's SMA"
-    # This prevents lookahead bias when comparing against Today's Open.
-    sma_dict = {}
-    for period in sma_periods:
-        # Calculate SMA on Close, then shift 1 to align with next day's Open
-        sma_series = df['close'].rolling(window=period).mean().shift(1)
-        sma_dict[period] = sma_series.to_numpy()
-
-    # Base arrays
+    # X: -0.05 to +0.05 in steps of 0.005 (0.5%)
+    x_values = np.arange(-0.05, 0.051, 0.005)
+    
+    # Base Arrays
+    closes = df['close'].to_numpy()
     opens = df['open'].to_numpy()
-    
-    # Calculate Market Returns (Open-to-Open or Close-to-Close log returns)
-    # Using Close-to-Close for standard portfolio simulation
     market_returns = np.log(df['close'] / df['close'].shift(1)).fillna(0).to_numpy()
     
-    # Track Best Results
     best_sharpe = -np.inf
     best_params = None
-    best_equity_curve = None
+    best_curve = None
     
-    # Generate all combinations
-    # We use combinations_with_replacement for SMAs if order didn't matter, 
-    # but here order matters because X applies to Z and Y applies to O.
-    # To save time, we can assume symmetry checks, but let's do full product for correctness.
-    sma_combinations = list(itertools.product(sma_periods, sma_periods))
-    thresh_combinations = list(itertools.product(thresholds, thresholds))
-    
-    total_iterations = len(sma_combinations) * len(thresh_combinations)
-    print(f"Starting Grid Search: {total_iterations} combinations...")
+    # Store results for Heatmap: [SMA, X, Sharpe]
+    results_matrix = np.zeros((len(sma_periods), len(x_values)))
     
     start_time = time.time()
-    counter = 0
     
-    # 3. The Loop (Optimized with Numpy)
-    # We iterate SMAs first, as pulling the array is the "expensive" part
-    for z, o in sma_combinations:
-        sma_z_arr = sma_dict[z]
-        sma_o_arr = sma_dict[o]
+    # 2. Loop over SMAs
+    for i, period in enumerate(sma_periods):
+        # Calculate shifted SMA (yesterday's SMA to avoid lookahead)
+        sma = df['close'].rolling(window=period).mean().shift(1).to_numpy()
         
-        # Valid mask: where both SMAs are not NaN
-        valid_mask = (~np.isnan(sma_z_arr)) & (~np.isnan(sma_o_arr))
+        # Valid mask (skip NaN start)
+        valid_mask = ~np.isnan(sma)
         
-        for x, y in thresh_combinations:
-            counter += 1
+        # 3. Loop over X thresholds
+        for j, x in enumerate(x_values):
             
-            # --- Vectorized Logic ---
+            # Define Bands
+            upper_band = sma * (1 + x)
+            lower_band = sma * (1 - x)
             
-            # Long: Open > SMA_Z*(1+x) AND Open > SMA_O*(1+y)
-            # We must handle NaNs (comparisons with NaN return False usually, but good to be safe)
-            long_condition = (opens > sma_z_arr * (1 + x)) & (opens > sma_o_arr * (1 + y))
+            # Vectorized Signal Logic
+            # If X is negative, Bands overlap. We prioritize Long (1) over Short (-1).
+            # Logic: 
+            #   If Open > Upper -> Long
+            #   Else If Open < Lower -> Short
+            #   Else -> Flat
             
-            # Short: Open < SMA_Z*(1-x) AND Open < SMA_O*(1-y)
-            short_condition = (opens < sma_z_arr * (1 - x)) & (opens < sma_o_arr * (1 - y))
-            
-            # Position: 1 for Long, -1 for Short, 0 otherwise
-            # Initialize with zeros
+            # Initialize positions array
             positions = np.zeros_like(opens)
-            positions[long_condition] = 1
-            positions[short_condition] = -1
             
-            # Strategy Returns = Position * Market Returns
+            # Apply conditions
+            # Note: np.where evaluates conditions in order. Nested to simulate elif.
+            # position = 1 if (open > upper) else (-1 if (open < lower) else 0)
+            
+            long_mask = (opens > upper_band)
+            short_mask = (opens < lower_band)
+            
+            # Apply Short first, then overwrite with Long to give Long priority in overlap
+            # Or use np.select for clarity
+            conditions = [long_mask, short_mask]
+            choices = [1, -1]
+            positions = np.select(conditions, choices, default=0)
+            
+            # Calculate Returns
             strat_returns = positions * market_returns
             
-            # Metrics
-            # Filter out the initial NaNs for accurate mean/std
+            # Sharpe Calc
             active_returns = strat_returns[valid_mask]
-            
-            if len(active_returns) == 0: continue
-                
-            mean_ret = np.mean(active_returns)
-            std_ret = np.std(active_returns)
-            
-            if std_ret < 1e-9:
+            if len(active_returns) == 0:
                 sharpe = 0
             else:
-                sharpe = (mean_ret / std_ret) * np.sqrt(365)
+                mean_ret = np.mean(active_returns)
+                std_ret = np.std(active_returns)
+                sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 1e-9 else 0
+            
+            # Store Result
+            results_matrix[i, j] = sharpe
             
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
-                best_params = (z, o, x, y)
-                best_equity_curve = np.cumsum(strat_returns) # Log returns sum
-                
-            if counter % 5000 == 0:
-                print(f"Processed {counter}/{total_iterations}...")
+                best_params = (period, x)
+                best_curve = np.cumsum(strat_returns)
 
-    end_time = time.time()
-    print(f"\nSearch complete in {end_time - start_time:.2f} seconds.")
-    
-    return best_params, best_sharpe, best_equity_curve, market_returns
+    print(f"Optimization complete in {time.time() - start_time:.2f}s.")
+    return best_params, best_sharpe, best_curve, market_returns, results_matrix, sma_periods, x_values
 
 # -----------------------------------------------------------------------------
-# FLASK ROUTES
+# MAIN
 # -----------------------------------------------------------------------------
-@app.route('/')
-def index():
-    """Main page that runs backtest and displays plot"""
+if __name__ == "__main__":
     SYMBOL = "BTCUSDT"
     
-    # 1. Fetch data
+    # 1. Fetch
     df = fetch_binance_data(SYMBOL)
     
     # 2. Run Grid Search
-    best_params, best_sharpe, best_curve, market_returns = run_heavy_grid_search(df)
+    best_params, best_sharpe, best_curve, market_ret, heatmap_data, smas, xs = run_single_sma_grid(df)
     
-    z, o, x, y = best_params
+    best_sma, best_x = best_params
     
-    # 3. Create plot
-    plt.figure(figsize=(10, 6))
+    print(f"\n--- RESULTS ---")
+    print(f"Best SMA Period: {best_sma}")
+    print(f"Best Threshold X: {best_x:.1%}")
+    print(f"Best Sharpe Ratio: {best_sharpe:.4f}")
     
-    # Convert log returns to cumulative percentage
-    strat_cum = np.exp(best_curve)
-    market_cum = np.exp(np.cumsum(market_returns))
+    # 3. Visualization
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(2, 2)
     
-    # Align lengths
+    # Plot A: Equity Curve
+    ax1 = fig.add_subplot(gs[0, :])
     dates = df.index
+    market_cum = np.exp(np.cumsum(market_ret))
+    strat_cum = np.exp(np.pad(best_curve, (0,0))) # Pad if needed, but cumsum matches length usually
     
-    plt.plot(dates, market_cum, label="Buy & Hold (BTC)", color='gray', alpha=0.5)
-    plt.plot(dates, np.exp(np.cumsum(np.pad(best_curve, (0,0)))), label=f"Strategy (Sharpe: {best_sharpe:.2f})", color='blue')
+    ax1.plot(dates, market_cum, label="Buy & Hold", color='gray', alpha=0.5)
+    ax1.plot(dates, strat_cum, label=f"Best Strategy (SMA {best_sma}, x={best_x:.1%})", color='green')
+    ax1.set_title("Equity Curve (Log scale)")
+    ax1.set_yscale('log')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
     
-    plt.title(f"Best Grid Search Result: SMA({z}) +/- {x:.1%} & SMA({o}) +/- {y:.1%}")
-    plt.yscale('log')
-    plt.legend()
-    plt.grid(True, which='both', alpha=0.3)
+    # Plot B: Heatmap (Sharpe Ratio Landscape)
+    ax2 = fig.add_subplot(gs[1, :])
+    # Create meshgrid for pcolormesh
+    X, Y = np.meshgrid(xs * 100, smas)
     
-    # Save plot to a bytes buffer
-    img = io.BytesIO()
-    plt.savefig(img, format='png', bbox_inches='tight')
-    img.seek(0)
-    plt.close()
+    # pcolormesh needs x, y (corners) or centers. 
+    # Using simple imshow might be easier but let's try pcolormesh for correct axis labels
+    c = ax2.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='viridis')
+    fig.colorbar(c, ax=ax2, label='Sharpe Ratio')
     
-    # Encode plot to base64 for HTML
-    plot_url = base64.b64encode(img.getvalue()).decode('utf8')
+    # Mark the best point
+    ax2.plot(best_x*100, best_sma, 'rx', markersize=10, markeredgewidth=2, label='Optimal')
     
-    # Create HTML template
-    html_template = '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Backtest Visualization</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            h1 { color: #333; }
-            .results { background: #f5f5f5; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
-            img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; }
-        </style>
-    </head>
-    <body>
-        <h1>Backtest Visualization</h1>
-        <div class="results">
-            <h2>Optimal Results</h2>
-            <p><strong>SMA Period Z:</strong> {{ z }}</p>
-            <p><strong>SMA Period O:</strong> {{ o }}</p>
-            <p><strong>Threshold X:</strong> {{ x_pct }}</p>
-            <p><strong>Threshold Y:</strong> {{ y_pct }}</p>
-            <p><strong>Sharpe Ratio:</strong> {{ sharpe }}</p>
-        </div>
-        <h2>Performance Chart</h2>
-        <img src="data:image/png;base64,{{ plot_url }}" alt="Backtest Plot">
-        <p><em>Server running on port 8080. Chart shows cumulative returns (log scale).</em></p>
-    </body>
-    </html>
-    '''
+    ax2.set_title("Sharpe Ratio Heatmap")
+    ax2.set_xlabel("Threshold X (%)")
+    ax2.set_ylabel("SMA Period")
+    ax2.legend()
     
-    return render_template_string(html_template, 
-                                  z=z, o=o, x_pct=f"{x:.2%}", y_pct=f"{y:.2%}", 
-                                  sharpe=f"{best_sharpe:.4f}", plot_url=plot_url)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    plt.tight_layout()
+    plt.show()
