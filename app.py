@@ -264,8 +264,8 @@ def index():
     
     ax1.plot(dates, market_cum, label="Buy & Hold", color='gray', alpha=0.5)
     ax1.plot(dates, strat_cum, label=f"Strategy (SMA{best_sma1} & SMA{best_sma2}) with 2x Leverage", color='darkorange')
-    ax1.set_title(f"Equity Curve: Dual SMA + Band Latch (Linear Scale)")
-    ax1.set_yscale('linear')
+    ax1.set_title(f"Equity Curve: Dual SMA + Band Latch (Log Scale)")
+    ax1.set_yscale('log')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
