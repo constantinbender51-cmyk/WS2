@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+import sys
 from datetime import datetime
 import matplotlib.pyplot as plt
 from numba import jit
@@ -242,7 +243,7 @@ if __name__ == "__main__":
     
     if best_params is None:
         print("No valid parameters found.")
-        return
+        sys.exit(1)
     
     best_sma1, best_sma2, best_x, best_s = best_params
     
