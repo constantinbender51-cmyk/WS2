@@ -13,6 +13,68 @@ app = Flask(__name__)
 
 # Global variables to store results
 results_data = None
+# Create Flask app
+app = Flask(__name__)
+
+# Global variables to store results
+results_data = None
+
+# -----------------------------------------------------------------------------
+# ROUTE: Main page with results
+# -----------------------------------------------------------------------------
+@app.route('/')
+def index():
+    # Fetch data
+    df = fetch_binance_data(symbol="BTCUSDT", interval="1d", start_date="2018-01-01")
+    
+    # Run optimization
+    best_params, best_sharpe, best_curve, market_returns, results_matrix, sma_periods, x_values = run_single_sma_grid(df)
+    
+    # Generate plots
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # Top plot: Equity curve
+    axes[0].plot(np.cumsum(market_returns), label='Market (Buy & Hold)', color='blue', linewidth=2)
+    axes[0].plot(best_curve, label=f'Strategy (Sharpe: {best_sharpe:.4f})', color='green', linewidth=2)
+    axes[0].set_title('Equity Curve Comparison')
+    axes[0].set_ylabel('Cumulative Log Return')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Bottom plot: Heatmap
+    im = axes[1].imshow(results_matrix, aspect='auto', origin='lower', 
+                        extent=[x_values[0]*100, x_values[-1]*100, sma_periods[0], sma_periods[-1]],
+                        cmap='RdYlGn')
+    axes[1].set_title('Sharpe Ratio Heatmap (SMA Period vs Entry Threshold X)')
+    axes[1].set_xlabel('Entry Threshold X (%)')
+    axes[1].set_ylabel('SMA Period')
+    plt.colorbar(im, ax=axes[1], label='Sharpe Ratio')
+    
+    # Mark best point on heatmap
+    best_sma, best_x, best_s = best_params
+    axes[1].plot(best_x * 100, best_sma, 'ro', markersize=10, label=f'Best: SMA={best_sma}, X={best_x*100:.1f}%')
+    axes[1].legend()
+    
+    plt.tight_layout()
+    
+    # Convert plot to base64 for HTML
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plot_url = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    # Prepare data for template
+    data = {
+        'symbol': 'BTCUSDT',
+        'best_sma': best_params[0],
+        'best_x': best_params[1],
+        'best_s': best_params[2],
+        'best_sharpe': best_sharpe,
+        'plot_url': plot_url
+    }
+    
+    return render_template('index.html', data=data)
 
 # -----------------------------------------------------------------------------
 # 1. DATA FETCHING
