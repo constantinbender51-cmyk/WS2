@@ -134,10 +134,10 @@ def run_dual_sma_grid(df):
     
     # --- Parameters ---
     # Using larger steps to accommodate 4D search space without taking forever
-    # SMA1 (Logic): 5 to 200, step 10
-    sma1_periods = np.arange(5, 205, 10)
-    # SMA2 (Filter): 10 to 365, step 20
-    sma2_periods = np.arange(10, 370, 20)
+    # SMA1 (Logic): 5 to 205, step 2
+    sma1_periods = np.arange(5, 205, 2)
+    # SMA2 (Filter): 10 to 370, step 2
+    sma2_periods = np.arange(10, 370, 2)
     
     # X: 0% to 6%
     x_values = np.arange(0.00, 0.061, 0.01) 
