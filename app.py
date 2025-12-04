@@ -4,6 +4,9 @@ import numpy as np
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
+from flask import Flask, render_template, send_file
+import io
+import base64
 
 # -----------------------------------------------------------------------------
 # 1. DATA FETCHING
@@ -166,52 +169,7 @@ def run_single_sma_grid(df):
 # MAIN
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    SYMBOL = "BTCUSDT"
-    
-    # 1. Fetch
-    df = fetch_binance_data(SYMBOL)
-    
-    # 2. Run Grid Search
-    best_params, best_sharpe, best_curve, market_ret, heatmap_data, smas, xs = run_single_sma_grid(df)
-    
-    best_sma, best_x, best_s = best_params
-    
-    print(f"\n--- RESULTS ---")
-    print(f"Best SMA Period : {best_sma}")
-    print(f"Best Threshold X: {best_x:.1%}")
-    print(f"Best Stop Loss S: {best_s:.1%}")
-    print(f"Best Sharpe Ratio: {best_sharpe:.4f}")
-    
-    # 3. Visualization
-    fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(2, 2)
-    
-    # Plot A: Equity Curve
-    ax1 = fig.add_subplot(gs[0, :])
-    dates = df.index
-    market_cum = np.exp(np.cumsum(market_ret))
-    strat_cum = np.exp(np.pad(best_curve, (0,0))) 
-    
-    ax1.plot(dates, market_cum, label="Buy & Hold", color='gray', alpha=0.5)
-    ax1.plot(dates, strat_cum, label=f"Best Strategy (SMA {best_sma}, x={best_x:.1%}, sl={best_s:.0%})", color='purple')
-    ax1.set_title(f"Equity Curve: SMA {best_sma} Breakout with {best_s:.0%} Stop Loss")
-    ax1.set_yscale('log')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot B: Heatmap (Sharpe Ratio Landscape)
-    ax2 = fig.add_subplot(gs[1, :])
-    X, Y = np.meshgrid(xs * 100, smas)
-    
-    c = ax2.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='viridis')
-    fig.colorbar(c, ax=ax2, label='Best Sharpe (across all S)')
-    
-    ax2.plot(best_x*100, best_sma, 'r*', markersize=15, markeredgecolor='white', label='Optimal')
-    
-    ax2.set_title("Sharpe Ratio Heatmap (Best S per cell)")
-    ax2.set_xlabel("Threshold X (%)")
-    ax2.set_ylabel("SMA Period")
-    ax2.legend()
-    
-    plt.tight_layout()
-    plt.show()
+    # Start Flask web server on port 8080
+    print("Starting web server on port 8080...")
+    print("Open http://localhost:8080 in your browser to view the results")
+    app.run(host='0.0.0.0', port=8080, debug=False)
