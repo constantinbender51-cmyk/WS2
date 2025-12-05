@@ -134,7 +134,7 @@ def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, 
 # -----------------------------------------------------------------------------
 # HELPER: Calculate Monthly Returns
 # -----------------------------------------------------------------------------
-def calculate_monthly_returns(strategy_returns, dates):
+def calculate_monthly_returns(daily_returns, dates):
     """
     Calculate monthly returns from daily strategy returns.
     Returns a list of monthly returns as percentages.
@@ -142,15 +142,15 @@ def calculate_monthly_returns(strategy_returns, dates):
     # Create a DataFrame for easy grouping
     df_returns = pd.DataFrame({
         'date': dates,
-        'return': strategy_returns
+        'return': daily_returns
     })
     df_returns.set_index('date', inplace=True)
     
-    # Group by year-month and calculate cumulative return for each month
-    monthly_cum = df_returns.groupby([df_returns.index.year, df_returns.index.month])['return'].sum()
+    # Group by year-month and sum daily returns for each month
+    monthly_sum = df_returns.groupby([df_returns.index.year, df_returns.index.month])['return'].sum()
     
-    # Convert to list of percentages
-    monthly_returns_list = (np.exp(monthly_cum.values) - 1) * 100  # Convert to percentage
+    # Convert log returns to simple returns and then to percentage
+    monthly_returns_list = (np.exp(monthly_sum.values) - 1) * 100  # Convert to percentage
     
     return monthly_returns_list.tolist()# -----------------------------------------------------------------------------
 # 3. GRID SEARCH
@@ -255,7 +255,9 @@ def run_dual_sma_grid(df):
     # Calculate monthly returns for the best strategy
     monthly_returns = []
     if best_curve is not None:
-        monthly_returns = calculate_monthly_returns(best_curve, df.index)
+        # Get daily returns from the best strategy (best_curve is cumulative, so diff it)
+        daily_returns = np.diff(best_curve, prepend=0)
+        monthly_returns = calculate_monthly_returns(daily_returns, df.index)
     
     return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma1_periods, sma2_periods, monthly_returns
 
