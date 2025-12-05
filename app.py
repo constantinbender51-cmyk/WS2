@@ -8,7 +8,7 @@ import base64
 from datetime import datetime
 import matplotlib.pyplot as plt
 from numba import jit
-from flask import Flask, render_template, render_template_string
+from flask import Flask, render_template_string
 
 # -----------------------------------------------------------------------------
 # 1. DATA FETCHING
@@ -54,13 +54,6 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1d", start_date="2018-01-01")
 # -----------------------------------------------------------------------------
 @jit(nopython=True)
 def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, sma2_arr, x, s, r):
-    """
-    SMA 1: Logic + Proximity
-    SMA 2: Filter
-    x: Band width
-    s: Stop Loss %
-    r: Take Profit %
-    """
     n = len(opens)
     strategy_returns = np.zeros(n)
     
@@ -68,13 +61,11 @@ def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, 
     cross_flag = 0 
     
     for i in range(1, n):
-        # Skip if either SMA is NaN
         if np.isnan(sma1_arr[i]) or np.isnan(sma2_arr[i]):
             continue
             
         current_open = opens[i]
         prev_open = opens[i-1]
-        
         cur_sma1 = sma1_arr[i]
         cur_sma2 = sma2_arr[i]
         
@@ -105,14 +96,12 @@ def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, 
         elif signal == -1 and current_open > cur_sma2:
             signal = 0
         
-        # 4. Calculate Return, Stop Loss & Take Profit
+        # 4. Calculate Return, SL & TP
         if signal != 0:
             daily_ret = signal * intraday_returns[i]
-            
-            # Pessimistic Assumption: Check Stop Loss First
             sl_hit = False
             
-            # STOP LOSS LOGIC
+            # STOP LOSS
             if signal == 1:
                 if lows[i] < current_open * (1 - s):
                     daily_ret = np.log(1 - s)
@@ -122,7 +111,7 @@ def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, 
                     daily_ret = np.log(1 - s)
                     sl_hit = True
             
-            # TAKE PROFIT LOGIC (Only if SL not hit)
+            # TAKE PROFIT (If SL not hit)
             if not sl_hit:
                 if signal == 1:
                     if highs[i] > current_open * (1 + r):
@@ -148,12 +137,12 @@ def calculate_monthly_returns(daily_returns, dates):
 def run_dual_sma_grid(df):
     print("\n--- Starting Grid Search (5-Dimensional) ---")
     
-    # Adjusted steps for performance (Total combos ~60k, runs in <5s)
-    sma1_periods = np.arange(10, 200, 10) # 19 steps
-    sma2_periods = np.arange(20, 200, 20) # 9 steps
-    x_values = np.arange(0.00, 0.051, 0.01) # 6 steps (0-5%)
-    s_values = np.arange(0.02, 0.101, 0.02) # 5 steps (2-10%)
-    r_values = np.arange(0.02, 0.201, 0.04) # 5 steps (2-20%)
+    # Range Settings
+    sma1_periods = np.arange(10, 200, 10) # Logic
+    sma2_periods = np.arange(20, 200, 20) # Filter
+    x_values = np.arange(0.00, 0.051, 0.01) # Band
+    s_values = np.arange(0.02, 0.101, 0.02) # Stop Loss
+    r_values = np.arange(0.02, 0.201, 0.04) # Take Profit
     
     total_combos = len(sma1_periods)*len(sma2_periods)*len(x_values)*len(s_values)*len(r_values)
     print(f"Scanning {total_combos} combinations...")
@@ -179,7 +168,6 @@ def run_dual_sma_grid(df):
     best_params = None
     best_curve = None
     
-    # Heatmap: SMA1 vs SMA2 (Projecting best X, S, R)
     results_matrix = np.zeros((len(sma1_periods), len(sma2_periods)))
     
     start_time = time.time()
@@ -200,7 +188,6 @@ def run_dual_sma_grid(df):
                             sma1_arr, sma2_arr, x, s, r
                         )
                         
-                        # Calculate Sharpe
                         start_idx = max(p1, p2)
                         active_rets = strat_ret[start_idx:]
                         
@@ -232,7 +219,61 @@ def run_dual_sma_grid(df):
     return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma1_periods, sma2_periods, monthly_returns
 
 # -----------------------------------------------------------------------------
-# 4. WEB SERVER
+# 4. HTML TEMPLATE
+# -----------------------------------------------------------------------------
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Strategy Optimizer</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; padding: 20px; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; text-align: center; margin-bottom: 30px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .card { background: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 5px solid #3498db; }
+        .card h3 { margin: 0 0 10px 0; font-size: 0.9em; color: #7f8c8d; text-transform: uppercase; }
+        .card p { margin: 0; font-size: 1.5em; font-weight: bold; color: #2c3e50; }
+        .plot-container { text-align: center; margin-bottom: 30px; }
+        img { max-width: 100%; height: auto; border-radius: 8px; border: 1px solid #eee; }
+        .returns-list { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+        .returns-list li { background: #ecf0f1; padding: 5px 10px; border-radius: 4px; font-size: 0.9em; }
+        .positive { color: #27ae60; }
+        .negative { color: #c0392b; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Optimal Strategy Results: {{ data.symbol }}</h1>
+        <div class="grid">
+            <div class="card"><h3>Logic SMA</h3><p>{{ data.best_sma1 }}</p></div>
+            <div class="card"><h3>Filter SMA</h3><p>{{ data.best_sma2 }}</p></div>
+            <div class="card"><h3>Band Width (X)</h3><p>{{ data.best_x }}</p></div>
+            <div class="card"><h3>Stop Loss (S)</h3><p>{{ data.best_s }}</p></div>
+            <div class="card" style="border-left-color: #27ae60;"><h3>Take Profit (R)</h3><p>{{ data.best_r }}</p></div>
+            <div class="card" style="border-left-color: #8e44ad;"><h3>Sharpe Ratio</h3><p>{{ data.best_sharpe }}</p></div>
+            <div class="card" style="border-left-color: #e67e22;"><h3>Avg 4-Mo Return (3x)</h3><p>{{ data.avg_return_4months }}</p></div>
+        </div>
+        <div class="plot-container">
+            <img src="data:image/png;base64,{{ data.plot_url }}" alt="Strategy Performance Plot">
+        </div>
+        <div style="text-align: center;">
+            <h3>Recent Monthly Returns (3x Lev)</h3>
+            <ul class="returns-list">
+                {% for ret in data.monthly_returns %}
+                    <li class="{{ 'positive' if '-' not in ret else 'negative' }}">{{ ret }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+# -----------------------------------------------------------------------------
+# 5. WEB SERVER
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -241,16 +282,17 @@ def index():
     SYMBOL = "BTCUSDT"
     df = fetch_binance_data(SYMBOL)
     
+    # Run Grid Search
+    # Note: run_dual_sma_grid returns 'results_matrix' as the 5th element
     best_params, best_sharpe, best_curve, benchmark_ret, heatmap_data, smas1, smas2, monthly_returns = run_dual_sma_grid(df)
     
     if best_params is None:
         return "No valid parameters found. Try increasing data range.", 500
     
     best_sma1, best_sma2, best_x, best_s, best_r = best_params
-    
     leveraged_curve = best_curve * 3
     
-    # Calc Avg 4-month return
+    # Avg 4-month return
     window_size = 120
     if len(leveraged_curve) >= window_size:
         window_returns = []
@@ -265,7 +307,7 @@ def index():
     fig = plt.figure(figsize=(14, 10))
     gs = fig.add_gridspec(2, 2)
     
-    # Equity Curve
+    # A: Equity Curve
     ax1 = fig.add_subplot(gs[0, :])
     dates = df.index
     market_cum = np.exp(np.cumsum(benchmark_ret))
@@ -278,10 +320,12 @@ def index():
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # Heatmap
+    # B: Heatmap (FIXED VARIABLE NAME HERE)
     ax2 = fig.add_subplot(gs[1, :])
     X, Y = np.meshgrid(smas2, smas1)
-    c = ax2.pcolormesh(X, Y, results_matrix, shading='auto', cmap='magma')
+    
+    # Use 'heatmap_data' which was returned from the function
+    c = ax2.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='magma')
     fig.colorbar(c, ax=ax2, label='Sharpe')
     ax2.plot(best_sma2, best_sma1, 'g*', markersize=15, markeredgecolor='white')
     ax2.set_title("Sharpe Landscape (SMA1 vs SMA2)")
@@ -306,10 +350,10 @@ def index():
         'best_sharpe': f"{best_sharpe:.4f}",
         'avg_return_4months': f"{np.exp(avg_return_4months)-1:.2%}",
         'plot_url': plot_url,
-        'monthly_returns': [f"{r:.2f}%" for r in monthly_returns[-12:]] # Show last 12 months
+        'monthly_returns': [f"{r:.2f}%" for r in monthly_returns[-12:]] 
     }
     
-    return render_template('index.html', data=data)
+    return render_template_string(HTML_TEMPLATE, data=data)
 
 if __name__ == "__main__":
     print("Starting web server on port 8080...")
