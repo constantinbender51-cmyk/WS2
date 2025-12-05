@@ -130,7 +130,29 @@ def calculate_dual_sma_strategy(opens, highs, lows, intraday_returns, sma1_arr, 
             
     return strategy_returns
 
+
 # -----------------------------------------------------------------------------
+# HELPER: Calculate Monthly Returns
+# -----------------------------------------------------------------------------
+def calculate_monthly_returns(strategy_returns, dates):
+    """
+    Calculate monthly returns from daily strategy returns.
+    Returns a list of monthly returns as percentages.
+    """
+    # Create a DataFrame for easy grouping
+    df_returns = pd.DataFrame({
+        'date': dates,
+        'return': strategy_returns
+    })
+    df_returns.set_index('date', inplace=True)
+    
+    # Group by year-month and calculate cumulative return for each month
+    monthly_cum = df_returns.groupby([df_returns.index.year, df_returns.index.month])['return'].sum()
+    
+    # Convert to list of percentages
+    monthly_returns_list = (np.exp(monthly_cum.values) - 1) * 100  # Convert to percentage
+    
+    return monthly_returns_list.tolist()# -----------------------------------------------------------------------------
 # 3. GRID SEARCH
 # -----------------------------------------------------------------------------
 def run_dual_sma_grid(df):
@@ -145,8 +167,8 @@ def run_dual_sma_grid(df):
     
     # X: 0% to 6%
     x_values = np.arange(0.00, 0.061, 0.01) 
-    # S: 2% to 10%
-    s_values = np.arange(0.02, 0.101, 0.02)
+    # S: 0% to 6%
+    s_values = np.arange(0.00, 0.061, 0.01)
     
     print(f"Total Combinations: {len(sma1_periods) * len(sma2_periods) * len(x_values) * len(s_values)}")
     
@@ -230,7 +252,12 @@ def run_dual_sma_grid(df):
             print(f"Processed SMA1 period {p1}...")
 
     print(f"Optimization complete in {time.time() - start_time:.2f}s.")
-    return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma1_periods, sma2_periods
+    # Calculate monthly returns for the best strategy
+    monthly_returns = []
+    if best_curve is not None:
+        monthly_returns = calculate_monthly_returns(best_curve, df.index)
+    
+    return best_params, best_sharpe, best_curve, benchmark_returns, results_matrix, sma1_periods, sma2_periods, monthly_returns
 
 # -----------------------------------------------------------------------------
 # 4. WEB SERVER
@@ -243,7 +270,7 @@ def index():
     SYMBOL = "BTCUSDT"
     df = fetch_binance_data(SYMBOL)
     
-    best_params, best_sharpe, best_curve, benchmark_ret, heatmap_data, smas1, smas2 = run_dual_sma_grid(df)
+    best_params, best_sharpe, best_curve, benchmark_ret, heatmap_data, smas1, smas2, monthly_returns = run_dual_sma_grid(df)
     
     if best_params is None:
         return "No valid parameters found.", 500
@@ -315,7 +342,8 @@ def index():
         'best_s': best_s,
         'best_sharpe': best_sharpe,
         'avg_return_4months': avg_return_4months,
-        'plot_url': plot_url
+        'plot_url': plot_url,
+        'monthly_returns': monthly_returns
     }
     
     return render_template('index.html', data=data)
