@@ -191,7 +191,7 @@ ax3.grid(True, alpha=0.3)
 
 plt.tight_layout()
 
-import matplotlib.collections # Re-import locally for safety
+
 
 # Save
 plot_dir = '/app/static'
