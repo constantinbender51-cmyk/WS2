@@ -65,8 +65,8 @@
         {% else %}
             <div class="info-box">
                 <h3>About the Inefficiency Index</h3>
-                <p>The inefficiency index is calculated as: sum(|log returns|) / |sum(log returns)|</p>
-                <p>This {{ window }}-day rolling measure shows market efficiency over time.</p>
+                <p>The inverse inefficiency index is calculated as: 1 / (sum(|log returns|) / |sum(log returns)|)</p>
+                <p>This {{ window }}-day rolling measure shows the inverse of market efficiency over time.</p>
                 <p>Data fetched from Binance starting from 2018-01-01 to present.</p>
             </div>
             
@@ -76,7 +76,7 @@
             </div>
             
             <div class="chart-container">
-                <h2 class="chart-title">Inefficiency Index ({{ window }}-day Rolling)</h2>
+                <h2 class="chart-title">Inverse Inefficiency Index ({{ window }}-day Rolling)</h2>
                 <img src="data:image/png;base64,{{ inefficiency_chart_url }}" alt="Inefficiency Index Chart" style="width:100%; max-width:1200px;">
             </div>
         {% endif %}
