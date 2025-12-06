@@ -211,7 +211,7 @@ def index():
     modified_returns = temp_df['returns'] * return_multiplier
     
     # Calculate the daily factor for compounding using the modified returns
-    daily_compounding_factor = 1 + (temp_df['iii_sma_yesterday'] * modified_returns)
+    daily_compounding_factor = 1 + modified_returns
     
     # Compute the cumulative product for compounding
     cumulative_compounded_series = daily_compounding_factor.cumprod()
