@@ -203,6 +203,38 @@ for i in range(start_idx, len(df)):
     df.at[df.index[i], 'strategy_equity'] = equity
     df.at[df.index[i], 'leverage_used'] = leverage
 
+
+def get_final_metrics(equity_curve):
+    # Ensure equity curve is a pandas Series for easier manipulation
+    if not isinstance(equity_curve, pd.Series):
+        equity_curve = pd.Series(equity_curve)
+
+    total_return = equity_curve.iloc[-1] - equity_curve.iloc[0]
+    
+    # Calculate CAGR
+    days = (equity_curve.index[-1] - equity_curve.index[0]).days
+    if days == 0: days = 1 # Avoid division by zero for single day data
+    cagr = (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (365.0/days) - 1
+    
+    # Calculate Max Drawdown
+    roll_max = equity_curve.cummax()
+    drawdown = (equity_curve - roll_max) / roll_max
+    max_dd = drawdown.min()
+    
+    # Calculate Sharpe Ratio (annualized)
+    # Use daily returns for calculation, then annualize
+    daily_returns = equity_curve.pct_change().dropna()
+    if daily_returns.empty:
+        sharpe = 0
+    else:
+        mean_daily_return = daily_returns.mean()
+        std_daily_return = daily_returns.std()
+        if std_daily_return == 0: # Avoid division by zero
+            sharpe = 0
+        else:
+            sharpe = (mean_daily_return / std_daily_return) * np.sqrt(365)
+            
+    return total_return, cagr, max_dd, sharpe
 # 5. METRICS & PLOT
 plot_data = df.iloc[start_idx:].copy()
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
