@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ symbol }} Price and Inefficiency Index</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 30px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .chart-container {
+            background-color: white;
+            padding: 20px;
+            margin-bottom: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .chart-title {
+            margin-top: 0;
+            color: #3498db;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        .error {
+            color: #e74c3c;
+            text-align: center;
+            padding: 20px;
+            background-color: #fdf2f2;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .info-box {
+            background-color: #e8f4fc;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .info-box h3 {
+            margin-top: 0;
+            color: #2980b9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{{ symbol }} Analysis Dashboard</h1>
+        
+        {% if error_message %}
+            <div class="error">
+                <h2>Error</h2>
+                <p>{{ error_message }}</p>
+            </div>
+        {% else %}
+            <div class="info-box">
+                <h3>About the Inefficiency Index</h3>
+                <p>The inefficiency index is calculated as: sum(|log returns|) / |sum(log returns)|</p>
+                <p>This {{ window }}-day rolling measure shows market efficiency over time.</p>
+                <p>Data fetched from Binance starting from 2018-01-01 to present.</p>
+            </div>
+            
+            <div class="chart-container">
+                <h2 class="chart-title">Price Chart</h2>
+                <div id="price-chart"></div>
+            </div>
+            
+            <div class="chart-container">
+                <h2 class="chart-title">Inefficiency Index ({{ window }}-day Rolling)</h2>
+                <div id="inefficiency-chart"></div>
+            </div>
+        {% endif %}
+    </div>
+    
+    <script>
+        {% if not error_message %}
+            var priceGraph = {{ graphJSON_price|safe }};
+            var inefficiencyGraph = {{ graphJSON_inefficiency|safe }};
+            
+            Plotly.newPlot('price-chart', priceGraph.data, priceGraph.layout);
+            Plotly.newPlot('inefficiency-chart', inefficiencyGraph.data, inefficiencyGraph.layout);
+        {% endif %}
+    </script>
+</body>
+</html>
