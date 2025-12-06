@@ -238,6 +238,8 @@ def get_final_metrics(equity_curve):
 # 5. METRICS & PLOT
 plot_data = df.iloc[start_idx:].copy()
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
+# Calculate buy-and-hold equity for comparison
+plot_data['buy_hold_equity'] = (plot_data['close'] / plot_data['close'].iloc[0])
 
 print("\n" + "="*45)
 print(f"BEST 5-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
