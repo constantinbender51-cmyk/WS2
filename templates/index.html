@@ -78,9 +78,9 @@
             
             {% if iii_x_returns_chart_url %}
             <div class="chart-container">
-                <h2 class="chart-title">Yesterday's Inverse Inefficiency Index SMA * Today's Return</h2>
+                <h2 class="chart-title">Cumulative Product of (1 + Yesterday's Inverse Inefficiency Index SMA * Today's Return)</h2>
                 <img src="data:image/png;base64,{{ iii_x_returns_chart_url }}" alt="III SMA x Returns Chart" style="width:100%; max-width:1200px;">
-                <p><em>Note: This chart displays the product of the previous day's 14-day SMA of the inverse inefficiency index and today's simple return.</em></p>
+                <p><em>Note: This chart displays the cumulative product of `(1 + (previous day's 14-day SMA of the inverse inefficiency index * today's simple return))`.</em></p>
             </div>
             {% endif %}
         {% endif %}
