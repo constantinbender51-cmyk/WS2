@@ -304,8 +304,8 @@ def index():
         avg_return_4months = leveraged_curve[-1] if len(leveraged_curve) > 0 else 0
     
     # Plotting
-    fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(2, 2)
+    fig = plt.figure(figsize=(14, 12))
+    gs = fig.add_gridspec(3, 2)
     
     # A: Equity Curve
     ax1 = fig.add_subplot(gs[0, :])
@@ -324,17 +324,26 @@ def index():
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # B: Heatmap (FIXED VARIABLE NAME HERE)
+    # B: Price with SMA
     ax2 = fig.add_subplot(gs[1, :])
+    ax2.plot(dates, df['close'], label="Close Price", color='green', alpha=0.8)
+    ax2.plot(dates, sma_365, label="365-day SMA", color='red', alpha=0.7, linestyle='--')
+    ax2.set_title("Price with 365-day Simple Moving Average")
+    ax2.set_ylabel("Price (USD)")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # C: Heatmap
+    ax3 = fig.add_subplot(gs[2, :])
     X, Y = np.meshgrid(smas2, smas1)
     
     # Use 'heatmap_data' which was returned from the function
-    c = ax2.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='magma')
-    fig.colorbar(c, ax=ax2, label='Sharpe')
-    ax2.plot(best_sma2, best_sma1, 'g*', markersize=15, markeredgecolor='white')
-    ax2.set_title("Sharpe Landscape (SMA1 vs SMA2)")
-    ax2.set_xlabel("Filter SMA")
-    ax2.set_ylabel("Logic SMA")
+    c = ax3.pcolormesh(X, Y, heatmap_data, shading='auto', cmap='magma')
+    fig.colorbar(c, ax=ax3, label='Sharpe')
+    ax3.plot(best_sma2, best_sma1, 'g*', markersize=15, markeredgecolor='white')
+    ax3.set_title("Sharpe Landscape (SMA1 vs SMA2)")
+    ax3.set_xlabel("Filter SMA")
+    ax3.set_ylabel("Logic SMA")
     
     plt.tight_layout()
     
