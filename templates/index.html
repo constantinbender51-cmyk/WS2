@@ -80,7 +80,7 @@
             <div class="chart-container">
                 <h2 class="chart-title">Conditional Cumulative Compounded Returns with Inverse Inefficiency Index SMA</h2>
                 <img src="data:image/png;base64,{{ iii_x_returns_chart_url }}" alt="Conditional Compounded Returns Chart" style="width:100%; max-width:1200px;">
-                <p><em>Note: This chart displays the cumulative product of `(1 + (previous day's 14-day SMA of the inverse inefficiency index * modified today's simple return))`. Today's simple return is multiplied by 1 if yesterday's close price was above its 120-day SMA, and by -1 if it was below or equal to its 120-day SMA.</em></p>
+                <p><em>Note: This chart displays the cumulative product of `(1 + (previous day's 14-day SMA of the inverse inefficiency index * modified today's simple return))`. The background is colored green when yesterday's close price was above its 120-day SMA, and red when it was below or equal. Today's simple return is multiplied by 1 if above SMA, and by -1 if below or equal to SMA.</em></p>
             </div>
             {% endif %}
         {% endif %}
