@@ -5,7 +5,7 @@ import datetime as dt
 from flask import Flask, render_template
 import plotly.express as px
 import plotly.graph_objects as go
-import json
+import plotly.io as pio
 
 # Configuration
 SYMBOL = 'BTC/USDT'
@@ -120,8 +120,8 @@ def index():
     fig_inefficiency.update_layout(hovermode="x unified", template="plotly_dark")
     
     # Convert to JSON for template
-    graphJSON_price = json.dumps(fig_price, cls=go.Figure.json_encoder)
-    graphJSON_inefficiency = json.dumps(fig_inefficiency, cls=go.Figure.json_encoder)
+    graphJSON_price = pio.to_json(fig_price)
+    graphJSON_inefficiency = pio.to_json(fig_inefficiency)
     
     return render_template('index.html',
                            graphJSON_price=graphJSON_price,
