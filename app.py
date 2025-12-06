@@ -18,14 +18,15 @@ SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 14 
 
-# --- OPTIMIZED PARAMETERS (Confirmed by user's optimization results) ---
+# --- OPTIMIZED PARAMETERS (2x Global Leverage) ---
+# Base Thresholds remain optimized:
 OPT_T_LOW = 0.10
 OPT_T_HIGH = 0.50
 
-# Using 0.0, 1.0, 0.5 as confirmed by the max Sharpe search results
-OPT_L_LOW = 0.0  # Cash (III < 0.10)
-OPT_L_MID = 1.0  # Standard risk (0.10 <= III < 0.50)
-OPT_L_HIGH = 0.5 # Ultra-defensive (III >= 0.50)
+# Leverage tiers scaled by 2x:
+OPT_L_LOW = 0.0  # (0.0 * 2) - Cash below 10% efficiency
+OPT_L_MID = 2.0  # (1.0 * 2) - Standard risk (10% <= III < 50%)
+OPT_L_HIGH = 1.0 # (0.5 * 2) - Ultra-defensive (III >= 50%)
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
@@ -57,6 +58,7 @@ def get_final_metrics(equity_series):
     roll_max = equity_series.cummax()
     drawdown = (equity_series - roll_max) / roll_max
     max_dd = drawdown.min()
+    # Sharpe Ratio scales linearly with leverage, assuming returns are scaled
     sharpe = (ret.mean() / ret.std()) * np.sqrt(365) if ret.std() != 0 else 0
     return total_ret, cagr, max_dd, sharpe
 
@@ -172,7 +174,7 @@ ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white'
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
 ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
 ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
-ax2.set_title('Leverage Deployment (0.0x / 1.0x / 0.5x)')
+ax2.set_title('Leverage Deployment (0.0x / 2.0x / 1.0x)')
 ax2.set_yticks(np.unique(plot_data['leverage_used']))
 ax2.set_ylabel('Leverage (x)')
 ax2.grid(True, axis='x', alpha=0.3)
