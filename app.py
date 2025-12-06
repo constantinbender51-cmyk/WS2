@@ -190,9 +190,14 @@ def index():
     temp_df['iii_sma'] = inefficiency_smoothed # This aligns by index, filling with NaNs where no match
 
     temp_df['iii_sma_yesterday'] = temp_df['iii_sma'].shift(1)
-    temp_df['iii_sma_x_returns'] = temp_df['iii_sma_yesterday'] * temp_df['returns']
     
-    iii_sma_x_returns = temp_df['iii_sma_x_returns'].dropna()
+    # Calculate the daily factor for compounding
+    daily_compounding_factor = 1 + (temp_df['iii_sma_yesterday'] * temp_df['returns'])
+    
+    # Compute the cumulative product for compounding
+    cumulative_compounded_series = daily_compounding_factor.cumprod()
+    
+    iii_sma_x_returns = cumulative_compounded_series.dropna()
 
     # Debug: Print some statistics about the inefficiency index
     print(f"Data length: {len(df)}")
@@ -247,9 +252,9 @@ def index():
     if not iii_sma_x_returns.empty:
         plt.figure(figsize=(12, 6))
         plt.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5)
-        plt.title(f'{SYMBOL} Yesterday\'s III SMA * Today\'s Return ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
+        plt.title(f'{SYMBOL} Cumulative Product of (1 + Yesterday\'s III SMA * Today\'s Return) ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
         plt.xlabel('Date', fontsize=12)
-        plt.ylabel('Yesterday\'s III SMA * Today\'s Return', fontsize=12)
+        plt.ylabel('Cumulative Compounded Value', fontsize=12)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
 
