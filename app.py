@@ -171,6 +171,9 @@ def index():
     if df is None or df.empty:
         print("DataFrame is None or empty. Using sample data.")
         df = generate_sample_data()
+
+    # Calculate log returns for the entire DataFrame
+    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
     # Debug: Print data info
     print(f"DataFrame info:")
@@ -179,6 +182,18 @@ def index():
     print(f"  Close price range: {df['close'].min():.2f} to {df['close'].max():.2f}")
     
     inefficiency_series, inefficiency_smoothed = calculate_inefficiency_index(df, ROLLING_WINDOW_DAYS)    
+    
+    # Calculate the new metric: yesterday's smoothed inefficiency * today's log return
+    # Create a temporary DataFrame to align series by index
+    temp_df = pd.DataFrame(index=df.index)
+    temp_df['log_returns'] = df['log_returns']
+    temp_df['iii_sma'] = inefficiency_smoothed # This aligns by index, filling with NaNs where no match
+
+    temp_df['iii_sma_yesterday'] = temp_df['iii_sma'].shift(1)
+    temp_df['iii_sma_x_returns'] = temp_df['iii_sma_yesterday'] * temp_df['log_returns']
+    
+    iii_sma_x_returns = temp_df['iii_sma_x_returns'].dropna()
+
     # Debug: Print some statistics about the inefficiency index
     print(f"Data length: {len(df)}")
     print(f"Inefficiency series length: {len(inefficiency_series)}")
@@ -226,9 +241,27 @@ def index():
     plt.close()
     img_combined.seek(0)
     combined_chart_url = base64.b64encode(img_combined.getvalue()).decode('utf8')
+
+    # Create the second plot for III SMA * Log Returns
+    iii_x_returns_chart_url = None # Initialize to None
+    if not iii_sma_x_returns.empty:
+        plt.figure(figsize=(12, 6))
+        plt.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5)
+        plt.title(f'{SYMBOL} Yesterday\'s III SMA * Today\'s Log Return ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Yesterday\'s III SMA * Today\'s Log Return', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        img_iii_x_returns = io.BytesIO()
+        plt.savefig(img_iii_x_returns, format='png', dpi=100)
+        plt.close()
+        img_iii_x_returns.seek(0)
+        iii_x_returns_chart_url = base64.b64encode(img_iii_x_returns.getvalue()).decode('utf8')
     
     return render_template('index.html',
                            combined_chart_url=combined_chart_url,
+                           iii_x_returns_chart_url=iii_x_returns_chart_url,
                            symbol=SYMBOL,
                            window=ROLLING_WINDOW_DAYS)
 
