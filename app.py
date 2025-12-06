@@ -13,7 +13,7 @@ import time
 # Configuration
 SYMBOL = 'BTC/USDT'
 START_DATE_STR = '2018-01-01'
-ROLLING_WINDOW_DAYS = 30
+ROLLING_WINDOW_DAYS = 60
 PORT = 8080
 
 app = Flask(__name__)
