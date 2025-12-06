@@ -409,8 +409,7 @@ def grid_search():
                            grid_search_chart_url=grid_search_chart_url,
                            symbol=SYMBOL)
 
-
-    @app.route('/bestiii')
+@app.route('/bestiii')
 def plot_bestiii_equity():
     # Fetch OHLCV data once
     print(f"Fetching OHLCV data for plotting best III equity...")
