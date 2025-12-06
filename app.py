@@ -1,500 +1,212 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import datetime as dt
-from flask import Flask, render_template
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import io
-import base64
-import time
+import matplotlib.cm as cm
+from datetime import datetime
+from flask import Flask, send_file
+import os
 
-# Configuration
-SYMBOL = 'BTC/USDT'
-START_DATE_STR = '2018-01-01'
-ROLLING_WINDOW_DAYS = 30
-PORT = 8080
+# 1. CONFIGURATION
+# ----------------
+symbol = 'BTC/USDT'
+timeframe = '1d'
+start_date_str = '2018-01-01 00:00:00'
 
-app = Flask(__name__)
+# Strategy Params
+SMA_FAST = 40
+SMA_SLOW = 120
+SL_PCT = 0.02
+TP_PCT = 0.16
 
-# Generate sample data for demonstration
-def generate_sample_data():
-    print("Generating sample data for demonstration...")
-    dates = pd.date_range(start=START_DATE_STR, end=pd.Timestamp.now(), freq='D')
-    n = len(dates)
+# Efficiency Calculation Window
+III_WINDOW = 14 
+
+def fetch_binance_history(symbol, start_str):
+    print(f"Fetching data for {symbol} starting from {start_str}...")
+    exchange = ccxt.binance()
+    since = exchange.parse8601(start_str)
+    all_ohlcv = []
     
-    # Generate realistic BTC price data
-    np.random.seed(42)
-    base_price = 10000
-    returns = np.random.normal(0.0005, 0.04, n)  # Daily returns
-    price = base_price * np.exp(np.cumsum(returns))
-    
-    # Add some volatility clusters
-    for i in range(5):
-        start = np.random.randint(0, n-100)
-        length = np.random.randint(20, 60)
-        price[start:start+length] *= (1 + np.random.normal(0, 0.2, length))
-    
-    df = pd.DataFrame({
-        'open': price * 0.99,
-        'high': price * 1.02,
-        'low': price * 0.98,
-        'close': price,
-        'volume': np.random.lognormal(10, 1, n) * 1000
-    }, index=dates)
-    
-    print(f"Generated {len(df)} sample daily candles for {SYMBOL}.")
+    while True:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            if not ohlcv: break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            if since > exchange.milliseconds(): break
+        except Exception as e:
+            print(f"Error fetching: {e}")
+            break
+            
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    df = df[~df.index.duplicated(keep='first')]
+    print(f"Fetched {len(df)} days of data.")
     return df
 
-# Data fetching function
-def fetch_ohlcv(symbol, since_date_str):
-    try:
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
-            'timeout': 30000,
-        })
-        
-        since_ms = exchange.parse8601(since_date_str + 'T00:00:00Z')
-        all_ohlcv = []
-        
-        print(f"Attempting to fetch {symbol} OHLCV data from {since_date_str}...")
-        
-        # Try to fetch data
-        exchange.load_markets()
-        if symbol not in exchange.symbols:
-            print(f"Symbol {symbol} not found on Binance. Using sample data.")
-            return generate_sample_data()
-        
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                while True:
-                    ohlcv = exchange.fetch_ohlcv(symbol, '1d', since_ms, limit=1000)
-                    if not ohlcv:
-                        break
-                    all_ohlcv.extend(ohlcv)
-                    since_ms = ohlcv[-1][0] + (24 * 60 * 60 * 1000)
-                    
-                    if since_ms > exchange.milliseconds():
-                        break
-                    
-                    print(f"Fetched {len(all_ohlcv)} entries, continuing...")
-                    time.sleep(1)  # Rate limiting
-                
-                if all_ohlcv:
-                    break
-                
-            except (ccxt.DDoSProtection, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
-                print(f"Exchange error (attempt {attempt+1}/{max_attempts}): {e}")
-                if attempt < max_attempts - 1:
-                    time.sleep(5)
-                    continue
-                else:
-                    print("Max attempts reached. Using sample data.")
-                    return generate_sample_data()
-            except Exception as e:
-                print(f"Unexpected error (attempt {attempt+1}/{max_attempts}): {e}")
-                if attempt < max_attempts - 1:
-                    time.sleep(5)
-                    continue
-                else:
-                    print("Max attempts reached. Using sample data.")
-                    return generate_sample_data()
-        
-        if not all_ohlcv:
-            print("No OHLCV data fetched. Using sample data.")
-            return generate_sample_data()
-        
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        df.sort_index(inplace=True)
-        
-        print(f"Successfully fetched {len(df)} daily candles for {symbol}.")
-        return df
-        
-    except Exception as e:
-        print(f"Critical error in fetch_ohlcv: {e}")
-        print("Falling back to sample data...")
-        return generate_sample_data()
+# 2. PREPARE DATA
+# ---------------
+df = fetch_binance_history(symbol, start_date_str)
 
-# Calculate inefficiency index
-def calculate_inefficiency_index(df, window_days):
-    if df is None or len(df) < window_days:
-        return pd.Series([], dtype=float), pd.Series([], dtype=float)
-    
-    # Calculate log returns
-    log_returns = np.log(df['close'] / df['close'].shift(1))
-    
-    # Calculate rolling sums using numpy functions
-    rolling_sum_abs_log_returns = log_returns.rolling(window=window_days).apply(
-        lambda x: np.nansum(np.abs(x)) if not np.all(np.isnan(x)) else np.nan, raw=True
-    )
-    rolling_sum_log_returns = log_returns.rolling(window=window_days).sum()
-    
-    # Calculate inefficiency index
-    inefficiency_index = rolling_sum_abs_log_returns / np.abs(rolling_sum_log_returns)
-    
-    # Handle edge cases
-    inefficiency_index = inefficiency_index.replace([np.inf, -np.inf], np.nan)
-    
-    # Handle near-zero denominators
-    denominator_mask = np.abs(rolling_sum_log_returns) < 1e-9
-    inefficiency_index[denominator_mask] = np.nan
-    
-    # Compute inverse inefficiency index (1/x)
-    inverse_inefficiency_index = 1 / inefficiency_index
-    
-    # Handle division by zero or near-zero values in the original index
-    inverse_inefficiency_index = inverse_inefficiency_index.replace([np.inf, -np.inf], np.nan)
-    
-    # Clean the data for plotting
-    # Remove NaN values and cap extreme values for better visualization
-    inverse_inefficiency_index_clean = inverse_inefficiency_index.dropna()
-    
-    # Cap extreme values at 100 for visualization
-    if not inverse_inefficiency_index_clean.empty:
-        inverse_inefficiency_index_clean = inverse_inefficiency_index_clean.clip(upper=100)
-    
-    # Compute 14-day SMA for smoothing the inverse inefficiency index
-    sma_window = 14
-    inverse_inefficiency_index_smoothed = inverse_inefficiency_index_clean.rolling(window=sma_window, min_periods=1).mean()
-    
-    return inverse_inefficiency_index_clean, inverse_inefficiency_index_smoothed
+# --- A. CALCULATE INVERTED INEFFICIENCY INDEX (III) ---
+# Formula: Abs(Net Change) / Sum(Abs(Changes))
+# Range: 0 to 1
 
-# Calculate Sharpe Ratio
-def calculate_sharpe_ratio(daily_returns, annualization_factor=252):
-    if daily_returns.empty or daily_returns.std() == 0 or daily_returns.isnull().all():
-        return 0.0  # Return 0.0 for no variance or no data
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 
-    mean_daily_return = daily_returns.mean()
-    std_daily_return = daily_returns.std()
-    
-    # Assuming risk-free rate is 0 for simplicity and comparative analysis
-    sharpe = (mean_daily_return / std_daily_return) * np.sqrt(annualization_factor)
-    return sharpe
+# Numerator: Absolute Net Direction over window
+# We use rolling sum of log returns = log(Close_t / Close_t-n)
+df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
 
-# Web server routes
-def get_processed_data(df_ohlcv, rolling_window_days):
-    # Use the pre-fetched DataFrame instead of fetching again
-    df = df_ohlcv.copy()
-    
-    if df is None or df.empty:
-        print("DataFrame is None or empty. Using sample data.")
-        df = generate_sample_data()
+# Denominator: Sum of absolute individual moves (Path Length)
+df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
 
-    # Calculate simple returns for the entire DataFrame
-    df['returns'] = df['close'].pct_change()
-    
-    # Calculate 120-day SMA of close price for conditional logic
-    df['close_sma_120'] = df['close'].rolling(window=120, min_periods=1).mean()
-    
-    inefficiency_series, inefficiency_smoothed = calculate_inefficiency_index(df, rolling_window_days)    
-    
-    # Calculate the new metric: yesterday's smoothed inefficiency * today's log return
-    # Create a temporary DataFrame to align series by index
-    temp_df = pd.DataFrame(index=df.index)
-    temp_df['returns'] = df['returns']
-    temp_df['iii_sma'] = inefficiency_smoothed # This aligns by index, filling with NaNs where no match
+# The Index
+epsilon = 1e-8
+df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
 
-    temp_df['iii_sma_yesterday'] = temp_df['iii_sma'].shift(1)
-    
-    # Add yesterday's close price and its 120-day SMA to temp_df for alignment
-    temp_df['close_yesterday'] = df['close'].shift(1)
-    temp_df['close_sma_120_yesterday'] = df['close_sma_120'].shift(1)
-    
-    # Determine the multiplier for returns based on the condition:
-    # If yesterday's close price is above yesterday's 120-day SMA, use original return (multiplier = 1)
-    # Else (price below or equal to SMA), use negative return (multiplier = -1)
-    return_multiplier = np.where(
-        temp_df['close_yesterday'] > temp_df['close_sma_120_yesterday'],
-        1,
-        -1
-    )
-    
-    # Apply the multiplier to today's simple return
-    modified_returns = temp_df['returns'] * return_multiplier
-    
-    # Calculate the daily factor for compounding using the modified returns
-    daily_strategy_returns_series = modified_returns * temp_df['iii_sma_yesterday']
-    daily_compounding_factor = 1 + daily_strategy_returns_series
-    
-    # Compute the cumulative product for compounding
-    cumulative_compounded_series = daily_compounding_factor.cumprod()
-    
-    iii_sma_x_returns = cumulative_compounded_series.dropna()
-    
-    # Also return the daily returns for Sharpe ratio calculation
-    # Drop NaNs from daily_strategy_returns_series before returning for cleaner Sharpe calculation
-    daily_strategy_returns_series_clean = daily_strategy_returns_series.dropna()
-    
-    return df, inefficiency_series, inefficiency_smoothed, iii_sma_x_returns, daily_strategy_returns_series_clean, temp_df
+# --- B. BASE STRATEGY BACKTEST ---
+df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
+df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
 
+df['strategy_equity'] = 1.0
+df['buy_hold_equity'] = 1.0
+df['daily_ret'] = 0.0
 
+equity = 1.0
+hold_equity = 1.0
+start_idx = max(SMA_SLOW, III_WINDOW)
+
+for i in range(start_idx, len(df)):
+    today = df.index[i]
+    
+    # Yesterday's Signals
+    prev_close = df['close'].iloc[i-1]
+    prev_fast = df['sma_fast'].iloc[i-1]
+    prev_slow = df['sma_slow'].iloc[i-1]
+    
+    # Today's Execution
+    open_p = df['open'].iloc[i]
+    high_p = df['high'].iloc[i]
+    low_p = df['low'].iloc[i]
+    close_p = df['close'].iloc[i]
+    
+    daily_ret = 0.0
+    
+    # Long
+    if prev_close > prev_fast and prev_close > prev_slow:
+        entry = open_p
+        sl = entry * (1 - SL_PCT)
+        tp = entry * (1 + TP_PCT)
+        if low_p <= sl: daily_ret = -SL_PCT
+        elif high_p >= tp: daily_ret = TP_PCT
+        else: daily_ret = (close_p - entry) / entry
+        
+    # Short
+    elif prev_close < prev_fast and prev_close < prev_slow:
+        entry = open_p
+        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 - TP_PCT)
+        if high_p >= sl: daily_ret = -SL_PCT
+        elif low_p <= tp: daily_ret = TP_PCT
+        else: daily_ret = (entry - close_p) / entry
+        
+    equity *= (1 + daily_ret)
+    
+    # Buy & Hold
+    bh_ret = (close_p - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
+    hold_equity *= (1 + bh_ret)
+    
+    df.at[today, 'strategy_equity'] = equity
+    df.at[today, 'buy_hold_equity'] = hold_equity
+    df.at[today, 'daily_ret'] = daily_ret
+
+# 3. VISUALIZATION
+# ----------------
+plt.figure(figsize=(14, 14))
+
+# Filter data
+plot_data = df.iloc[start_idx:].copy()
+
+# Plot 1: Strategy Performance
+ax1 = plt.subplot(3, 1, 1)
+ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy Equity', color='blue', linewidth=2)
+ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+ax1.set_yscale('log')
+ax1.set_title('Strategy vs Buy & Hold (No Circuit Breakers)')
+ax1.legend()
+ax1.grid(True, which='both', linestyle='--', alpha=0.3)
+
+# Plot 2: The Inverted Inefficiency Index (III)
+ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+# Color code the line:
+# High values (Efficiency) = Green
+# Low values (Chop) = Red
+points = np.array([plot_data.index.astype(np.int64) // 10**9, plot_data['iii']]).T.reshape(-1, 1, 2)
+segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+# Create a continuous norm to map from 0 to 1
+norm = plt.Normalize(0, 1)
+lc = matplotlib.collections.LineCollection(segments, cmap='RdYlGn', norm=norm)
+lc.set_array(plot_data['iii'])
+lc.set_linewidth(1.5)
+ax2.add_collection(lc)
+ax2.autoscale_view()
+
+# Add Threshold lines
+ax2.axhline(0.6, color='green', linestyle='--', alpha=0.5, label='High Efficiency (Trend)')
+ax2.axhline(0.2, color='red', linestyle='--', alpha=0.5, label='Low Efficiency (Chop)')
+ax2.set_ylabel('Efficiency (0=Chop, 1=Trend)')
+ax2.set_title('Inverted Inefficiency Index (III)')
+ax2.legend(loc='upper left')
+ax2.grid(True, alpha=0.3)
+
+# Plot 3: Scatter Analysis (Does III predict Volatility/Big Moves?)
+# We plot III (x-axis) vs Absolute Next Day Return (y-axis)
+ax3 = plt.subplot(3, 1, 3)
+# Shift returns back by 1 to align "Today's III" with "Tomorrow's Move"
+x_scatter = plot_data['iii'][:-1]
+y_scatter = plot_data['daily_ret'].abs().shift(-1).dropna()
+# Ensure alignment
+common_idx = x_scatter.index.intersection(y_scatter.index)
+x_scatter = x_scatter.loc[common_idx]
+y_scatter = y_scatter.loc[common_idx]
+
+# Color points by positive (profit) vs negative (loss) return
+raw_ret = plot_data['daily_ret'].shift(-1).loc[common_idx]
+colors = ['green' if r > 0 else 'red' for r in raw_ret]
+
+ax3.scatter(x_scatter, y_scatter, c=colors, alpha=0.4, s=10)
+ax3.set_xlabel('III Value (Today)')
+ax3.set_ylabel('Absolute Return (Tomorrow)')
+ax3.set_title('Correlation: Does High Efficiency Predict Big Moves Tomorrow?')
+# Add trendline
+z = np.polyfit(x_scatter, y_scatter, 1)
+p = np.poly1d(z)
+ax3.plot(x_scatter, p(x_scatter), "k--", alpha=0.5, label=f'Trend Line')
+ax3.legend()
+ax3.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+import matplotlib.collections # Re-import locally for safety
+
+# Save
+plot_dir = '/app/static'
+if not os.path.exists(plot_dir): os.makedirs(plot_dir)
+plot_path = os.path.join(plot_dir, 'plot.png')
+plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+
+# Flask
+app = Flask(__name__)
 @app.route('/')
-def index():
-    # Fetch OHLCV data once for the index page
-    print("Fetching OHLCV data for index page...")
-    df_ohlcv = fetch_ohlcv(SYMBOL, START_DATE_STR)
-    
-    # Pass the pre-fetched DataFrame and rolling_window_days to get_processed_data
-    df, inefficiency_series, inefficiency_smoothed, iii_sma_x_returns, _, temp_df = get_processed_data(df_ohlcv, ROLLING_WINDOW_DAYS)
-
-    # Debug: Print some statistics about the inefficiency index
-    print(f"Data length: {len(df)}")
-    print(f"Inefficiency series length: {len(inefficiency_series)}")
-    if not inefficiency_series.empty:
-        print(f"Inefficiency index stats - min: {inefficiency_series.min():.2f}, max: {inefficiency_series.max():.2f}, mean: {inefficiency_series.mean():.2f}")
-        print(f"First 5 values: {inefficiency_series.head().tolist()}")
-        print(f"Last 5 values: {inefficiency_series.tail().tolist()}")
-    if not inefficiency_smoothed.empty:
-        print(f"Smoothed inefficiency index stats - min: {inefficiency_smoothed.min():.2f}, max: {inefficiency_smoothed.max():.2f}, mean: {inefficiency_smoothed.mean():.2f}")
-    
-    # Create combined price and inverse inefficiency index chart with second y-axis
-    plt.figure(figsize=(12, 6))
-    
-    # Plot price on primary y-axis (left)
-    ax1 = plt.gca()
-    ax1.plot(df.index, df['close'], color='blue', linewidth=1.5, label='Price')
-    ax1.set_xlabel('Date', fontsize=12)
-    ax1.set_ylabel('Price (USDT)', fontsize=12, color='blue')
-    ax1.tick_params(axis='y', labelcolor='blue')
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot smoothed inverse inefficiency index (14-day SMA) on secondary y-axis (right) if data exists
-    if not inefficiency_smoothed.empty:
-        ax2 = ax1.twinx()
-        ax2.plot(inefficiency_smoothed.index, inefficiency_smoothed.values, color='darkred', linewidth=2, label='Inverse Inefficiency Index (14-day SMA)')
-        ax2.set_ylabel('Inverse Inefficiency Index (1/x)', fontsize=12, color='darkred')
-        ax2.tick_params(axis='y', labelcolor='darkred')
-        # Set y-axis range for inverse inefficiency index if needed
-        if inefficiency_smoothed.max() > 10:
-            ax2.set_ylim(0, min(100, inefficiency_smoothed.max() * 1.1))
-        # Add legend for both axes
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-    else:
-        # Add legend for price only if no inefficiency data
-        ax1.legend(loc='upper left')
-    
-    plt.title(f'{SYMBOL} Price with Inverse Inefficiency Index ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA Only)', fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    
-    # Save plot to base64 string
-    img_combined = io.BytesIO()
-    plt.savefig(img_combined, format='png', dpi=100)
-    plt.close()
-    img_combined.seek(0)
-    combined_chart_url = base64.b64encode(img_combined.getvalue()).decode('utf8')
-
-    # Create the second plot for III SMA * Log Returns
-    iii_x_returns_chart_url = None # Initialize to None
-    if not iii_sma_x_returns.empty:
-        fig, ax = plt.subplots(figsize=(12, 6))
-
-        # Helper function to plot colored background spans
-        def plot_spans(axis, condition_series, color_true, color_false, alpha=0.2):
-            if condition_series.empty:
-                return
-
-            current_segment_start = None
-            current_state = None
-
-            for i, (date, value) in enumerate(condition_series.items()):
-                if current_segment_start is None:
-                    # Initialize first segment
-                    current_segment_start = date
-                    current_state = value
-                elif value != current_state:
-                    # State changed, plot the previous segment
-                    end_date = condition_series.index[i-1]
-                    facecolor = color_true if current_state else color_false
-                    axis.axvspan(current_segment_start, end_date, facecolor=facecolor, alpha=alpha, zorder=0) # zorder to place behind line
-                    
-                    # Start new segment
-                    current_segment_start = date
-                    current_state = value
-            
-            # Plot the last segment
-            if current_segment_start is not None:
-                end_date = condition_series.index[-1]
-                facecolor = color_true if current_state else color_false
-                axis.axvspan(current_segment_start, end_date, facecolor=facecolor, alpha=alpha, zorder=0)
-
-        # Align the condition with the plot's index
-        plot_index = iii_sma_x_returns.index
-        above_sma_condition = temp_df['close_yesterday'] > temp_df['close_sma_120_yesterday']
-        above_sma_condition = above_sma_condition.reindex(plot_index).fillna(False) # Fill NaNs (e.g., at beginning) as False
-
-        # Plot background spans
-        plot_spans(ax, above_sma_condition, 'lightgreen', 'lightcoral')
-
-        ax.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5, zorder=1) # Ensure line is on top
-        ax.set_title(f'{SYMBOL} Conditional Cumulative Compounded Returns with III SMA ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
-        ax.set_xlabel('Date', fontsize=12)
-        ax.set_ylabel('Cumulative Compounded Value', fontsize=12)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-
-        img_iii_x_returns = io.BytesIO()
-        fig.savefig(img_iii_x_returns, format='png', dpi=100)
-        plt.close(fig)
-        img_iii_x_returns.seek(0)
-        iii_x_returns_chart_url = base64.b64encode(img_iii_x_returns.getvalue()).decode('utf8')
-    
-    return render_template('index.html',
-                           combined_chart_url=combined_chart_url,
-                           iii_x_returns_chart_url=iii_x_returns_chart_url,
-                           symbol=SYMBOL,
-                           window=ROLLING_WINDOW_DAYS)
-
-@app.route('/grid_search')
-def grid_search():
-    optimal_periods = {}
-    iii_periods = range(2, 121)  # From 2 to 120
-    
-    # Fetch OHLCV data once outside the loop
-    print(f"Fetching OHLCV data for grid search...")
-    base_df = fetch_ohlcv(SYMBOL, START_DATE_STR)
-    
-    if base_df is None or base_df.empty:
-        return "<p>Failed to fetch base data for grid search.</p>", 500
-
-    for period in iii_periods:
-        print(f"Performing grid search for iii_period: {period}")
-        # Pass the pre-fetched base_df to get_processed_data
-        _, _, _, _, daily_strategy_returns, _ = get_processed_data(base_df, period)
-        
-        if not daily_strategy_returns.empty:
-            sharpe_ratio = calculate_sharpe_ratio(daily_strategy_returns)
-            optimal_periods[period] = sharpe_ratio
-        else:
-            optimal_periods[period] = np.nan
-            
-    # Filter out NaN values for plotting
-    valid_periods = {k: v for k, v in optimal_periods.items() if not np.isnan(v)}
-    
-    if not valid_periods:
-        return "<p>No valid data for grid search plot.</p>", 500
-
-    periods = list(valid_periods.keys())
-    sharpe_ratios = list(valid_periods.values())
-
-    # Create the grid search plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar(periods, sharpe_ratios, color='skyblue')
-    ax.set_title('Grid Search for Optimal III Period: Sharpe Ratio', fontsize=16, fontweight='bold')
-    ax.set_xlabel('III Period (Days)', fontsize=12)
-    ax.set_ylabel('Annualized Sharpe Ratio', fontsize=12)
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Highlight the best period
-    if sharpe_ratios:
-        best_period_idx = np.argmax(sharpe_ratios)
-        best_period = periods[best_period_idx]
-        best_sharpe = sharpe_ratios[best_period_idx]
-        ax.bar(best_period, best_sharpe, color='orange', label=f'Best Period: {best_period} (Sharpe: {best_sharpe:.2f})')
-        ax.legend()
-        print(f"Best III Period found: {best_period} with Sharpe Ratio: {best_sharpe:.2f}")
-
-    img_grid_search = io.BytesIO()
-    fig.savefig(img_grid_search, format='png', dpi=100)
-    plt.close(fig)
-    img_grid_search.seek(0)
-    grid_search_chart_url = base64.b64encode(img_grid_search.getvalue()).decode('utf8')
-
-    # After generating the grid search plot, find the best period and generate its equity plot
-    optimal_periods = {}
-    iii_periods = range(2, 121)  # From 2 to 120
-
-    # Re-fetch base_df if it was not stored or passed from the initial fetch in grid_search
-    # For simplicity, we'll re-fetch here, but a more optimized approach would pass it.
-    print(f"Fetching OHLCV data for best period equity plot...")
-    base_df = fetch_ohlcv(SYMBOL, START_DATE_STR)
-    if base_df is None or base_df.empty:
-        return render_template('grid_search.html', 
-                               grid_search_chart_url=grid_search_chart_url,
-                               symbol=SYMBOL,
-                               error_message="Failed to fetch data for equity plot after grid search.")
-
-    for period in iii_periods:
-        _, _, _, _, daily_strategy_returns, _ = get_processed_data(base_df, period)
-        if not daily_strategy_returns.empty:
-            sharpe_ratio = calculate_sharpe_ratio(daily_strategy_returns)
-            optimal_periods[period] = sharpe_ratio
-        else:
-            optimal_periods[period] = np.nan
-
-    valid_periods = {k: v for k, v in optimal_periods.items() if not np.isnan(v)}
-    if not valid_periods:
-        return render_template('grid_search.html', 
-                               grid_search_chart_url=grid_search_chart_url,
-                               symbol=SYMBOL,
-                               error_message="No valid data found to determine best period for equity plot.")
-
-    best_period = max(valid_periods, key=valid_periods.get)
-    best_sharpe = valid_periods[best_period]
-    print(f"Best III Period identified for equity plot: {best_period} with Sharpe Ratio: {best_sharpe:.2f}")
-
-    # Generate the equity plot for the best period
-    print(f"Generating equity plot for the best III period: {best_period}...")
-    _, _, _, iii_sma_x_returns, _, temp_df = get_processed_data(base_df, best_period)
-
-    equity_plot_url = None
-    if not iii_sma_x_returns.empty:
-        fig, ax = plt.subplots(figsize=(12, 6))
-
-        def plot_spans(axis, condition_series, color_true, color_false, alpha=0.2):
-            if condition_series.empty:
-                return
-            current_segment_start = None
-            current_state = None
-            aligned_condition = temp_df['close_yesterday'] > temp_df['close_sma_120_yesterday']
-            aligned_condition = aligned_condition.reindex(iii_sma_x_returns.index).fillna(False)
-
-            for i, (date, value) in enumerate(iii_sma_x_returns.index):
-                current_condition = aligned_condition.get(date, False)
-                if current_segment_start is None:
-                    current_segment_start = date
-                    current_state = current_condition
-                elif current_condition != current_state:
-                    end_date = iii_sma_x_returns.index[i-1]
-                    facecolor = color_true if current_state else color_false
-                    axis.axvspan(current_segment_start, end_date, facecolor=facecolor, alpha=alpha, zorder=0)
-                    current_segment_start = date
-                    current_state = current_condition
-            if current_segment_start is not None:
-                end_date = iii_sma_x_returns.index[-1]
-                facecolor = color_true if current_state else color_false
-                axis.axvspan(current_segment_start, end_date, facecolor=facecolor, alpha=alpha, zorder=0)
-
-        plot_condition = temp_df['close_yesterday'] > temp_df['close_sma_120_yesterday']
-        plot_condition = plot_condition.reindex(iii_sma_x_returns.index).fillna(False)
-
-        plot_spans(ax, plot_condition, 'lightgreen', 'lightcoral')
-        ax.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5, zorder=1)
-        ax.set_title(f'{SYMBOL} Equity Curve for Best III Period ({best_period} Days)', fontsize=16, fontweight='bold')
-        ax.set_xlabel('Date', fontsize=12)
-        ax.set_ylabel('Cumulative Compounded Value', fontsize=12)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-
-        img_equity_plot = io.BytesIO()
-        fig.savefig(img_equity_plot, format='png', dpi=100)
-        plt.close(fig)
-        img_equity_plot.seek(0)
-        equity_plot_url = base64.b64encode(img_equity_plot.getvalue()).decode('utf8')
-
-    # Render a combined template showing grid search results and the equity plot
-    return render_template('grid_search_with_equity.html', 
-                           grid_search_chart_url=grid_search_chart_url,
-                           symbol=SYMBOL,
-                           equity_plot_url=equity_plot_url,
-                           best_period=best_period,
-                           best_sharpe=best_sharpe)
-
+def serve_plot(): return send_file(plot_path, mimetype='image/png')
+@app.route('/health')
+def health(): return 'OK', 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=PORT)
+    print(f"Final Strategy Equity: {equity:.2f}x")
+    print("\nStarting Web Server...")
+    app.run(host='0.0.0.0', port=8080, debug=False)
