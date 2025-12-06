@@ -176,9 +176,11 @@ def index():
         print(f"Last 5 values: {inefficiency_series.tail().tolist()}")
     
     # Create price chart
-    fig_price = px.line(df, x=df.index, y='close', 
+    # Convert datetime index to string for proper JSON serialization
+    date_strings = df.index.strftime('%Y-%m-%d').tolist()
+    fig_price = px.line(x=date_strings, y=df['close'], 
                         title=f'{SYMBOL} Price (Daily Close)',
-                        labels={'close': 'Price (USDT)', 'timestamp': 'Date'})
+                        labels={'y': 'Price (USDT)', 'x': 'Date'})
     fig_price.update_layout(
         hovermode="x unified", 
         template="plotly_dark",
@@ -204,7 +206,9 @@ def index():
             )]
         )
     else:
-        fig_inefficiency = px.line(x=inefficiency_series.index, y=inefficiency_series,
+        # Convert datetime index to string for proper JSON serialization
+        inefficiency_dates = inefficiency_series.index.strftime('%Y-%m-%d').tolist()
+        fig_inefficiency = px.line(x=inefficiency_dates, y=inefficiency_series,
                                    title=f'{SYMBOL} Inefficiency Index ({ROLLING_WINDOW_DAYS}-day Rolling)',
                                    labels={'y': 'Inefficiency Index', 'x': 'Date'})
         fig_inefficiency.update_layout(
