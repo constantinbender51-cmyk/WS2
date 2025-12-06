@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ symbol }} Price and Inefficiency Index</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -73,24 +72,16 @@
             
             <div class="chart-container">
                 <h2 class="chart-title">Price Chart</h2>
-                <div id="price-chart"></div>
+                <img src="data:image/png;base64,{{ price_chart_url }}" alt="Price Chart" style="width:100%; max-width:1200px;">
             </div>
             
             <div class="chart-container">
                 <h2 class="chart-title">Inefficiency Index ({{ window }}-day Rolling)</h2>
-                <div id="inefficiency-chart"></div>
+                <img src="data:image/png;base64,{{ inefficiency_chart_url }}" alt="Inefficiency Index Chart" style="width:100%; max-width:1200px;">
             </div>
         {% endif %}
     </div>
     
-    <script>
-        {% if not error_message %}
-            var priceGraph = {{ graphJSON_price|safe }};
-            var inefficiencyGraph = {{ graphJSON_inefficiency|safe }};
-            
-            Plotly.newPlot('price-chart', priceGraph.data, priceGraph.layout);
-            Plotly.newPlot('inefficiency-chart', inefficiencyGraph.data, inefficiencyGraph.layout);
-        {% endif %}
-    </script>
+
 </body>
 </html>
