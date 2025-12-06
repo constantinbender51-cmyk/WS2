@@ -165,8 +165,59 @@ def calculate_inefficiency_index(df, window_days):
 
 # Web server routes
 @app.route('/')
-def index():
+def get_processed_data(rolling_window_days):
     df = fetch_ohlcv(SYMBOL, START_DATE_STR)
+    
+    if df is None or df.empty:
+        print("DataFrame is None or empty. Using sample data.")
+        df = generate_sample_data()
+
+    # Calculate simple returns for the entire DataFrame
+    df['returns'] = df['close'].pct_change()
+    
+    # Calculate 120-day SMA of close price for conditional logic
+    df['close_sma_120'] = df['close'].rolling(window=120, min_periods=1).mean()
+    
+    inefficiency_series, inefficiency_smoothed = calculate_inefficiency_index(df, rolling_window_days)    
+    
+    # Calculate the new metric: yesterday's smoothed inefficiency * today's log return
+    # Create a temporary DataFrame to align series by index
+    temp_df = pd.DataFrame(index=df.index)
+    temp_df['returns'] = df['returns']
+    temp_df['iii_sma'] = inefficiency_smoothed # This aligns by index, filling with NaNs where no match
+
+    temp_df['iii_sma_yesterday'] = temp_df['iii_sma'].shift(1)
+    
+    # Add yesterday's close price and its 120-day SMA to temp_df for alignment
+    temp_df['close_yesterday'] = df['close'].shift(1)
+    temp_df['close_sma_120_yesterday'] = df['close_sma_120'].shift(1)
+    
+    # Determine the multiplier for returns based on the condition:
+    # If yesterday's close price is above yesterday's 120-day SMA, use original return (multiplier = 1)
+    # Else (price below or equal to SMA), use negative return (multiplier = -1)
+    return_multiplier = np.where(
+        temp_df['close_yesterday'] > temp_df['close_sma_120_yesterday'],
+        1,
+        -1
+    )
+    
+    # Apply the multiplier to today's simple return
+    modified_returns = temp_df['returns'] * return_multiplier
+    
+    # Calculate the daily factor for compounding using the modified returns
+    daily_compounding_factor = 1 + (modified_returns * temp_df['iii_sma_yesterday'])
+    
+    # Compute the cumulative product for compounding
+    cumulative_compounded_series = daily_compounding_factor.cumprod()
+    
+    iii_sma_x_returns = cumulative_compounded_series.dropna()
+    
+    return df, inefficiency_series, inefficiency_smoothed, iii_sma_x_returns, temp_df
+
+
+@app.route('/')
+def index():
+    df, inefficiency_series, inefficiency_smoothed, iii_sma_x_returns, temp_df = get_processed_data(ROLLING_WINDOW_DAYS)
     
     if df is None or df.empty:
         print("DataFrame is None or empty. Using sample data.")
@@ -326,6 +377,57 @@ def index():
                            iii_x_returns_chart_url=iii_x_returns_chart_url,
                            symbol=SYMBOL,
                            window=ROLLING_WINDOW_DAYS)
+
+@app.route('/grid_search')
+def grid_search():
+    optimal_periods = {}
+    iii_periods = range(2, 121)  # From 2 to 120
+    
+    for period in iii_periods:
+        print(f"Performing grid search for iii_period: {period}")
+        df, _, _, iii_sma_x_returns, _ = get_processed_data(period)
+        
+        if not iii_sma_x_returns.empty:
+            final_equity = iii_sma_x_returns.iloc[-1]
+            optimal_periods[period] = final_equity
+        else:
+            optimal_periods[period] = np.nan
+            
+    # Filter out NaN values for plotting
+    valid_periods = {k: v for k, v in optimal_periods.items() if not np.isnan(v)}
+    
+    if not valid_periods:
+        return "<p>No valid data for grid search plot.</p>", 500
+
+    periods = list(valid_periods.keys())
+    final_equities = list(valid_periods.values())
+
+    # Create the grid search plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(periods, final_equities, color='skyblue')
+    ax.set_title('Grid Search for Optimal III Period: Final Equity', fontsize=16, fontweight='bold')
+    ax.set_xlabel('III Period (Days)', fontsize=12)
+    ax.set_ylabel('Final Cumulative Compounded Value', fontsize=12)
+    ax.grid(axis='y', alpha=0.3)
+    
+    # Highlight the best period
+    if final_equities:
+        best_period_idx = np.argmax(final_equities)
+        best_period = periods[best_period_idx]
+        best_equity = final_equities[best_period_idx]
+        ax.bar(best_period, best_equity, color='orange', label=f'Best Period: {best_period} (Equity: {best_equity:.2f})')
+        ax.legend()
+        print(f"Best III Period found: {best_period} with final equity: {best_equity:.2f}")
+
+    img_grid_search = io.BytesIO()
+    fig.savefig(img_grid_search, format='png', dpi=100)
+    plt.close(fig)
+    img_grid_search.seek(0)
+    grid_search_chart_url = base64.b64encode(img_grid_search.getvalue()).decode('utf8')
+
+    return render_template('grid_search.html', 
+                           grid_search_chart_url=grid_search_chart_url,
+                           symbol=SYMBOL)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=PORT)
