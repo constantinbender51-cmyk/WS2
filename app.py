@@ -172,8 +172,8 @@ def index():
         print("DataFrame is None or empty. Using sample data.")
         df = generate_sample_data()
 
-    # Calculate log returns for the entire DataFrame
-    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+    # Calculate simple returns for the entire DataFrame
+    df['returns'] = df['close'].pct_change()
     
     # Debug: Print data info
     print(f"DataFrame info:")
@@ -186,11 +186,11 @@ def index():
     # Calculate the new metric: yesterday's smoothed inefficiency * today's log return
     # Create a temporary DataFrame to align series by index
     temp_df = pd.DataFrame(index=df.index)
-    temp_df['log_returns'] = df['log_returns']
+    temp_df['returns'] = df['returns']
     temp_df['iii_sma'] = inefficiency_smoothed # This aligns by index, filling with NaNs where no match
 
     temp_df['iii_sma_yesterday'] = temp_df['iii_sma'].shift(1)
-    temp_df['iii_sma_x_returns'] = temp_df['iii_sma_yesterday'] * temp_df['log_returns']
+    temp_df['iii_sma_x_returns'] = temp_df['iii_sma_yesterday'] * temp_df['returns']
     
     iii_sma_x_returns = temp_df['iii_sma_x_returns'].dropna()
 
@@ -247,9 +247,9 @@ def index():
     if not iii_sma_x_returns.empty:
         plt.figure(figsize=(12, 6))
         plt.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5)
-        plt.title(f'{SYMBOL} Yesterday\'s III SMA * Today\'s Log Return ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
+        plt.title(f'{SYMBOL} Yesterday\'s III SMA * Today\'s Return ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
         plt.xlabel('Date', fontsize=12)
-        plt.ylabel('Yesterday\'s III SMA * Today\'s Log Return', fontsize=12)
+        plt.ylabel('Yesterday\'s III SMA * Today\'s Return', fontsize=12)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
 
