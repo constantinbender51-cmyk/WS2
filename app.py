@@ -164,8 +164,9 @@ def calculate_inefficiency_index(df, window_days):
     return inverse_inefficiency_index_clean, inverse_inefficiency_index_smoothed
 
 # Web server routes
-def get_processed_data(rolling_window_days):
-    df = fetch_ohlcv(SYMBOL, START_DATE_STR)
+def get_processed_data(df_ohlcv, rolling_window_days):
+    # Use the pre-fetched DataFrame instead of fetching again
+    df = df_ohlcv.copy()
     
     if df is None or df.empty:
         print("DataFrame is None or empty. Using sample data.")
@@ -382,9 +383,17 @@ def grid_search():
     optimal_periods = {}
     iii_periods = range(2, 121)  # From 2 to 120
     
+    # Fetch OHLCV data once outside the loop
+    print(f"Fetching OHLCV data for grid search...")
+    base_df = fetch_ohlcv(SYMBOL, START_DATE_STR)
+    
+    if base_df is None or base_df.empty:
+        return "<p>Failed to fetch base data for grid search.</p>", 500
+
     for period in iii_periods:
         print(f"Performing grid search for iii_period: {period}")
-        df, _, _, iii_sma_x_returns, _ = get_processed_data(period)
+        # Pass the pre-fetched base_df to get_processed_data
+        _, _, _, iii_sma_x_returns, _ = get_processed_data(base_df, period)
         
         if not iii_sma_x_returns.empty:
             final_equity = iii_sma_x_returns.iloc[-1]
