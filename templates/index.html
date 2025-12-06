@@ -75,6 +75,14 @@
                 <img src="data:image/png;base64,{{ combined_chart_url }}" alt="Combined Chart" style="width:100%; max-width:1200px;">
                 <p><em>Note: Price is shown on the left y-axis (blue), and smoothed inverse inefficiency index (14-day SMA) on the right y-axis (darkred).</em></p>
             </div>
+            
+            {% if iii_x_returns_chart_url %}
+            <div class="chart-container">
+                <h2 class="chart-title">Yesterday's Inverse Inefficiency Index SMA * Today's Log Return</h2>
+                <img src="data:image/png;base64,{{ iii_x_returns_chart_url }}" alt="III SMA x Returns Chart" style="width:100%; max-width:1200px;">
+                <p><em>Note: This chart displays the product of the previous day's 14-day SMA of the inverse inefficiency index and today's log return.</em></p>
+            </div>
+            {% endif %}
         {% endif %}
     </div>
     
