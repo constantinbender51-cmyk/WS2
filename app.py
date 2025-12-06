@@ -178,7 +178,15 @@ def index():
     # Create price chart
     # Convert datetime index to string for proper JSON serialization
     date_strings = df.index.strftime('%Y-%m-%d').tolist()
-    fig_price = px.line(x=date_strings, y=df['close'], 
+    close_prices = df['close'].tolist()  # Convert Series to list for proper JSON serialization
+    
+    # Debug: Check data being passed to chart
+    print(f"Price chart data - Dates count: {len(date_strings)}, Prices count: {len(close_prices)}")
+    if len(date_strings) > 0 and len(close_prices) > 0:
+        print(f"  First date: {date_strings[0]}, First price: {close_prices[0]:.2f}")
+        print(f"  Last date: {date_strings[-1]}, Last price: {close_prices[-1]:.2f}")
+    
+    fig_price = px.line(x=date_strings, y=close_prices, 
                         title=f'{SYMBOL} Price (Daily Close)',
                         labels={'y': 'Price (USDT)', 'x': 'Date'})
     fig_price.update_layout(
@@ -208,7 +216,15 @@ def index():
     else:
         # Convert datetime index to string for proper JSON serialization
         inefficiency_dates = inefficiency_series.index.strftime('%Y-%m-%d').tolist()
-        fig_inefficiency = px.line(x=inefficiency_dates, y=inefficiency_series,
+        inefficiency_values = inefficiency_series.tolist()  # Convert Series to list for proper JSON serialization
+        
+        # Debug: Check inefficiency data being passed to chart
+        print(f"Inefficiency chart data - Dates count: {len(inefficiency_dates)}, Values count: {len(inefficiency_values)}")
+        if len(inefficiency_dates) > 0 and len(inefficiency_values) > 0:
+            print(f"  First date: {inefficiency_dates[0]}, First value: {inefficiency_values[0]:.2f}")
+            print(f"  Last date: {inefficiency_dates[-1]}, Last value: {inefficiency_values[-1]:.2f}")
+        
+        fig_inefficiency = px.line(x=inefficiency_dates, y=inefficiency_values,
                                    title=f'{SYMBOL} Inefficiency Index ({ROLLING_WINDOW_DAYS}-day Rolling)',
                                    labels={'y': 'Inefficiency Index', 'x': 'Date'})
         fig_inefficiency.update_layout(
