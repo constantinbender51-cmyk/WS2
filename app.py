@@ -269,17 +269,55 @@ def index():
     # Create the second plot for III SMA * Log Returns
     iii_x_returns_chart_url = None # Initialize to None
     if not iii_sma_x_returns.empty:
-        plt.figure(figsize=(12, 6))
-        plt.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5)
-        plt.title(f'{SYMBOL} Conditional Cumulative Compounded Returns with III SMA ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
-        plt.xlabel('Date', fontsize=12)
-        plt.ylabel('Cumulative Compounded Value', fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Helper function to plot colored background spans
+        def plot_spans(axis, condition_series, color_true, color_false, alpha=0.2):
+            if condition_series.empty:
+                return
+
+            current_segment_start = None
+            current_state = None
+
+            for i, (date, value) in enumerate(condition_series.items()):
+                if current_segment_start is None:
+                    # Initialize first segment
+                    current_segment_start = date
+                    current_state = value
+                elif value != current_state:
+                    # State changed, plot the previous segment
+                    end_date = condition_series.index[i-1]
+                    facecolor = color_true if current_state else color_false
+                    axis.axvspan(current_segment_start, end_date, facecolor=facecolor, alpha=alpha, zorder=0) # zorder to place behind line
+                    
+                    # Start new segment
+                    current_segment_start = date
+                    current_state = value
+            
+            # Plot the last segment
+            if current_segment_start is not None:
+                end_date = condition_series.index[-1]
+                facecolor = color_true if current_state else color_false
+                axis.axvspan(current_segment_start, end_date, facecolor=facecolor, alpha=alpha, zorder=0)
+
+        # Align the condition with the plot's index
+        plot_index = iii_sma_x_returns.index
+        above_sma_condition = temp_df['close_yesterday'] > temp_df['close_sma_120_yesterday']
+        above_sma_condition = above_sma_condition.reindex(plot_index).fillna(False) # Fill NaNs (e.g., at beginning) as False
+
+        # Plot background spans
+        plot_spans(ax, above_sma_condition, 'lightgreen', 'lightcoral')
+
+        ax.plot(iii_sma_x_returns.index, iii_sma_x_returns.values, color='purple', linewidth=1.5, zorder=1) # Ensure line is on top
+        ax.set_title(f'{SYMBOL} Conditional Cumulative Compounded Returns with III SMA ({ROLLING_WINDOW_DAYS}-day Rolling, 14-day SMA)', fontsize=16, fontweight='bold')
+        ax.set_xlabel('Date', fontsize=12)
+        ax.set_ylabel('Cumulative Compounded Value', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
 
         img_iii_x_returns = io.BytesIO()
-        plt.savefig(img_iii_x_returns, format='png', dpi=100)
-        plt.close()
+        fig.savefig(img_iii_x_returns, format='png', dpi=100)
+        plt.close(fig)
         img_iii_x_returns.seek(0)
         iii_x_returns_chart_url = base64.b64encode(img_iii_x_returns.getvalue()).decode('utf8')
     
