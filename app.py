@@ -105,7 +105,7 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
     Args:
         df: DataFrame with 'close' column
         window: SMA window period (default: 120)
-        noise_level: Standard deviation of Gaussian noise as fraction of SMA (default: 0.1 = 10%)
+        noise_level: Standard deviation of Gaussian noise (default: 0.1)
     
     Returns:
         DataFrame with added 'sma', 'noisy_sma', and 'noisy_sma_shifted' columns
@@ -119,8 +119,8 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
     # Only add noise where SMA is not NaN
     sma_values = df['sma'].dropna()
     if len(sma_values) > 0:
-        # Create static noise with fixed standard deviation
-        noise = np.random.normal(0, noise_level * 100, len(sma_values))
+        # Create static noise with fixed standard deviation (independent of SMA)
+        noise = np.random.normal(0, noise_level, len(sma_values))
         
         # Add noise to SMA
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
@@ -182,7 +182,7 @@ def index():
         
         # Compute SMA with noise
         print("Computing SMA with noise...")
-        df = compute_sma_with_noise(df, window=120, noise_level=720.0)
+        df = compute_sma_with_noise(df, window=120, noise_level=72.0)
         
         # Create plot
         print("Creating plot...")
