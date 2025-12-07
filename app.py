@@ -3,7 +3,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import requests
 import json
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.preprocessing import PolynomialFeatures
 from flask import Flask, render_template_string
 import matplotlib
@@ -99,6 +99,23 @@ def prepare_regression_data(log_returns, poly_degree=1):
     
     return X, y, poly
 
+# Function to prepare features and target for logistic regression
+# For logistic regression, we need a binary target (e.g., positive/negative returns)
+def prepare_logistic_data(log_returns, poly_degree=2):
+    """Prepare polynomial features from log returns for logistic regression."""
+    # Remove NaN values
+    log_returns_clean = log_returns.dropna().values.reshape(-1, 1)
+    
+    # Create polynomial features
+    poly = PolynomialFeatures(degree=poly_degree, include_bias=False)
+    X = poly.fit_transform(log_returns_clean)
+    
+    # Create binary target: 1 if next return is positive, 0 otherwise
+    y_binary = (log_returns_clean[1:] > 0).astype(int).ravel()
+    X = X[:-1]  # Remove last row since we don't have target for it
+    
+    return X, y_binary, poly
+
 # Function to project future data using linear regression
 def project_future_data(model, poly, last_log_return, periods=16*365):
     """Project future log returns using trained linear regression model."""
@@ -143,11 +160,11 @@ def index():
         log_returns = calculate_log_returns(df)
         
         # Prepare data for regression with degree 1 (straight line)
-        X, y, poly = prepare_regression_data(log_returns, poly_degree=1)
+        X_linear, y_linear, poly_linear = prepare_regression_data(log_returns, poly_degree=1)
         
         # Train linear regression model for degree 1
-        model = LinearRegression()
-        model.fit(X, y)
+        linear_model = LinearRegression()
+        linear_model.fit(X_linear, y_linear)
         
         # Get last log return for projection
         last_log_return = log_returns.dropna().iloc[-1]
@@ -157,44 +174,104 @@ def index():
         periods = 16 * 365
         
         # Project using degree 1 model
-        projected_returns = project_future_data(model, poly, last_log_return, periods)
+        projected_returns = project_future_data(linear_model, poly_linear, last_log_return, periods)
         projected_prices = log_returns_to_price(last_price, projected_returns)
         
         # Create future dates
         last_date = df.index[-1]
         future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+        # Prepare data for logistic regression with polynomial degrees 2 and 3
+        # Combine features from degrees 2 and 3
+        X_logistic_deg2, y_logistic_deg2, poly_logistic_deg2 = prepare_logistic_data(log_returns, poly_degree=2)
+        X_logistic_deg3, y_logistic_deg3, poly_logistic_deg3 = prepare_logistic_data(log_returns, poly_degree=3)
         
-        # Create visualization - single plot with both datasets
-        fig, ax = plt.subplots(figsize=(14, 7))
+        # Train logistic regression models
+        logistic_model_deg2 = LogisticRegression(max_iter=1000, random_state=42)
+        logistic_model_deg3 = LogisticRegression(max_iter=1000, random_state=42)
+        logistic_model_deg2.fit(X_logistic_deg2, y_logistic_deg2)
+        logistic_model_deg3.fit(X_logistic_deg3, y_logistic_deg3)
+        
+        # Test logistic regression on the straight-line data from linear regression
+        # Use the projected returns from linear regression as test features
+        # For testing, we need to create polynomial features of degrees 2 and 3 from the projected returns
+        projected_returns_reshaped = projected_returns.reshape(-1, 1)
+        
+        # Transform to polynomial features
+        X_test_deg2 = poly_logistic_deg2.transform(projected_returns_reshaped)
+        X_test_deg3 = poly_logistic_deg3.transform(projected_returns_reshaped)
+        
+        # Predict probabilities for positive returns
+        prob_positive_deg2 = logistic_model_deg2.predict_proba(X_test_deg2)[:, 1]
+        prob_positive_deg3 = logistic_model_deg3.predict_proba(X_test_deg3)[:, 1]
+        
+        # Calculate accuracy metrics (since we don't have true labels for future, use as demonstration)
+        # For demonstration, assume a simple threshold of 0.5 for classification
+        predictions_deg2 = (prob_positive_deg2 >= 0.5).astype(int)
+        predictions_deg3 = (prob_positive_deg3 >= 0.5).astype(int)
+        
+        # Create visualizations
+        # First plot: Price and continuation dataset
+        fig1, ax1 = plt.subplots(figsize=(14, 7))
         
         # Plot historical price
-        ax.plot(df.index, df['close'], label='Historical Price (2018-Present)', color='blue', linewidth=1.5)
+        ax1.plot(df.index, df['close'], label='Historical Price (2018-Present)', color='blue', linewidth=1.5)
         
         # Plot projected continuation price
-        ax.plot(future_dates, projected_prices, label='Projected Continuation (Next 16 Years)', color='orange', linewidth=1.5, linestyle='--')
+        ax1.plot(future_dates, projected_prices, label='Projected Continuation (Next 16 Years)', color='orange', linewidth=1.5, linestyle='--')
         
         # Add vertical line at the transition point
-        ax.axvline(x=last_date, color='red', linestyle=':', alpha=0.7, label=f'Transition: {last_date.date()}')
+        ax1.axvline(x=last_date, color='red', linestyle=':', alpha=0.7, label=f'Transition: {last_date.date()}')
         
         # Add horizontal line at last price
-        ax.axhline(y=last_price, color='green', linestyle='--', alpha=0.5, label=f'Last Price: ${last_price:.2f}')
+        ax1.axhline(y=last_price, color='green', linestyle='--', alpha=0.5, label=f'Last Price: ${last_price:.2f}')
         
-        ax.set_title('BTC/USDT Price with Linear Regression Projection (Degree 1)')
-        ax.set_xlabel('Date')
-        ax.set_ylabel('Price (USDT)')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Format x-axis dates for better readability
-        fig.autofmt_xdate()
+        ax1.set_title('BTC/USDT Price with Linear Regression Projection (Degree 1)')
+        ax1.set_xlabel('Date')
+        ax1.set_ylabel('Price (USDT)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        fig1.autofmt_xdate()
         plt.tight_layout()
         
-        # Convert plot to base64 for HTML display
-        img = io.BytesIO()
-        plt.savefig(img, format='png', dpi=100)
-        img.seek(0)
-        plot_url = base64.b64encode(img.getvalue()).decode()
-        plt.close()
+        # Convert first plot to base64
+        img1 = io.BytesIO()
+        plt.savefig(img1, format='png', dpi=100)
+        img1.seek(0)
+        plot_url1 = base64.b64encode(img1.getvalue()).decode()
+        plt.close(fig1)
+        
+        # Second plot: Logistic regression test results
+        fig2, (ax2, ax3) = plt.subplots(2, 1, figsize=(14, 10))
+        
+        # Plot probability of positive returns (degree 2)
+        ax2.plot(future_dates, prob_positive_deg2, label='Probability of Positive Return (Degree 2)', color='purple', linewidth=1.5)
+        ax2.axhline(y=0.5, color='red', linestyle='--', alpha=0.7, label='Threshold (0.5)')
+        ax2.set_title('Logistic Regression Test on Straight-Line Data: Degree 2 Polynomial Features')
+        ax2.set_xlabel('Date')
+        ax2.set_ylabel('Probability')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim([0, 1])
+        
+        # Plot probability of positive returns (degree 3)
+        ax3.plot(future_dates, prob_positive_deg3, label='Probability of Positive Return (Degree 3)', color='brown', linewidth=1.5)
+        ax3.axhline(y=0.5, color='red', linestyle='--', alpha=0.7, label='Threshold (0.5)')
+        ax3.set_title('Logistic Regression Test on Straight-Line Data: Degree 3 Polynomial Features')
+        ax3.set_xlabel('Date')
+        ax3.set_ylabel('Probability')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.set_ylim([0, 1])
+        
+        fig2.autofmt_xdate()
+        plt.tight_layout()
+        
+        # Convert second plot to base64
+        img2 = io.BytesIO()
+        plt.savefig(img2, format='png', dpi=100)
+        img2.seek(0)
+        plot_url2 = base64.b64encode(img2.getvalue()).decode()
+        plt.close(fig2)
         
         # Prepare data summary
         data_summary = {
@@ -206,7 +283,11 @@ def index():
             'projection_start': future_dates[0].strftime('%Y-%m-%d'),
             'projection_end': future_dates[-1].strftime('%Y-%m-%d'),
             'projection_periods': periods,
-            'model_score': f"{model.score(X, y):.4f}"
+            'linear_model_score': f"{linear_model.score(X_linear, y_linear):.4f}",
+            'logistic_model_score_deg2': f"{logistic_model_deg2.score(X_logistic_deg2, y_logistic_deg2):.4f}",
+            'logistic_model_score_deg3': f"{logistic_model_deg3.score(X_logistic_deg3, y_logistic_deg3):.4f}",
+            'avg_prob_positive_deg2': f"{prob_positive_deg2.mean():.4f}",
+            'avg_prob_positive_deg3': f"{prob_positive_deg3.mean():.4f}"
         }
         
         # Create HTML template
@@ -227,6 +308,7 @@ def index():
                 .plot-container img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 5px; }
                 .disclaimer { background-color: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 15px; border-radius: 5px; margin-top: 20px; }
                 .footer { margin-top: 30px; text-align: center; color: #666; font-size: 0.9em; }
+                .section-title { color: #4CAF50; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 30px; }
             </style>
         </head>
         <body>
@@ -242,19 +324,29 @@ def index():
                         <div class="summary-item"><strong>Last Log Return:</strong> {{ last_log_return }}</div>
                         <div class="summary-item"><strong>Projection Period:</strong> {{ projection_start }} to {{ projection_end }}</div>
                         <div class="summary-item"><strong>Projection Periods:</strong> {{ projection_periods }} days (16 years)</div>
-                        <div class="summary-item"><strong>Model R² Score (Degree 1):</strong> {{ model_score }}</div>
+                        <div class="summary-item"><strong>Linear Model R² Score (Degree 1):</strong> {{ linear_model_score }}</div>
+                        <div class="summary-item"><strong>Logistic Model Accuracy (Degree 2):</strong> {{ logistic_model_score_deg2 }}</div>
+                        <div class="summary-item"><strong>Logistic Model Accuracy (Degree 3):</strong> {{ logistic_model_score_deg3 }}</div>
+                        <div class="summary-item"><strong>Avg Positive Prob (Degree 2):</strong> {{ avg_prob_positive_deg2 }}</div>
+                        <div class="summary-item"><strong>Avg Positive Prob (Degree 3):</strong> {{ avg_prob_positive_deg3 }}</div>
                     </div>
                 </div>
                 
                 <div class="plot-container">
-                    <h2>Price and Continuation Dataset</h2>
+                    <h2 class="section-title">Price and Continuation Dataset</h2>
                     <p>Historical price (blue solid line) and projected continuation (orange dashed line) using linear regression with degree 1 polynomial features.</p>
-                    <img src="data:image/png;base64,{{ plot_url }}" alt="Price and Continuation Plot">
+                    <img src="data:image/png;base64,{{ plot_url1 }}" alt="Price and Continuation Plot">
+                </div>
+                
+                <div class="plot-container">
+                    <h2 class="section-title">Logistic Regression Test Results</h2>
+                    <p>Logistic regression models trained on log returns with polynomial features of degrees 2 and 3, tested on the straight-line data from linear regression.</p>
+                    <img src="data:image/png;base64,{{ plot_url2 }}" alt="Logistic Regression Test Plot">
                 </div>
                 
                 <div class="disclaimer">
                     <h3>Important Disclaimer</h3>
-                    <p>This is a technical demonstration only. The linear regression model with polynomial features is a simple statistical approach and should not be used for financial decision-making. Financial markets are complex and influenced by many factors not captured in this model. Past performance does not guarantee future results.</p>
+                    <p>This is a technical demonstration only. The models are simple statistical approaches and should not be used for financial decision-making. Financial markets are complex and influenced by many factors not captured in these models. Past performance does not guarantee future results.</p>
                     <p>The projection of 16 years into the future is purely mathematical and based on historical patterns. It does not account for market changes, economic events, or other real-world factors.</p>
                 </div>
                 
@@ -270,7 +362,8 @@ def index():
         # Render template with data
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         html = render_template_string(html_template, 
-                                     plot_url=plot_url,
+                                     plot_url1=plot_url1,
+                                     plot_url2=plot_url2,
                                      current_time=current_time,
                                      **data_summary)
         
