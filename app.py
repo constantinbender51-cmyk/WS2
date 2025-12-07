@@ -119,8 +119,10 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
     # Only add noise where SMA is not NaN
     sma_values = df['sma'].dropna()
     if len(sma_values) > 0:
+        # Create noise as absolute value based on SMA magnitude
         noise = np.random.normal(0, noise_level * sma_values.mean(), len(sma_values))
-        df.loc[sma_values.index, 'noisy_sma'] = sma_values * (1 + noise)
+        # Add noise to SMA (not multiply)
+        df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
     else:
         df['noisy_sma'] = np.nan
     
