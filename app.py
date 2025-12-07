@@ -182,11 +182,12 @@ def create_plot(model, X, y, scaler_target, ref_prices, ref_dates, split_index):
     img = io.BytesIO()
     plt.savefig(img, format='png', dpi=100)
     img.seek(0)
+    img_bytes = img.getvalue() # Extract the raw bytes
     plt.close()
-    return img
+    return img_bytes # Return raw bytes
 
 app = flask.Flask(__name__)
-plot_image = None
+plot_image = None # This will now store raw bytes
 
 @app.route('/')
 def home():
@@ -214,8 +215,11 @@ def home():
 
 @app.route('/plot.png')
 def plot_png():
+    global plot_image
     if plot_image:
-        return flask.send_file(plot_image, mimetype='image/png')
+        # Crucial fix: Wrap the raw bytes in a new BytesIO object for *each request*
+        # Flask will close this temporary object, but the original raw data remains available.
+        return flask.send_file(io.BytesIO(plot_image), mimetype='image/png')
     else:
         return "Training in progress...", 503
 
