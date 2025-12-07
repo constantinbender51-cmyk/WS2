@@ -28,7 +28,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA (Shifted 120 Left)</h1>
-        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices, a 120-period simple moving average with added noise, and the same noisy SMA shifted 120 periods left to overlap with close price swings.</p>
+        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices and the noisy SMA shifted 120 periods left to overlap with close price swings.</p>
         <img src="data:image/png;base64,{{ plot_data }}" alt="OHLCV with Noisy SMA Plot">
         <p>Generated at: {{ timestamp }}</p>
     </div>
@@ -147,11 +147,6 @@ def create_plot(df):
     
     # Plot closing price
     plt.plot(df.index, df['close'], label='Close Price', alpha=0.7, linewidth=1)
-    
-    # Plot noisy SMA if available
-    if 'noisy_sma' in df.columns and not df['noisy_sma'].isna().all():
-        plt.plot(df.index, df['noisy_sma'], label='Noisy 120-period SMA', 
-                color='red', linewidth=2, alpha=0.5)
     
     # Plot shifted noisy SMA if available
     if 'noisy_sma_shifted' in df.columns and not df['noisy_sma_shifted'].isna().all():
