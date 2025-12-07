@@ -13,19 +13,19 @@ timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
 # Strategy Params
-SMA_FAST = 40
-SMA_SLOW = 120
+SMA_FAST = 57
+SMA_SLOW = 128
 SL_PCT = 0.02
 TP_PCT = 0.16
-III_WINDOW = 14 
+III_WINDOW = 35 
 
 # --- GRID SEARCH SPACE DEFINITION (5 VARIABLES) ---
 
-# Threshold Search Space (T_Low, T_High): 0.0 to 0.9 in 0.1 steps (10 values)
-THRESH_RANGE = np.arange(0.0, 1.0, 0.1) 
+# Threshold Search Space (T_Low, T_High): 0.13 and 0.18 only
+THRESH_RANGE = np.array([0.13, 0.18]) 
 
-# Leverage Search Space (L_Low, L_Mid, L_High): 0.0 to 4.5 in 0.5 steps (10 values)
-LEV_RANGE = np.arange(0.0, 4.51, 0.5) 
+# Leverage Search Space (L_Low, L_Mid, L_High): 0.5, 4.5, and 2.45 only
+LEV_RANGE = np.array([0.5, 4.5, 2.45]) 
 
 # MDD Constraint
 MAX_MDD_CONSTRAINT = -0.50 # Must be less than 50% drawdown
@@ -115,7 +115,7 @@ base_ret_arr = np.array(base_returns)
 iii_prev = df['iii'].shift(1).fillna(0).values
 
 best_sharpe = -999
-best_combo = (0.0, 0.0, 0.0, 0.0, 0.0) # T_Low, T_High, L_Low, L_Mid, L_High
+best_combo = (0.13, 0.18, 0.5, 4.5, 2.45) # T_Low, T_High, L_Low, L_Mid, L_High
 best_mdd = 0
 
 # Metrics function optimized for arrays
