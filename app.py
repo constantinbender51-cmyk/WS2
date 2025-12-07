@@ -13,34 +13,35 @@ symbol = 'BTC/USDT'
 timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
-# Global Strategy Params
-SMA_FAST = 40
-SMA_SLOW = 120
+# Fixed Params for this Config
+III_WINDOW = 35 
+L_LOW = 0.5
+L_MID = 4.5
+L_HIGH = 2.45
 SL_PCT = 0.02
 TP_PCT = 0.16
 
-# --- SCENARIO DEFINITIONS (The Core Test) ---
+# --- SCENARIOS ---
 scenarios = {
-    "0. BASELINE (T=0.10/0.50)": {
-        "III_WINDOW": 14,
-        "T_LOW": 0.10, "T_HIGH": 0.50,
-        "L_LOW": 0.0, "L_MID": 1.75, "L_HIGH": 1.0
+    "0. BASELINE (40/120, 0.13/0.18)": {
+        "SMA_F": 40, "SMA_S": 120,
+        "T_LOW": 0.13, "T_HIGH": 0.18
     },
-    "1. T_SHIFT (+0.05)": {
-        "III_WINDOW": 14,
-        "T_LOW": 0.15, "T_HIGH": 0.55, 
-        "L_LOW": 0.0, "L_MID": 1.75, "L_HIGH": 1.0
+    "1. SMA +5 (45/125)": {
+        "SMA_F": 45, "SMA_S": 125, # Robustness Check 1
+        "T_LOW": 0.13, "T_HIGH": 0.18
     },
-    "2. LAG_SLOW (+4 Days)": {
-        "III_WINDOW": 18, 
-        "T_LOW": 0.10, "T_HIGH": 0.50,
-        "L_LOW": 0.0, "L_MID": 1.75, "L_HIGH": 1.0
+    "2. SMA -5 (35/115)": {
+        "SMA_F": 35, "SMA_S": 115, # Robustness Check 2
+        "T_LOW": 0.13, "T_HIGH": 0.18
     },
-    "3. LEV_MID (-0.25x)": {
-        "III_WINDOW": 14,
-        "T_LOW": 0.10, "T_HIGH": 0.50,
-        "L_LOW": 0.0, "L_MID": 1.50, # Reduced aggression
-        "L_HIGH": 1.0
+    "3. THRESH +0.01 (0.14/0.19)": {
+        "SMA_F": 40, "SMA_S": 120,
+        "T_LOW": 0.14, "T_HIGH": 0.19 # Micro-nudge up
+    },
+    "4. THRESH -0.01 (0.12/0.17)": {
+        "SMA_F": 40, "SMA_S": 120,
+        "T_LOW": 0.12, "T_HIGH": 0.17 # Micro-nudge down
     },
 }
 
@@ -49,7 +50,6 @@ def fetch_binance_history(symbol, start_str):
     exchange = ccxt.binance()
     since = exchange.parse8601(start_str)
     all_ohlcv = []
-    
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
@@ -60,223 +60,229 @@ def fetch_binance_history(symbol, start_str):
         except Exception as e:
             print(f"Error fetching: {e}")
             break
-            
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# Metrics function
+# Metrics
 def calculate_metrics(equity_series, base_returns):
     ret = equity_series.pct_change().fillna(0)
     days = (equity_series.index[-1] - equity_series.index[0]).days
     cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (365.0 / days) - 1
-    
     roll_max = equity_series.cummax()
     drawdown = (equity_series - roll_max) / roll_max
     max_dd = drawdown.min()
-    
     sharpe = (ret.mean() / ret.std()) * np.sqrt(365) if ret.std() != 0 else 0
     
-    # Calculate Buy & Hold for CAGR comparison
+    # Buy & Hold
     bh_series = pd.Series(np.cumprod(1 + base_returns), index=equity_series.index)
     bh_cagr = (bh_series.iloc[-1] / bh_series.iloc[0]) ** (365.0 / days) - 1
     
     return cagr, max_dd, sharpe, bh_cagr
 
-# 2. DATA PREP & BASE RETURNS (Runs once)
+# 2. DATA PREP (Common)
 df = fetch_binance_history(symbol, start_date_str)
-df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
-df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
 
-# Pre-calculate Base 1x Strategy Returns
-print("Pre-calculating base strategy returns...")
-base_returns = []
-start_idx_max = max(SMA_SLOW, max(s["III_WINDOW"] for s in scenarios.values()))
-
-for i in range(len(df)):
-    if i < start_idx_max:
-        base_returns.append(0.0)
-        continue
-    
-    prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
-    open_p = df['open'].iloc[i]
-    high_p = df['high'].iloc[i]
-    low_p = df['low'].iloc[i]
-    close_p = df['close'].iloc[i]
-    daily_ret = 0.0
-    
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p; sl = entry * (1 - SL_PCT); tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p; sl = entry * (1 + SL_PCT); tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
-        
-    base_returns.append(daily_ret)
-
-df['base_ret'] = base_returns
+# Calculate III (Constant for all tests)
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
+df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
+epsilon = 1e-8
+df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
+iii_prev = df['iii'].shift(1).fillna(0).values
 
 # 3. RUN SCENARIOS
-print("\nRunning Sensitivity Tests...")
+print("\nRunning Robustness Tests (SMA & Threshold Sensitivity)...")
 comparison_data = []
 
-for name, params in scenarios.items():
-    # --- A. RECALCULATE III FOR SCENARIO (If window changed) ---
-    iii_window = params['III_WINDOW']
-    
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-    df['net_direction'] = df['log_ret'].rolling(iii_window).sum().abs()
-    df['path_length'] = df['log_ret'].abs().rolling(iii_window).sum()
-    epsilon = 1e-8
-    iii_series = df['net_direction'] / (df['path_length'] + epsilon)
-    iii_prev = iii_series.shift(1).fillna(0).values
+# To ensure fair comparison, find max start index across all possible SMAs
+max_sma = 125 
+start_idx_max = max(max_sma, III_WINDOW)
 
-    # --- B. APPLY DYNAMIC LEVERAGE ---
-    t_low, t_high = params['T_LOW'], params['T_HIGH']
-    l_low, l_mid, l_high = params['L_LOW'], params['L_MID'], params['L_HIGH']
+for name, params in scenarios.items():
+    # A. Calculate SMA for this scenario
+    sma_f_val = params['SMA_F']
+    sma_s_val = params['SMA_S']
     
-    # Vectorized mask creation for the current scenario
+    sma_fast = df['close'].rolling(sma_f_val).mean()
+    sma_slow = df['close'].rolling(sma_s_val).mean()
+    
+    # B. Calculate Base Returns (Trend Logic)
+    # We must do this inside loop because signals change with SMA
+    temp_base_rets = np.zeros(len(df))
+    
+    # Vectorized signal calculation for speed
+    # Note: Using shift(1) for prev close/sma
+    prev_c = df['close'].shift(1)
+    prev_f = sma_fast.shift(1)
+    prev_s = sma_slow.shift(1)
+    
+    # Entry conditions
+    long_cond = (prev_c > prev_f) & (prev_c > prev_s)
+    short_cond = (prev_c < prev_f) & (prev_c < prev_s)
+    
+    # We need to apply SL/TP logic. 
+    # Since we need high accuracy, we iterate.
+    # (Optimization: We iterate only from start_idx_max)
+    
+    scenario_equity = [1.0] * start_idx_max # Placeholder
+    equity = 1.0
+    
+    # Tiers
+    t_low, t_high = params['T_LOW'], params['T_HIGH']
+    
+    # Leverage Array
     tier_mask = np.full(len(df), 2, dtype=int) 
     tier_mask[iii_prev < t_high] = 1
     tier_mask[iii_prev < t_low] = 0
-    
-    lookup = np.array([l_low, l_mid, l_high])
+    lookup = np.array([L_LOW, L_MID, L_HIGH])
     lev_arr = lookup[tier_mask]
-    
-    final_rets = df['base_ret'].values * lev_arr
-    
-    # --- C. CALCULATE EQUITY & METRICS ---
-    equity_series = pd.Series(np.cumprod(1 + final_rets), index=df.index)
-    
-    eval_series = equity_series.iloc[start_idx_max:]
-    eval_base_rets = df['base_ret'].iloc[start_idx_max:]
 
-    cagr, mdd, sharpe, bh_cagr = calculate_metrics(eval_series, eval_base_rets)
+    for i in range(start_idx_max, len(df)):
+        daily_ret = 0.0
+        
+        # Check Signal
+        is_long = long_cond.iloc[i]
+        is_short = short_cond.iloc[i]
+        
+        open_p = df['open'].iloc[i]
+        high_p = df['high'].iloc[i]
+        low_p = df['low'].iloc[i]
+        close_p = df['close'].iloc[i]
+        
+        if is_long:
+            entry = open_p; sl = entry*(1-SL_PCT); tp = entry*(1+TP_PCT)
+            if low_p <= sl: daily_ret = -SL_PCT
+            elif high_p >= tp: daily_ret = TP_PCT
+            else: daily_ret = (close_p - entry)/entry
+            
+        elif is_short:
+            entry = open_p; sl = entry*(1+SL_PCT); tp = entry*(1-TP_PCT)
+            if high_p >= sl: daily_ret = -SL_PCT
+            elif low_p <= tp: daily_ret = TP_PCT
+            else: daily_ret = (entry - close_p)/entry
+            
+        # Apply Leverage
+        lev = lev_arr[i]
+        final_ret = daily_ret * lev
+        equity *= (1 + final_ret)
+        
+        # Check liquidation (simplistic)
+        if equity < 0.05: equity = 0
+            
+        scenario_equity.append(equity)
+        
+    # C. Metrics
+    eq_series = pd.Series(scenario_equity, index=df.index[start_idx_max-len(scenario_equity):])
+    # Recalculate pure Buy Hold for comparison on same timeframe
+    bh_series = df['close'].iloc[start_idx_max:] / df['close'].iloc[start_idx_max]
+    
+    # Metrics
+    # Filter for the valid trading period
+    valid_eq = eq_series.iloc[start_idx_max:] 
+    
+    # Calculate Base Returns for BH CAGR (using close price)
+    base_bh_ret = df['close'].pct_change().fillna(0)
+    
+    cagr, mdd, sharpe, bh_cagr = calculate_metrics(valid_eq, base_bh_ret.iloc[start_idx_max:].values)
     
     comparison_data.append({
         'Scenario': name,
         'CAGR': cagr,
         'MDD': mdd,
-        'Sharpe': sharpe,
+        'Sharpe': sharpe
     })
 
-# Convert to DataFrame for display
 results_df = pd.DataFrame(comparison_data)
 
-# 4. PRINT RESULTS & PLOT (Comparison Table)
-print("\n" + "="*70)
-print(f"SENSITIVITY ANALYSIS RESULTS (Target: Maximize Sharpe, Minimize MDD)")
-print(f"Buy & Hold CAGR (Benchmark): {bh_cagr*100:.1f}%")
-print("-" * 70)
-print(f"{'Scenario':<25} | {'Sharpe':<8} | {'CAGR':<8} | {'MDD':<8} | {'Params'}")
-print("-" * 70)
+# 4. OUTPUT
+print("\n" + "="*85)
+print(f"ROBUSTNESS TEST: HIGH AGGRESSION CONFIG (35d / 4.5x)")
+print("-" * 85)
+print(f"{'Scenario':<30} | {'Sharpe':<8} | {'CAGR':<8} | {'MDD':<8} | {'Change vs Base'}")
+print("-" * 85)
+
+base_sharpe = results_df.iloc[0]['Sharpe']
 
 for index, row in results_df.iterrows():
-    name = row['Scenario']
-    params = scenarios[name]
-    param_str = f"W:{params['III_WINDOW']}, T:{params['T_LOW']:.2f}/{params['T_HIGH']:.2f}, L:{params['L_LOW']:.2f}/{params['L_MID']:.2f}/{params['L_HIGH']:.2f}"
+    change = (row['Sharpe'] - base_sharpe) / base_sharpe
+    color_code = ""
+    if abs(change) < 0.10: status = "ROBUST"
+    else: status = "SENSITIVE"
     
-    print(f"{name:<25} | {row['Sharpe']:.2f}<{' ':<2} | {row['CAGR']*100:.1f}%<{' ':<1} | {row['MDD']*100:.1f}%<{' ':<1} | {param_str}")
+    print(f"{row['Scenario']:<30} | {row['Sharpe']:.2f}<{' ':<2} | {row['CAGR']*100:.1f}%<{' ':<1} | {row['MDD']*100:.1f}%<{' ':<1} | {change*100:+.1f}% ({status})")
 
-print("="*70 + "\n")
+print("="*85 + "\n")
 
 # 5. VISUALIZATION
-# --- Setup plotting ---
-fig, ax = plt.subplots(figsize=(14, 8))
+plt.figure(figsize=(14, 8))
+colors = ['blue', 'orange', 'green', 'purple', 'red']
+for (name, params), color in zip(scenarios.items(), colors):
+    # Re-run loop briefly to get curve (inefficient but cleaner code structure)
+    # ... (Logic identical to above loop, omitted for brevity in print, included in exec)
+    # Actually, let's just create a quick helper to grab the curve data from the main loop logic if we stored it
+    # For now, we just rely on the table metrics which are the definitive proof.
+    pass
 
-# Function to retrieve and plot equity curve for visualization
-def get_equity_curve(params):
-    iii_window = params['III_WINDOW']
-    # Recalculate III for visualization fidelity
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-    df['net_direction'] = df['log_ret'].rolling(iii_window).sum().abs()
-    df['path_length'] = df['log_ret'].abs().rolling(iii_window).sum()
-    epsilon = 1e-8
-    iii_series = df['net_direction'] / (df['path_length'] + epsilon)
-    iii_prev = iii_series.shift(1).fillna(0).values
+# We will generate the plot image using the logic inside the Flask route to save state
+pass
 
+# Plotting Logic recreated for the file save
+plt.figure(figsize=(14, 8))
+for (name, params), color in zip(scenarios.items(), colors):
+    # Re-calc for plot
+    sma_f = df['close'].rolling(params['SMA_F']).mean()
+    sma_s = df['close'].rolling(params['SMA_S']).mean()
+    prev_c = df['close'].shift(1); prev_f = sma_f.shift(1); prev_s = sma_s.shift(1)
+    
     t_low, t_high = params['T_LOW'], params['T_HIGH']
-    l_low, l_mid, l_high = params['L_LOW'], params['L_MID'], params['L_HIGH']
-    
     tier_mask = np.full(len(df), 2, dtype=int) 
-    tier_mask[iii_prev < t_high] = 1
-    tier_mask[iii_prev < t_low] = 0
+    tier_mask[iii_prev < t_high] = 1; tier_mask[iii_prev < t_low] = 0
+    lookup = np.array([L_LOW, L_MID, L_HIGH]); lev_arr = lookup[tier_mask]
     
-    lookup = np.array([l_low, l_mid, l_high])
-    lev_arr = lookup[tier_mask]
-    final_rets = df['base_ret'].values * lev_arr
+    eq = [1.0] * start_idx_max
+    curr_eq = 1.0
     
-    equity_curve = pd.Series(np.cumprod(1 + final_rets), index=df.index)
-    return equity_curve.iloc[start_idx_max:]
+    for i in range(start_idx_max, len(df)):
+        daily_ret = 0
+        if prev_c.iloc[i] > prev_f.iloc[i] and prev_c.iloc[i] > prev_s.iloc[i]:
+            entry = df['open'].iloc[i]; sl=entry*(1-SL_PCT); tp=entry*(1+TP_PCT)
+            if df['low'].iloc[i]<=sl: daily_ret=-SL_PCT
+            elif df['high'].iloc[i]>=tp: daily_ret=TP_PCT
+            else: daily_ret=(df['close'].iloc[i]-entry)/entry
+        elif prev_c.iloc[i] < prev_f.iloc[i] and prev_c.iloc[i] < prev_s.iloc[i]:
+            entry = df['open'].iloc[i]; sl=entry*(1+SL_PCT); tp=entry*(1-TP_PCT)
+            if df['high'].iloc[i]>=sl: daily_ret=-SL_PCT
+            elif df['low'].iloc[i]<=tp: daily_ret=TP_PCT
+            else: daily_ret=(entry-df['close'].iloc[i])/entry
+            
+        curr_eq *= (1 + daily_ret * lev_arr[i])
+        eq.append(curr_eq)
+        
+    plt.plot(df.index[start_idx_max-len(eq):], eq, label=name, color=color, linewidth=2 if "BASELINE" in name else 1)
 
-# Plotting the four curves
-colors = ['blue', 'green', 'orange', 'red']
-for (i, row), color in zip(results_df.iterrows(), colors):
-    params = scenarios[row['Scenario']]
-    eq = get_equity_curve(params)
-    ax.plot(eq.index, eq, label=f"{row['Scenario']} (Sharpe: {row['Sharpe']:.2f})", color=color, linewidth=2 if i==0 else 1)
+plt.yscale('log')
+plt.title('Robustness Check: SMA & Threshold Sensitivity')
+plt.legend()
+plt.grid(True, which='both', linestyle='--', alpha=0.3)
 
-ax.set_yscale('log')
-ax.set_title(f'Robustness Check: III-14 Architecture Sensitivity')
-ax.legend()
-ax.grid(True, which='both', linestyle='--', alpha=0.3)
-plt.tight_layout()
-
-# Save plot to file
 plot_dir = '/app/static'
 if not os.path.exists(plot_dir): os.makedirs(plot_dir)
-plot_path = os.path.join(plot_dir, 'robustness_plot.png')
+plot_path = os.path.join(plot_dir, 'robustness_final.png')
 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-plt.close(fig)
-
-
-# 6. FLASK APP TO SERVE PLOT
-table_html = results_df.to_html(classes='table table-striped', float_format='%.2f', 
-                                    formatters={'CAGR': '{:.1%}'.format, 'MDD': '{:.1%}'.format})
-    
-response_html = f"""
-<html>
-<head>
-    <title>Robustness Check Results</title>
-    <style>
-        body {{ font-family: sans-serif; }}
-        h2 {{ color: #1E90FF; }}
-        table {{ width: 90%; border-collapse: collapse; margin: 20px 0; }}
-        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: right; }}
-        th {{ background-color: #f2f2f2; }}
-        .container {{ display: flex; flex-direction: column; align-items: center; }}
-        .header-box {{ border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; background-color: #f9f9f9; width: 90%; max-width: 900px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header-box">
-            <h2>Robustness Check: III 14-Day Architecture</h2>
-            <p><strong>Baseline Parameters:</strong> W=14, T=0.10/0.50, L=0.0/1.75/1.0</p>
-            <p><strong>Goal:</strong> Validate that slight parameter shifts cause graceful degradation, not catastrophic failure.</p>
-        </div>
-        <img src="/static/robustness_plot.png" alt="Equity Curve Comparison" style="width: 80%; max-width: 900px;">
-        <h3>Metric Comparison</h3>
-        <p>Baseline B&H CAGR: {bh_cagr*100:.1f}%</p>
-        {table_html}
-    </div>
-</body>
-</html>
-"""
 
 app = Flask(__name__)
 @app.route('/')
-def serve_html(): return response_html
-@app.route('/static/<path:path>')
-def serve_static(path): return send_file(os.path.join(plot_dir, path))
+def serve_plot(): 
+    # Just serving the image for simplicity in this final step
+    return f"""
+    <html><body>
+    <h2>Robustness Test Results</h2>
+    <img src="/static/robustness_final.png" style="width:100%; max-width:1000px;">
+    </body></html>
+    """
 @app.route('/health')
 def health(): return 'OK', 200
 
