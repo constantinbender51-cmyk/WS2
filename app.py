@@ -119,7 +119,36 @@ best_combo = (0.13, 0.18, 0.5, 4.5, 2.45) # T_Low, T_High, L_Low, L_Mid, L_High
 best_mdd = 0
 
 # Metrics function optimized for arrays
-def calculate_sharpe_mdd(returns):
+
+
+def get_final_metrics(equity_series):
+    """Calculate total return, CAGR, max drawdown, and Sharpe ratio from equity series."""
+    if len(equity_series) < 2:
+        return 0, 0, 0, 0
+    
+    # Total return
+    total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
+    
+    # CAGR
+    years = (equity_series.index[-1] - equity_series.index[0]).days / 365.25
+    if years > 0:
+        cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (1 / years) - 1
+    else:
+        cagr = 0
+    
+    # Max drawdown
+    roll_max = equity_series.cummax()
+    drawdown = (equity_series - roll_max) / roll_max
+    max_dd = drawdown.min()
+    
+    # Sharpe ratio (assuming daily returns)
+    daily_returns = equity_series.pct_change().dropna()
+    if len(daily_returns) > 0:
+        sharpe = np.sqrt(365) * daily_returns.mean() / daily_returns.std() if daily_returns.std() > 0 else 0
+    else:
+        sharpe = 0
+    
+    return total_return, cagr, max_dd, sharpedef calculate_sharpe_mdd(returns):
     cum_ret = np.cumprod(1 + returns)
     if cum_ret.size == 0 or cum_ret.iloc[0] == 0: return 0, 0
     
@@ -171,10 +200,18 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
 
 
 # 4. FINAL BACKTEST WITH FIXED PARAMS
-# Use the same tier mask and leverage array from fixed calculation
-tier_mask_final = tier_mask
-lev_arr_final = lev_arr
-final_rets_final = final_rets
+# Use the best combination from grid search
+OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
+
+# Create tier mask for best thresholds
+tier_mask_final = np.full(len(df), 2, dtype=int) # Default High
+tier_mask_final[iii_prev < OPT_T_HIGH] = 1 # Mid
+tier_mask_final[iii_prev < OPT_T_LOW] = 0  # Low
+
+# Construct leverage array for best leverages
+lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
+lev_arr_final = lookup_final[tier_mask_final]
+final_rets_final = base_ret_arr * lev_arr_final
 
 # Backtest simulation for plot data
 df['strategy_equity'] = 1.0
@@ -197,6 +234,11 @@ for i in range(start_idx, len(df)):
 
 # 5. METRICS & PLOT
 plot_data = df.iloc[start_idx:].copy()
+s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
+# Calculate buy & hold equity for comparison
+plot_data['buy_hold_equity'] = plot_data['close'] / plot_data['close'].iloc[0]
+
+# Calculate strategy metrics
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 
 print("\n" + "="*45)
