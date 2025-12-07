@@ -1,7 +1,0 @@
-ccxt
-pandas
-numpy
-flask
-matplotlib
-gunicorn
-seaborn
