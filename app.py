@@ -122,9 +122,17 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         # Calculate derivative of SMA using gradient
         sma_derivative = np.gradient(sma_values.values)
         
-        # Calculate net distance traveled (cumulative sum of absolute derivatives)
-        # This represents the total movement of the SMA
-        net_distance_traveled = np.cumsum(np.abs(sma_derivative))
+        # Calculate net distance traveled using a 60-day rolling window
+        # Create a rolling window of 60 periods for cumulative sum of absolute derivatives
+        abs_derivatives = np.abs(sma_derivative)
+        
+        # Initialize net_distance_traveled array
+        net_distance_traveled = np.zeros_like(sma_derivative)
+        
+        # Calculate rolling cumulative sum for 60-day window
+        for i in range(len(abs_derivatives)):
+            start_idx = max(0, i - 59)  # 60-day window (inclusive of current point)
+            net_distance_traveled[i] = np.sum(abs_derivatives[start_idx:i+1])
         
         # Use the net distance traveled as the base for noise magnitude
         # Scale by noise_level to control the noise intensity
