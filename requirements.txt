@@ -5,3 +5,5 @@ matplotlib
 ccxt
 requests
 scipy
+plotly
+dash
