@@ -124,7 +124,7 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         
         # Identify points where the slope is horizontal (derivative close to 0)
         # Use a threshold relative to the SMA value at each point
-        horizontal_threshold = 0.005 * sma_values.values
+        horizontal_threshold = 0.001 * sma_values.values
         horizontal_mask = np.abs(sma_derivative) < horizontal_threshold
         
         # Create noise array (initially zeros - no noise)
