@@ -13,6 +13,7 @@ MIN_SHARPE = 0.5  # Lowered to capture more strategies for the consensus
 
 def fetch_data(symbol, timeframe, start_str):
     print(f"--- Fetching {symbol} data since {start_str} ---")
+    time.sleep(0.2)
     exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(start_str)
     all_ohlcv = []
@@ -32,6 +33,7 @@ def fetch_data(symbol, timeframe, start_str):
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     print(f"Data loaded: {len(df)} candles.")
+    time.sleep(0.2)
     return df
 
 def get_sharpe(returns_array):
@@ -43,8 +45,11 @@ def get_sharpe(returns_array):
 def diagnose_specific_pair(df, fast=40, slow=120):
     """Deep dive into the specific strategy mentioned by the user."""
     print(f"\n" + "="*60)
+    time.sleep(0.2)
     print(f"DIAGNOSIS: SMA {fast} vs SMA {slow}")
+    time.sleep(0.2)
     print("="*60)
+    time.sleep(0.2)
     
     prices = df['close']
     returns = prices.pct_change().fillna(0)
@@ -75,13 +80,19 @@ def diagnose_specific_pair(df, fast=40, slow=120):
     sharpe_bh = (returns.mean() / returns.std()) * np.sqrt(365)
     
     print(f"{'Metric':<20} {'Long/Short':<15} {'Long/Flat':<15} {'Buy & Hold':<15}")
+    time.sleep(0.2)
     print("-" * 65)
+    time.sleep(0.2)
     print(f"{'Sharpe Ratio':<20} {sharpe_ls:<15.3f} {sharpe_lo:<15.3f} {sharpe_bh:<15.3f}")
+    time.sleep(0.2)
     print(f"{'Ann. Return %':<20} {ann_ret_ls:<15.1f} {ann_ret_lo:<15.1f} {100*returns.mean()*365:<15.1f}")
+    time.sleep(0.2)
     print("="*60 + "\n")
+    time.sleep(0.2)
 
 def run_meta_optimization(df):
     print(f"--- Starting Meta-Strategy Optimization ---")
+    time.sleep(0.2)
     
     # 1. Setup
     market_returns = df['close'].pct_change().fillna(0).to_numpy()
@@ -90,6 +101,7 @@ def run_meta_optimization(df):
     
     # 2. Pre-calculate SMA Matrix
     print(f"Pre-calculating SMA Matrix (1 to {MAX_SMA})...")
+    time.sleep(0.2)
     sma_matrix = np.zeros((n_days, MAX_SMA))
     for i in range(MAX_SMA):
         sma_matrix[:, i] = df['close'].rolling(window=i+1).mean().fillna(0).to_numpy()
@@ -98,6 +110,7 @@ def run_meta_optimization(df):
     
     # --- A. Price vs SMA ---
     print("Scanning Price vs SMA strategies...")
+    time.sleep(0.2)
     pv_raw = np.where(close_prices[:, None] > sma_matrix, 1, -1).astype(np.int8)
     pv_signals = np.roll(pv_raw, 1, axis=0)
     pv_signals[0, :] = 0
@@ -110,9 +123,11 @@ def run_meta_optimization(df):
     if np.any(mask):
         winning_signals_list.append(pv_signals[:, mask])
         print(f"  -> Found {np.sum(mask)} Price-SMA strategies > {MIN_SHARPE} Sharpe")
+        time.sleep(0.2)
 
     # --- B. SMA vs SMA ---
     print("Scanning SMA vs SMA strategies...")
+    time.sleep(0.2)
     count_sma_winners = 0
     
     for fast_idx in range(MAX_SMA):
@@ -137,9 +152,11 @@ def run_meta_optimization(df):
             winning_signals_list.append(sigs[:, valid_mask])
             
     print(f"  -> Found {count_sma_winners} SMA-SMA strategies > {MIN_SHARPE} Sharpe")
+    time.sleep(0.2)
     
     if not winning_signals_list:
         print("No strategies met the criteria.")
+        time.sleep(0.2)
         return
 
     # 3. Consensus
@@ -151,8 +168,11 @@ def run_meta_optimization(df):
     votes_short = (all_winners == -1).sum(axis=1)
     
     print("\n--- Consensus Optimization (k-sweep) ---")
+    time.sleep(0.2)
     print(f"{'k%':<10} {'Sharpe':<10} {'Ann. Ret':<12} {'Trades':<8}")
+    time.sleep(0.2)
     print("-" * 45)
+    time.sleep(0.2)
     
     best_sharpe = -999
     best_k = 0
@@ -181,13 +201,16 @@ def run_meta_optimization(df):
         trades = np.sum(np.abs(np.diff(final_sig)))
         
         print(f"{k*100:3.0f}%       {s:6.3f}     {np.mean(strat_rets)*365*100:6.1f}%    {trades:4}")
+        time.sleep(0.2)
         
         if s > best_sharpe:
             best_sharpe = s
             best_k = k
 
     print("-" * 45)
+    time.sleep(0.2)
     print(f"Optimal Consensus k: {best_k*100:.0f}% | Sharpe: {best_sharpe:.3f}")
+    time.sleep(0.2)
 
 if __name__ == '__main__':
     df = fetch_data(SYMBOL, TIMEFRAME, START_DATE)
