@@ -139,10 +139,10 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         # Add noise only where slope is horizontal
         if np.any(horizontal_mask):
             # Generate Gaussian noise based on absolute sum of last 60 days of SMA returns and noise_level
-            # Increase amplitude by multiplying by 5
+            # Multiply by huge number (1000) to make noise clearly visible
             horizontal_noise = np.random.normal(
                 0, 
-                noise_level * sma_returns_sum.values[horizontal_mask] * 5, 
+                noise_level * sma_returns_sum.values[horizontal_mask] * 1000, 
                 np.sum(horizontal_mask)
             )
             noise[horizontal_mask] = horizontal_noise
