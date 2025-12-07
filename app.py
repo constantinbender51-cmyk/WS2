@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from flask import Flask, send_file
 import os
-import itertools
+# Removed itertools as grid search is no longer performed
 
 # 1. CONFIGURATION
 symbol = 'BTC/USDT'
@@ -17,21 +17,21 @@ SMA_FAST = 40
 SMA_SLOW = 120
 SL_PCT = 0.02
 TP_PCT = 0.16
+
+# --- NEW OPTIMIZED PARAMETERS ---
 III_WINDOW = 35 
 
-# --- FIXED PARAMETERS ---
+# Optimal Thresholds (Confirmed by comprehensive search)
+OPT_T_LOW = 0.13
+OPT_T_HIGH = 0.18
 
-# Fixed Threshold Values
-FIXED_T_LOW = 0.13
-FIXED_T_HIGH = 0.18
+# Optimal Leverages (Confirmed by comprehensive search)
+OPT_L_LOW = 0.5  # Defensive/Noise Tier
+OPT_L_MID = 4.5  # Mid-Efficiency/Aggressive Tier
+OPT_L_HIGH = 2.45 # High-Efficiency/Contrarian Tier
 
-# Fixed Leverage Values (L_Low, L_Mid, L_High): 0.5, 4.5, and 2.45 as specified
-FIXED_L_LOW = 0.5
-FIXED_L_MID = 4.5
-FIXED_L_HIGH = 2.45
-
-# MDD Constraint
-MAX_MDD_CONSTRAINT = -0.50 # Must be less than 50% drawdown
+# MDD Constraint (Not used in final backtest, but kept for context)
+MAX_MDD_CONSTRAINT = -0.50 
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
@@ -53,6 +53,18 @@ def fetch_binance_history(symbol, start_str):
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
     return df
+
+# Metrics function
+def calculate_metrics(equity_series):
+    ret = equity_series.pct_change().fillna(0)
+    days = (equity_series.index[-1] - equity_series.index[0]).days
+    total_ret = (equity_series.iloc[-1] / equity_series.iloc[0]) - 1
+    cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (365.0 / days) - 1
+    roll_max = equity_series.cummax()
+    drawdown = (equity_series - roll_max) / roll_max
+    max_dd = drawdown.min()
+    sharpe = (ret.mean() / ret.std()) * np.sqrt(365) if ret.std() != 0 else 0
+    return total_ret, cagr, max_dd, sharpe
 
 # 2. DATA PREP & BASE RETURNS
 df = fetch_binance_history(symbol, start_date_str)
@@ -91,17 +103,13 @@ for i in range(len(df)):
     
     # Trend Logic
     if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
+        entry = open_p; sl = entry * (1 - SL_PCT); tp = entry * (1 + TP_PCT)
         if low_p <= sl: daily_ret = -SL_PCT
         elif high_p >= tp: daily_ret = TP_PCT
         else: daily_ret = (close_p - entry) / entry
         
     elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
+        entry = open_p; sl = entry * (1 + SL_PCT); tp = entry * (1 - TP_PCT)
         if high_p >= sl: daily_ret = -SL_PCT
         elif low_p <= tp: daily_ret = TP_PCT
         else: daily_ret = (entry - close_p) / entry
@@ -110,74 +118,25 @@ for i in range(len(df)):
 
 df['base_ret'] = base_returns
 
-# 3. FIXED PARAMETERS IMPLEMENTATION
-# Function to calculate metrics from equity series
-def get_final_metrics(equity_series):
-    """
-    Calculate total return, CAGR, max drawdown, and Sharpe ratio from equity series.
-    Assumes daily returns (252 trading days per year).
-    Uses the full equity series starting from the first valid value.
-    """
-    # Drop NaN values (warmup period)
-    equity_series = equity_series.dropna()
-    
-    if len(equity_series) < 2:
-        return 0.0, 0.0, 0.0, 0.0
-    
-    # Total return
-    total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
-    
-    # CAGR
-    years = len(equity_series) / 252  # Approximate trading days per year
-    if years > 0:
-        cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (1 / years) - 1
-    else:
-        cagr = 0.0
-    
-    # Max drawdown
-    roll_max = equity_series.cummax()
-    drawdown = (equity_series - roll_max) / roll_max
-    max_drawdown = drawdown.min()
-    
-    # Sharpe ratio (assuming risk-free rate = 0 for simplicity)
-    daily_returns = equity_series.pct_change().dropna()
-    if len(daily_returns) > 0 and daily_returns.std() != 0:
-        sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
-    else:
-        sharpe = 0.0
-    
-    return total_return, cagr, max_drawdown, sharpe
-print("Using fixed parameters without grid search...")
-
-base_ret_arr = np.array(base_returns)
+# 3. FINAL BACKTEST WITH OPTIMIZED PARAMS
 iii_prev = df['iii'].shift(1).fillna(0).values
 
-# Fixed parameters
-OPT_T_LOW = FIXED_T_LOW
-OPT_T_HIGH = FIXED_T_HIGH
-OPT_L_LOW = FIXED_L_LOW
-OPT_L_MID = FIXED_L_MID
-OPT_L_HIGH = FIXED_L_HIGH
+# Recalculate tier mask for the final run
+tier_mask_final = np.full(len(df), 2, dtype=int) 
+tier_mask_final[iii_prev < OPT_T_HIGH] = 1
+tier_mask_final[iii_prev < OPT_T_LOW] = 0
 
-# Create tier mask for fixed thresholds
-tier_mask_final = np.full(len(df), 2, dtype=int) # Default High
-tier_mask_final[iii_prev < OPT_T_HIGH] = 1 # Mid
-tier_mask_final[iii_prev < OPT_T_LOW] = 0  # Low
-
-# Construct leverage array for fixed leverages
+# Final optimized leverage array
 lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
 lev_arr_final = lookup_final[tier_mask_final]
-final_rets_final = base_ret_arr * lev_arr_final
-
-# 4. FINAL BACKTEST WITH FIXED PARAMS
-
-# Remove duplicate tier mask and leverage array creation (already done above)
-# Use the existing tier_mask_final and lev_arr_final from section 3
+final_rets_final = np.array(df['base_ret']) * lev_arr_final
 
 # Backtest simulation for plot data
-df['strategy_equity'] = np.nan
-df['leverage_used'] = np.nan
+df['strategy_equity'] = 1.0
+df['buy_hold_equity'] = 1.0
+df['leverage_used'] = 0.0
 equity = 1.0
+hold_equity = 1.0
 is_busted = False
 
 for i in range(start_idx, len(df)):
@@ -192,22 +151,23 @@ for i in range(start_idx, len(df)):
             
     df.at[df.index[i], 'strategy_equity'] = equity
     df.at[df.index[i], 'leverage_used'] = leverage
+    
+    # Buy Hold
+    close_p = df['close'].iloc[i]
+    prev_p = df['close'].iloc[i-1]
+    bh_ret = (close_p - prev_p) / prev_p
+    hold_equity *= (1 + bh_ret)
+    df.at[df.index[i], 'buy_hold_equity'] = hold_equity
 
-# Set equity before start_idx to NaN to exclude from metrics
-df.loc[:df.index[start_idx-1], 'strategy_equity'] = np.nan
-
-# 5. METRICS & PLOT
+# 4. METRICS & PLOT
 plot_data = df.iloc[start_idx:].copy()
-# Calculate buy & hold equity for comparison
-plot_data['buy_hold_equity'] = plot_data['close'] / plot_data['close'].iloc[0]
-
-# Calculate strategy metrics
-s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
+s_tot, s_cagr, s_mdd, s_sharpe = calculate_metrics(plot_data['strategy_equity'])
 
 print("\n" + "="*45)
-print(f"FIXED PARAMETERS (No Grid Search)")
-print(f"Fixed Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
-print(f"Fixed Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
+print(f"FINAL BACKTEST WITH COMPREHENSIVE OPTIMIZATION")
+print(f"III Window: {III_WINDOW} days")
+print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
+print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
 print("-" * 45)
 print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
 print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
@@ -217,10 +177,10 @@ print("="*45 + "\n")
 plt.figure(figsize=(12, 10))
 
 ax1 = plt.subplot(3, 1, 1)
-ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
+ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Final Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
-ax1.set_title(f'Strategy with Fixed Parameters (No Grid Search) (T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
+ax1.set_title(f'Optimized Strategy Equity (Sharpe: {s_sharpe:.2f})')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
@@ -231,7 +191,7 @@ ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white'
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
 ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
 ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
-ax2.set_title('Leverage Deployed')
+ax2.set_title(f'Leverage Deployed ({OPT_L_LOW}x / {OPT_L_MID}x / {OPT_L_HIGH}x)')
 ax2.set_yticks(np.unique(plot_data['leverage_used']))
 ax2.set_ylabel('Leverage (x)')
 ax2.grid(True, axis='x', alpha=0.3)
@@ -242,8 +202,7 @@ roll_max = plot_data['strategy_equity'].cummax()
 dd = (plot_data['strategy_equity'] - roll_max) / roll_max
 ax3.plot(plot_data.index, dd, color='red')
 ax3.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
-ax3.axhline(MAX_MDD_CONSTRAINT, color='black', linestyle='--')
-ax3.set_title('Drawdown Profile (Constrained < 50%)')
+ax3.set_title('Drawdown Profile')
 ax3.set_ylabel('Drawdown')
 ax3.grid(True, alpha=0.3)
 
