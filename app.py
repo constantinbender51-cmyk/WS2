@@ -8,11 +8,10 @@ import time
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
-MAX_SMA = 365 
-MIN_SHARPE = 1.0  # Threshold for a "winning" strategy
+MAX_SMA = 365
+MIN_SHARPE = 0.5  # Lowered to capture more strategies for the consensus
 
 def fetch_data(symbol, timeframe, start_str):
-    """Fetches full history from Binance."""
     print(f"--- Fetching {symbol} data since {start_str} ---")
     exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(start_str)
@@ -36,18 +35,55 @@ def fetch_data(symbol, timeframe, start_str):
     return df
 
 def get_sharpe(returns_array):
-    """Vectorized Sharpe calculation."""
-    # axis=0 is time
+    """Vectorized Sharpe calculation (Annualized)."""
     means = np.mean(returns_array, axis=0)
     stds = np.std(returns_array, axis=0)
-    # Avoid division by zero
     return np.divide(means, stds, out=np.zeros_like(means), where=stds!=0) * np.sqrt(365)
 
-def run_meta_optimization(df):
-    print(f"\n--- Starting Meta-Strategy Optimization (k-sweep) ---")
-    start_time = time.time()
+def diagnose_specific_pair(df, fast=40, slow=120):
+    """Deep dive into the specific strategy mentioned by the user."""
+    print(f"\n" + "="*60)
+    print(f"DIAGNOSIS: SMA {fast} vs SMA {slow}")
+    print("="*60)
     
-    # 1. Setup Data
+    prices = df['close']
+    returns = prices.pct_change().fillna(0)
+    
+    sma_f = prices.rolling(window=fast).mean()
+    sma_s = prices.rolling(window=slow).mean()
+    
+    # 1. Raw Signal (1 where Fast > Slow, else -1)
+    raw_signal = np.where(sma_f > sma_s, 1, -1)
+    
+    # 2. Shift (Trade tomorrow based on today)
+    signal = np.roll(raw_signal, 1)
+    signal[0] = 0
+    
+    # --- Mode A: Long / Short ---
+    returns_ls = signal * returns
+    sharpe_ls = (returns_ls.mean() / returns_ls.std()) * np.sqrt(365)
+    ann_ret_ls = returns_ls.mean() * 365 * 100
+    
+    # --- Mode B: Long / Flat ---
+    # Only take the long signals (where signal == 1), otherwise 0
+    signal_lo = np.where(signal == 1, 1, 0)
+    returns_lo = signal_lo * returns
+    sharpe_lo = (returns_lo.mean() / returns_lo.std()) * np.sqrt(365)
+    ann_ret_lo = returns_lo.mean() * 365 * 100
+    
+    # --- Buy & Hold ---
+    sharpe_bh = (returns.mean() / returns.std()) * np.sqrt(365)
+    
+    print(f"{'Metric':<20} {'Long/Short':<15} {'Long/Flat':<15} {'Buy & Hold':<15}")
+    print("-" * 65)
+    print(f"{'Sharpe Ratio':<20} {sharpe_ls:<15.3f} {sharpe_lo:<15.3f} {sharpe_bh:<15.3f}")
+    print(f"{'Ann. Return %':<20} {ann_ret_ls:<15.1f} {ann_ret_lo:<15.1f} {100*returns.mean()*365:<15.1f}")
+    print("="*60 + "\n")
+
+def run_meta_optimization(df):
+    print(f"--- Starting Meta-Strategy Optimization ---")
+    
+    # 1. Setup
     market_returns = df['close'].pct_change().fillna(0).to_numpy()
     close_prices = df['close'].to_numpy()
     n_days = len(market_returns)
@@ -58,159 +94,102 @@ def run_meta_optimization(df):
     for i in range(MAX_SMA):
         sma_matrix[:, i] = df['close'].rolling(window=i+1).mean().fillna(0).to_numpy()
 
-    # We will collect ALL signals here. 
-    # To save memory, we'll process in batches or just be careful with types.
-    # ~130k strategies * 2000 days * 1 byte = ~260MB. This fits in RAM easily as int8.
-    
-    print("Generating signals for all strategies...")
-    
-    # --- A. Price vs SMA Signals ---
-    # Price > SMA = 1 (Long), Price < SMA = -1 (Short)
-    # Shape: (T, 365)
-    pv_sma_raw = np.where(close_prices[:, None] > sma_matrix, 1, -1).astype(np.int8)
-    # Shift signals (Trade today based on yesterday)
-    pv_sma_signals = np.roll(pv_sma_raw, 1, axis=0)
-    pv_sma_signals[0, :] = 0
-    
-    # --- B. SMA vs SMA Signals ---
-    # We need to flatten the SMA-SMA pairs into a 2D matrix (T, N_pairs)
-    # or process them to find winners immediately. 
-    # To keep code simple and vectorizable, let's generate returns, filter, and keep only winning signals.
-    
     winning_signals_list = []
     
-    # 1. Check Price vs SMA Performance
-    print("Evaluating Price vs SMA strategies...")
-    pv_returns = pv_sma_signals * market_returns[:, None]
+    # --- A. Price vs SMA ---
+    print("Scanning Price vs SMA strategies...")
+    pv_raw = np.where(close_prices[:, None] > sma_matrix, 1, -1).astype(np.int8)
+    pv_signals = np.roll(pv_raw, 1, axis=0)
+    pv_signals[0, :] = 0
+    
+    # Check Performance (Long/Short)
+    pv_returns = pv_signals * market_returns[:, None]
     pv_sharpes = get_sharpe(pv_returns)
     
-    # Filter
-    pv_winners_mask = pv_sharpes > MIN_SHARPE
-    if np.any(pv_winners_mask):
-        print(f"  -> Found {np.sum(pv_winners_mask)} Price-SMA strategies with Sharpe > {MIN_SHARPE}")
-        winning_signals_list.append(pv_sma_signals[:, pv_winners_mask])
-    
-    # 2. Check SMA vs SMA Performance
-    print("Evaluating SMA vs SMA strategies (iterative batches)...")
-    
-    # We iterate fast_idx and compare against all slow_idx at once
-    total_sma_winners = 0
+    mask = pv_sharpes > MIN_SHARPE
+    if np.any(mask):
+        winning_signals_list.append(pv_signals[:, mask])
+        print(f"  -> Found {np.sum(mask)} Price-SMA strategies > {MIN_SHARPE} Sharpe")
+
+    # --- B. SMA vs SMA ---
+    print("Scanning SMA vs SMA strategies...")
+    count_sma_winners = 0
     
     for fast_idx in range(MAX_SMA):
-        # Broadcasting: (T, 1) vs (T, MAX_SMA) -> (T, MAX_SMA)
-        fast_sma_vec = sma_matrix[:, fast_idx][:, None]
-        
-        # Raw signals for this batch
-        batch_raw = np.where(fast_sma_vec > sma_matrix, 1, -1).astype(np.int8)
+        fast_vec = sma_matrix[:, fast_idx][:, None]
+        # Compare fast vs ALL slow
+        raw = np.where(fast_vec > sma_matrix, 1, -1).astype(np.int8)
         
         # Shift
-        batch_signals = np.roll(batch_raw, 1, axis=0)
-        batch_signals[0, :] = 0
+        sigs = np.roll(raw, 1, axis=0)
+        sigs[0, :] = 0
         
-        # Returns
-        batch_returns = batch_signals * market_returns[:, None]
+        # Perf
+        rets = sigs * market_returns[:, None]
+        sharpes = get_sharpe(rets)
         
-        # Sharpe
-        batch_sharpes = get_sharpe(batch_returns)
+        # Filter (exclude diagonal and poor performers)
+        # Note: We exclude cases where sharpes are NaN or Inf
+        valid_mask = np.isfinite(sharpes) & (sharpes > MIN_SHARPE) & (np.arange(MAX_SMA) != fast_idx)
         
-        # Filter:
-        # We must exclude the diagonal (where fast_idx == slow_idx) and likely the inverse pairs 
-        # (SMA_A vs SMA_B is inverse of SMA_B vs SMA_A).
-        # However, purely checking Sharpe > 1 handles logic automatically (inverse strat has negative Sharpe).
-        # We only need to ensure we don't compare a SMA to itself (Sharpe=0 or NaN).
-        
-        # Create mask
-        mask = batch_sharpes > MIN_SHARPE
-        
-        if np.any(mask):
-            count = np.sum(mask)
-            total_sma_winners += count
-            winning_signals_list.append(batch_signals[:, mask])
-
-    print(f"  -> Found {total_sma_winners} SMA-SMA strategies with Sharpe > {MIN_SHARPE}")
-
+        if np.any(valid_mask):
+            count_sma_winners += np.sum(valid_mask)
+            winning_signals_list.append(sigs[:, valid_mask])
+            
+    print(f"  -> Found {count_sma_winners} SMA-SMA strategies > {MIN_SHARPE} Sharpe")
+    
     if not winning_signals_list:
-        print("No strategies found with Sharpe > 1. Cannot optimize k.")
+        print("No strategies met the criteria.")
         return
 
-    # 3. Consolidate Winning Signals
-    print("Consolidating consensus matrix...")
-    # Concatenate along columns (axis 1)
-    # Result: (Time, N_Winners)
+    # 3. Consensus
     all_winners = np.hstack(winning_signals_list)
     n_winners = all_winners.shape[1]
-    print(f"Total Winning Strategies: {n_winners}")
     
-    # 4. Compute Daily Votes
-    # Count how many +1s and -1s exist per row
-    # (T,) arrays
+    # Votes
     votes_long = (all_winners == 1).sum(axis=1)
     votes_short = (all_winners == -1).sum(axis=1)
     
-    # 5. Sweep k
-    print("\n--- Optimization Results: Confirmation Entry (k% Threshold) ---")
-    print(f"{'k (Threshold)':<15} {'Sharpe':<10} {'Ann. Return %':<15} {'Trades/Year':<15}")
-    print("-" * 60)
+    print("\n--- Consensus Optimization (k-sweep) ---")
+    print(f"{'k%':<10} {'Sharpe':<10} {'Ann. Ret':<12} {'Trades':<8}")
+    print("-" * 45)
     
-    best_k = 0
     best_sharpe = -999
+    best_k = 0
     
-    # Range 0.0 to 1.0 inclusive, step 0.05
-    k_values = np.arange(0.0, 1.01, 0.05)
-    
-    for k in k_values:
-        # Determine threshold count based on k and n_winners
-        # Note: k is a percentage of TOTAL winners
-        required_votes = k * n_winners
+    for k in np.arange(0.0, 1.01, 0.05):
+        threshold = k * n_winners
         
-        # Vectorized Signal Generation
-        # Logic: 
-        # If long_votes >= threshold -> 1
-        # Elif short_votes >= threshold -> -1
-        # Else -> 0
+        final_sig = np.zeros(n_days, dtype=np.int8)
         
-        # Note: If k is low (e.g. 0.1), both conditions could be true.
-        # Standard convention: If both trigger, they cancel out or one takes precedence.
-        # We'll assume Flat if conflicted, or Long-Short cancellation. 
-        # Let's use simple logic: If Longs > Shorts and Longs > Threshold -> 1, etc.
-        # But prompt says: "If k% winners indicate long, go long."
-        # We will prioritize Long if Long threshold met, Short if Short threshold met.
-        # If both met? (Unlikely for high k, possible for low k). We'll set to 0 (conflict).
+        # If winners vote > threshold, take position
+        is_long = votes_long >= threshold
+        is_short = votes_short >= threshold
         
-        final_signal = np.zeros(n_days, dtype=np.int8)
+        final_sig[is_long] = 1
+        final_sig[is_short] = -1
+        # Conflict resolution: Flat
+        final_sig[is_long & is_short] = 0
         
-        long_cond = votes_long >= required_votes
-        short_cond = votes_short >= required_votes
+        strat_rets = final_sig * market_returns
+        s = get_sharpe(strat_rets.reshape(-1, 1))[0] # get_sharpe expects 2d usually or handles 1d?
+                                                     # Our get_sharpe does axis=0. It works on 1D too if properly shaped or not.
+                                                     # Actually get_sharpe(strat_rets) where strat_rets is 1D returns scalar.
         
-        # Apply Longs
-        final_signal[long_cond] = 1
-        # Apply Shorts (overwrite if short cond is met? Or handle conflict?)
-        # Let's handle conflict: if both are true, set to 0.
-        conflict = long_cond & short_cond
-        final_signal[short_cond] = -1
-        final_signal[conflict] = 0
+        if np.isnan(s): s = 0
         
-        # Calculate Returns
-        strat_returns = final_signal * market_returns
+        trades = np.sum(np.abs(np.diff(final_sig)))
         
-        # Metrics
-        ann_sharpe = get_sharpe(strat_returns) # Returns scalar
-        ann_return = np.mean(strat_returns) * 365 * 100
+        print(f"{k*100:3.0f}%       {s:6.3f}     {np.mean(strat_rets)*365*100:6.1f}%    {trades:4}")
         
-        # Trades per year (roughly: count changes in signal / years)
-        # Just approximate non-zero days for now or actual flips
-        # Let's just count days in market for simplicity or turnover
-        days_in_market = np.sum(final_signal != 0)
-        
-        print(f"{k*100:5.0f}%          {ann_sharpe:6.3f}     {ann_return:8.1f}%       {days_in_market:>5} days")
-        
-        if ann_sharpe > best_sharpe:
-            best_sharpe = ann_sharpe
+        if s > best_sharpe:
+            best_sharpe = s
             best_k = k
 
-    print("-" * 60)
-    print(f"Optimal k: {best_k*100:.0f}% with Sharpe: {best_sharpe:.3f}")
+    print("-" * 45)
+    print(f"Optimal Consensus k: {best_k*100:.0f}% | Sharpe: {best_sharpe:.3f}")
 
 if __name__ == '__main__':
     df = fetch_data(SYMBOL, TIMEFRAME, START_DATE)
+    diagnose_specific_pair(df, 40, 120)
     run_meta_optimization(df)
