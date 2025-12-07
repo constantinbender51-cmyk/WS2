@@ -14,7 +14,7 @@ FEES_PCT = 0.0006  # 0.06% est. taker fee per trade (entry + exit)
 # Strategy Parameters
 SMA_PERIOD_1 = 40
 SMA_PERIOD_2 = 120
-BAND_WIDTH = 0.05
+BAND_WIDTH = 0.0
 STATIC_STOP_PCT = 0.02
 TAKE_PROFIT_PCT = 0.16
 III_WINDOW = 35
