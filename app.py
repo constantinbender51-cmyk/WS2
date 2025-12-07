@@ -2,8 +2,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from dash import Dash, dcc, html
-from plotly.subplots import make_subplots
+from dash import Dash, dcc, html, Input, Output, callback
 import time
 
 # --- Configuration ---
@@ -11,8 +10,7 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 MAX_SMA = 365
-TOP_N_SURVIVORS = 40 # Keep top 40 candidates per level to breed next level
-RISK_FREE_RATE = 0.0
+PORT = 8080
 
 def fetch_data(symbol, timeframe, start_str):
     print(f"--- Fetching {symbol} data since {start_str} ---")
@@ -37,252 +35,204 @@ def fetch_data(symbol, timeframe, start_str):
     print(f"Data loaded: {len(df)} candles.")
     return df
 
-def get_sharpe_vectorized(returns_matrix):
-    """Calculates Annualized Sharpe Ratio for a matrix of returns."""
-    means = np.mean(returns_matrix, axis=0)
-    stds = np.std(returns_matrix, axis=0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        sharpes = np.divide(means, stds) * np.sqrt(365)
-    sharpes[np.isnan(sharpes)] = 0
-    return sharpes
-
-def run_greedy_optimization(df):
+def calculate_heatmap_matrix(df):
     """
-    Performs greedy forward selection to find best SMA combinations.
-    Logic: Long if Price > ALL SMAs, Short if Price < ALL SMAs.
-    Returns: DataFrame with consensus score and metadata.
+    Computes Sharpe Ratio for ALL pairs of SMAs (SMA_i AND SMA_j).
+    Returns a symmetric matrix (MAX_SMA, MAX_SMA).
     """
-    print("--- Starting Greedy Optimization ---")
-    start_time = time.time()
+    print("Computing Heatmap Matrix (this may take 10-20 seconds)...")
+    start_t = time.time()
     
     prices = df['close'].to_numpy()
+    # Market returns (T,)
     market_returns = df['close'].pct_change().fillna(0).to_numpy()
     n_days = len(prices)
     
-    # 1. Pre-calculate all Boolean conditions (Price > SMA)
-    # Shape: (T, MAX_SMA)
-    print("Pre-calculating SMA matrix...")
-    sma_conds_long = np.zeros((n_days, MAX_SMA), dtype=bool)
-    sma_conds_short = np.zeros((n_days, MAX_SMA), dtype=bool)
+    # 1. Pre-calculate SMA Booleans: (T, MAX_SMA)
+    # col 0 -> SMA 1, col 1 -> SMA 2...
+    sma_long = np.zeros((n_days, MAX_SMA), dtype=bool)
+    sma_short = np.zeros((n_days, MAX_SMA), dtype=bool)
     
     for i in range(MAX_SMA):
-        sma = df['close'].rolling(window=i+1).mean().fillna(0).to_numpy()
-        sma_conds_long[:, i] = prices > sma
-        sma_conds_short[:, i] = prices < sma
+        sma_val = df['close'].rolling(window=i+1).mean().fillna(0).to_numpy()
+        sma_long[:, i] = prices > sma_val
+        sma_short[:, i] = prices < sma_val
 
-    # Master list to store all valid strategies found across all levels
-    # List of dicts: {'indices': [1, 50], 'sharpe': 1.2, 'level': 2}
-    master_strategy_list = []
-
-    # --- LEVEL 1: Single SMAs ---
-    print("Scanning Level 1 (Single SMAs)...")
-    # 1 if Long, -1 if Short, 0 else
-    l1_sigs = sma_conds_long.astype(np.int8) - sma_conds_short.astype(np.int8)
-    l1_sigs = np.roll(l1_sigs, 1, axis=0) # Shift 1 day
-    l1_sigs[0, :] = 0
+    # 2. Compute Matrix
+    # We want a matrix `sharpe_matrix` where [i, j] is Sharpe of SMA(i+1) & SMA(j+1)
+    sharpe_matrix = np.zeros((MAX_SMA, MAX_SMA))
     
-    l1_rets = l1_sigs * market_returns[:, None]
-    l1_sharpes = get_sharpe_vectorized(l1_rets)
-    
-    level_results = []
+    # Optimization: Iterate outer loop i, vectorize inner loop j
     for i in range(MAX_SMA):
-        if l1_sharpes[i] > 0:
-            level_results.append({'indices': [i], 'sharpe': l1_sharpes[i], 'level': 1})
-            
-    level_results.sort(key=lambda x: x['sharpe'], reverse=True)
-    master_strategy_list.extend(level_results[:50]) # Add best singles to master list
-    
-    # Survivors continue to breed in Level 2
-    current_survivors = level_results[:TOP_N_SURVIVORS]
-    
-    # --- LEVEL 2 to 5: Greedy Additions ---
-    for level in range(2, 6):
-        print(f"Scanning Level {level} (adding confirmation)...")
-        next_gen = []
+        # Base vector for SMA i
+        base_l = sma_long[:, i][:, None] # (T, 1)
+        base_s = sma_short[:, i][:, None] # (T, 1)
         
-        for survivor in current_survivors:
-            base_indices = survivor['indices']
-            
-            # Construct Base Condition (AND logic)
-            # Start true, AND with every SMA in the set
-            base_L = np.ones(n_days, dtype=bool)
-            base_S = np.ones(n_days, dtype=bool)
-            for idx in base_indices:
-                base_L &= sma_conds_long[:, idx]
-                base_S &= sma_conds_short[:, idx]
-            
-            # Vectorized test adding one more SMA
-            # Combined = Base AND New_Column
-            combined_L = base_L[:, None] & sma_conds_long
-            combined_S = base_S[:, None] & sma_conds_short
-            
-            sigs = combined_L.astype(np.int8) - combined_S.astype(np.int8)
-            sigs = np.roll(sigs, 1, axis=0)
-            sigs[0, :] = 0
-            
-            rets = sigs * market_returns[:, None]
-            sharpes = get_sharpe_vectorized(rets)
-            
-            # Collect results
-            # We only look at indices > max(base_indices) to avoid permutations/duplicates 
-            # (e.g., [10, 20] is same as [20, 10])
-            start_search = max(base_indices) + 1
-            if start_search < MAX_SMA:
-                for k in range(start_search, MAX_SMA):
-                    # Only add if Sharpe improves or is high enough
-                    if sharpes[k] > 0.5: 
-                        new_idx = base_indices + [k]
-                        next_gen.append({'indices': new_idx, 'sharpe': sharpes[k], 'level': level})
+        # Combine with ALL columns j
+        # (T, 1) & (T, MAX_SMA) -> (T, MAX_SMA)
+        comb_l = base_l & sma_long
+        comb_s = base_s & sma_short
         
-        # Sort and Keep Best
-        next_gen.sort(key=lambda x: x['sharpe'], reverse=True)
+        # Signal: 1 if Long, -1 if Short, 0 else
+        sigs = comb_l.astype(np.int8) - comb_s.astype(np.int8)
         
-        # Deduplicate (just in case logic above missed something)
-        unique_next = []
-        seen = set()
-        for item in next_gen:
-            t = tuple(sorted(item['indices']))
-            if t not in seen:
-                seen.add(t)
-                unique_next.append(item)
+        # Shift signals forward 1 day (trade tomorrow based on today)
+        sigs = np.roll(sigs, 1, axis=0)
+        sigs[0, :] = 0
         
-        # Add to master list and set survivors
-        master_strategy_list.extend(unique_next[:50])
-        current_survivors = unique_next[:TOP_N_SURVIVORS]
-
-    # --- SELECT TOP 25 OVERALL ---
-    print("Selecting Top 25 Strategies from all levels...")
-    # Sort master list by Sharpe
-    master_strategy_list.sort(key=lambda x: x['sharpe'], reverse=True)
-    
-    # Ensure uniqueness (strategies might appear in multiple levels if we aren't careful, 
-    # though strict > logic usually prevents it. Just being safe.)
-    final_top_25 = []
-    seen_sets = set()
-    for strat in master_strategy_list:
-        k = tuple(sorted(strat['indices']))
-        if k not in seen_sets:
-            seen_sets.add(k)
-            final_top_25.append(strat)
-        if len(final_top_25) >= 25:
-            break
-            
-    print(f"Total Unique Strategies selected: {len(final_top_25)}")
-    if len(final_top_25) < 25:
-        print("WARNING: Fewer than 25 strategies found. Consensus will be based on available strategies.")
-
-    # --- CALCULATE CONSENSUS SCORE ---
-    print("Calculating Consensus Score...")
-    consensus_sum = np.zeros(n_days)
-    
-    for strat in final_top_25:
-        indices = strat['indices']
+        # Returns: (T, MAX_SMA)
+        strat_rets = sigs * market_returns[:, None]
         
-        # Rebuild signal
-        is_long = np.ones(n_days, dtype=bool)
-        is_short = np.ones(n_days, dtype=bool)
+        # Vectorized Sharpe
+        means = np.mean(strat_rets, axis=0)
+        stds = np.std(strat_rets, axis=0)
         
-        for idx in indices:
-            is_long &= sma_conds_long[:, idx]
-            is_short &= sma_conds_short[:, idx]
-            
-        sig = is_long.astype(np.int8) - is_short.astype(np.int8)
-        # Shift (Trade tomorrow)
-        sig = np.roll(sig, 1)
-        sig[0] = 0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_sharpes = np.divide(means, stds) * np.sqrt(365)
         
-        consensus_sum += sig
+        row_sharpes[np.isnan(row_sharpes)] = 0
+        sharpe_matrix[i, :] = row_sharpes
         
-    # Scale: Divide by 5 to fit 0-5 range (technically -5 to +5)
-    # Logic: 25 max votes / 5 = 5.0 max score
-    df['consensus_raw'] = consensus_sum
-    df['consensus_score'] = consensus_sum / 5.0
+    print(f"Heatmap computed in {time.time() - start_t:.2f}s")
+    return sharpe_matrix
+
+# --- GLOBAL DATA ---
+# We load this once on startup
+df_global = fetch_data(SYMBOL, TIMEFRAME, START_DATE)
+sharpe_matrix_global = calculate_heatmap_matrix(df_global)
+
+# Find Global Max for default view
+max_idx = np.unravel_index(np.argmax(sharpe_matrix_global), sharpe_matrix_global.shape)
+best_sma1, best_sma2 = max_idx[0] + 1, max_idx[1] + 1
+best_sharpe = sharpe_matrix_global[max_idx]
+
+# --- APP SETUP ---
+app = Dash(__name__)
+
+app.layout = html.Div([
+    html.Div([
+        html.H2("BTC/USDT Strategy Clusters", style={'color': 'white', 'margin': '0'}),
+        html.P("Logic: Long if Price > SMA_A & SMA_B. Short if Price < SMA_A & SMA_B. (Double Confirmation)", style={'color': '#888'})
+    ], style={'padding': '20px', 'backgroundColor': '#1e1e1e'}),
     
-    print(f"Optimization finished in {time.time() - start_time:.2f}s")
-    return df, final_top_25
-
-def create_figure(df):
-    # Create subplots: Price on top, Consensus on bottom
-    fig = make_subplots(
-        rows=2, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.03,
-        row_heights=[0.7, 0.3],
-        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
-    )
-
-    # --- Top Panel: Price ---
-    # Candlestick (simplified to line for speed if dense, but user likes details)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['close'],
-        name='BTC Price',
-        line=dict(color='white', width=1)
-    ), row=1, col=1, secondary_y=False)
-
-    # --- Bottom Panel: Consensus Score ---
-    # We color the area: Green if > 0, Red if < 0
-    
-    # Split into positive and negative for coloring
-    pos_score = df['consensus_score'].clip(lower=0)
-    neg_score = df['consensus_score'].clip(upper=0)
-
-    fig.add_trace(go.Scatter(
-        x=df.index, y=pos_score,
-        name='Consensus (Long)',
-        fill='tozeroy',
-        mode='none',
-        fillcolor='rgba(0, 255, 100, 0.5)'
-    ), row=2, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df.index, y=neg_score,
-        name='Consensus (Short)',
-        fill='tozeroy',
-        mode='none',
-        fillcolor='rgba(255, 50, 50, 0.5)'
-    ), row=2, col=1)
-
-    # Add a horizontal line at 0
-    fig.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
-
-    # Layout
-    fig.update_layout(
-        title='Bitcoin Price vs. SMA Consensus Score (Top 25 Strategies)',
-        template='plotly_dark',
-        height=800,
-        hovermode='x unified',
-        showlegend=False
-    )
-    
-    fig.update_yaxes(title_text="Price (USDT)", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Consensus (-5 to +5)", row=2, col=1, range=[-5.5, 5.5])
-
-    return fig
-
-# --- Main ---
-if __name__ == '__main__':
-    # 1. Fetch
-    df = fetch_data(SYMBOL, TIMEFRAME, START_DATE)
-    
-    # 2. Optimize & Calc
-    df, top_strats = run_greedy_optimization(df)
-    
-    # 3. Server
-    app = Dash(__name__)
-    
-    app.layout = html.Div([
-        dcc.Graph(figure=create_figure(df), style={'height': '95vh'}),
-        
-        # Display Info
+    html.Div([
+        # --- LEFT: HEATMAP ---
         html.Div([
-            html.H3(f"Consensus based on {len(top_strats)} Best Strategies", style={'color': 'white'}),
-            html.H4("Top 5 Contributing Strategies:", style={'color': '#888'}),
-            html.Ul([
-                html.Li(f"Level {s['level']} | SMAs: {[x+1 for x in s['indices']]} | Sharpe: {s['sharpe']:.3f}") 
-                for s in top_strats[:5]
-            ], style={'color': '#aaa'})
-        ], style={'padding': '20px'})
-    ], style={'backgroundColor': '#111', 'margin': '-8px'})
+            dcc.Graph(id='heatmap-graph', style={'height': '80vh'})
+        ], style={'width': '55%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+        
+        # --- RIGHT: SELECTED STRATEGY ---
+        html.Div([
+            html.Div(id='stats-panel', style={'padding': '20px', 'color': 'white'}),
+            dcc.Graph(id='equity-graph', style={'height': '60vh'})
+        ], style={'width': '44%', 'display': 'inline-block', 'verticalAlign': 'top', 'paddingLeft': '1%'})
+    ], style={'display': 'flex'})
     
+], style={'backgroundColor': '#111', 'minHeight': '100vh', 'margin': '-8px'})
+
+@callback(
+    [Output('heatmap-graph', 'figure'),
+     Output('equity-graph', 'figure'),
+     Output('stats-panel', 'children')],
+    [Input('heatmap-graph', 'clickData')]
+)
+def update_view(clickData):
+    # 1. Determine Selected SMAs
+    if clickData:
+        # Plotly heatmap x/y are 0-indexed or 1-indexed depending on axis setup
+        # We set axis explicitly below, so x=SMA1, y=SMA2
+        p1 = clickData['points'][0]['x']
+        p2 = clickData['points'][0]['y']
+        sma1, sma2 = int(p1), int(p2)
+    else:
+        # Default to global max
+        sma1, sma2 = best_sma1, best_sma2
+
+    # --- 2. Generate Heatmap (Only done once technically, but Dash statelessness) ---
+    # To optimize, we could store figure, but generating just the trace is fast enough.
+    
+    hm_fig = go.Figure(data=go.Heatmap(
+        z=sharpe_matrix_global,
+        x=list(range(1, MAX_SMA + 1)),
+        y=list(range(1, MAX_SMA + 1)),
+        colorscale='Viridis',
+        colorbar=dict(title='Sharpe'),
+        hovertemplate='SMA %{x} & SMA %{y}<br>Sharpe: %{z:.3f}<extra></extra>'
+    ))
+    
+    # Highlight selection
+    hm_fig.add_trace(go.Scatter(
+        x=[sma1], y=[sma2],
+        mode='markers',
+        marker=dict(color='red', size=12, line=dict(color='white', width=2)),
+        name='Selected'
+    ))
+
+    hm_fig.update_layout(
+        title='Sharpe Ratio Heatmap (All Combinations)',
+        template='plotly_dark',
+        xaxis_title='SMA 1 Period',
+        yaxis_title='SMA 2 Period',
+        margin=dict(l=50, r=50, t=50, b=50)
+    )
+
+    # --- 3. Backtest Selected Strategy ---
+    prices = df_global['close']
+    returns = df_global['close'].pct_change().fillna(0)
+    
+    s_val1 = prices.rolling(sma1).mean()
+    s_val2 = prices.rolling(sma2).mean()
+    
+    # Logic: Confirmation
+    cond_long = (prices > s_val1) & (prices > s_val2)
+    cond_short = (prices < s_val1) & (prices < s_val2)
+    
+    sig = cond_long.astype(int) - cond_short.astype(int)
+    sig = sig.shift(1).fillna(0) # Trade tomorrow
+    
+    strat_rets = sig * returns
+    cum_equity = (1 + strat_rets).cumprod()
+    
+    # Metrics
+    ann_sharpe = (strat_rets.mean() / strat_rets.std()) * np.sqrt(365) if strat_rets.std() > 0 else 0
+    total_ret = (cum_equity.iloc[-1] - 1) * 100
+    trades = (sig.diff().abs() > 0).sum()
+    
+    # --- 4. Equity Curve Figure ---
+    eq_fig = go.Figure()
+    eq_fig.add_trace(go.Scatter(x=df_global.index, y=cum_equity, mode='lines', name='Strategy', line=dict(color='#00d4ff')))
+    eq_fig.add_trace(go.Scatter(x=df_global.index, y=df_global['close']/df_global['close'].iloc[0], 
+                                mode='lines', name='Buy & Hold (Norm)', line=dict(color='gray', dash='dot')))
+    
+    eq_fig.update_layout(
+        title=f'Performance: SMA {sma1} & SMA {sma2}',
+        template='plotly_dark',
+        yaxis_title='Growth (1.0 = Initial)',
+        yaxis_type='log',
+        margin=dict(l=50, r=50, t=50, b=50)
+    )
+    
+    # --- 5. Stats Panel ---
+    stats_html = [
+        html.H3(f"Selected: SMA {sma1} + SMA {sma2}"),
+        html.Div([
+            html.Span("Sharpe Ratio: ", style={'color': '#888'}),
+            html.Span(f"{ann_sharpe:.3f}", style={'fontWeight': 'bold', 'color': '#00ff00' if ann_sharpe > 1 else 'white'}),
+        ]),
+        html.Div([
+            html.Span("Total Return: ", style={'color': '#888'}),
+            html.Span(f"{total_ret:,.0f}%", style={'fontWeight': 'bold'}),
+        ]),
+        html.Div([
+            html.Span("Est. Trades: ", style={'color': '#888'}),
+            html.Span(f"{trades}", style={'fontWeight': 'bold'}),
+        ]),
+        html.Hr(style={'borderColor': '#333'}),
+        html.P("Click any point on the heatmap to analyze that pair.", style={'fontSize': '0.9em', 'color': '#666'})
+    ]
+
+    return hm_fig, eq_fig, stats_html
+
+if __name__ == '__main__':
     print("Starting server on port 8080...")
     app.run(debug=False, port=8080, host='0.0.0.0')
