@@ -27,8 +27,8 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA (Shifted 60 Right)</h1>
-        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices and the noisy SMA shifted 60 periods right to overlap with close price swings.</p>
+        <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA (Shifted 120 Left)</h1>
+        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices and the noisy SMA shifted 120 periods left (absolute shift -60 relative to original SMA).</p>
         <img src="data:image/png;base64,{{ plot_data }}" alt="OHLCV with Noisy SMA Plot">
         <p>Generated at: {{ timestamp }}</p>
     </div>
@@ -124,8 +124,8 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
         # Add noise to SMA (not multiply)
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
         
-        # Shift noisy SMA 60 periods to the right to overlap with close price swings
-        df['noisy_sma_shifted'] = df['noisy_sma'].shift(60)
+        # Shift noisy SMA 120 periods to the left to be shifted -60 absolute to original SMA
+        df['noisy_sma_shifted'] = df['noisy_sma'].shift(-120)
     else:
         df['noisy_sma'] = np.nan
         df['noisy_sma_shifted'] = np.nan
@@ -150,10 +150,10 @@ def create_plot(df):
     
     # Plot shifted noisy SMA if available
     if 'noisy_sma_shifted' in df.columns and not df['noisy_sma_shifted'].isna().all():
-        plt.plot(df.index, df['noisy_sma_shifted'], label='Noisy SMA (shifted 60 right)', 
+        plt.plot(df.index, df['noisy_sma_shifted'], label='Noisy SMA (shifted 120 left)', 
                 color='green', linewidth=2, alpha=0.8)
     
-    plt.title('Binance BTC/USDT - Close Price with Noisy 120-period SMA (Shifted 60 Right)')
+    plt.title('Binance BTC/USDT - Close Price with Noisy 120-period SMA (Shifted 120 Left)')
     plt.xlabel('Date')
     plt.ylabel('Price (USDT)')
     plt.legend()
