@@ -122,17 +122,21 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         # Calculate derivative of SMA using gradient
         sma_derivative = np.gradient(sma_values.values)
         
+        # Calculate net distance traveled (cumulative sum of absolute derivatives)
+        # This represents the total movement of the SMA
+        net_distance_traveled = np.cumsum(np.abs(sma_derivative))
+        
+        # Use the net distance traveled as the base for noise magnitude
+        # Scale by noise_level to control the noise intensity
+        noise_magnitude = net_distance_traveled * noise_level
+        
+        # Create noise array based on the net distance traveled
+        noise = np.random.normal(0, noise_magnitude, len(sma_values))
+        
         # Identify points where the slope is horizontal (derivative close to 0)
         # Use a threshold relative to the SMA value at each point
         horizontal_threshold = 0.001 * sma_values.values
         horizontal_mask = np.abs(sma_derivative) < horizontal_threshold
-        
-        # Create noise array with significant magnitude
-        # Use a fixed base magnitude of 1000 and multiply by 1000000 to make noise clearly visible
-        noise_magnitude = 1000 * 1000000
-        
-        # Create noise array
-        noise = np.random.normal(0, noise_level * noise_magnitude, len(sma_values))
         
         # Apply noise only where slope is horizontal
         # Create a mask for non-horizontal points and set their noise to 0
