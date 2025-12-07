@@ -277,7 +277,7 @@ for (name, params), color in zip(scenarios.items(), colors):
         curr_eq *= (1 + daily_ret * lev_arr[i])
         eq.append(curr_eq)
         
-    plt.plot(df.index[start_idx_max-len(eq):], eq, label=name, color=color, linewidth=2 if "BASELINE" in name else 1)
+    plt.plot(df.index[start_idx_max:], eq[start_idx_max:], label=name, color=color, linewidth=2 if "BASELINE" in name else 1)
 
 plt.yscale('log')
 plt.title('Robustness Check: SMA & Threshold Sensitivity')
