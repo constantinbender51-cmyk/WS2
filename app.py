@@ -67,9 +67,9 @@ def prepare_data(df):
     # Calculate the 150-day SMA
     df['sma_150'] = df['close'].rolling(window=SMA_PERIOD).mean()
     
-    # Calculate Log Returns of Price (Feature)
-    # log_ret_t = ln(Price_t / Price_{t-1})
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    # Calculate Log Returns of 150-day SMA (Feature)
+    # log_ret_t = ln(SMA_t / SMA_{t-1})
+    df['log_ret'] = np.log(df['sma_150'] / df['sma_150'].shift(1))
     
     # Create the Target: 
     # The goal is to predict the SMA 150 days in the future.
@@ -204,7 +204,7 @@ def home():
         <body>
             <div class="container">
                 <h1>LSTM Regressor: BTC/USDT</h1>
-                <p>Target: 150-day SMA (150 days in the future) | Inputs: 60-day Log Returns</p>
+                <p>Target: 150-day SMA (150 days in the future) | Inputs: 60-day SMA Log Returns</p>
                 <img src="/plot.png" alt="Prediction Plot">
                 <p><i>Predictions show the model's estimate of the SMA 150 days relative to the date on the X-axis.</i></p>
             </div>
