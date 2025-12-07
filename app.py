@@ -148,7 +148,9 @@ def get_final_metrics(equity_series):
     else:
         sharpe = 0
     
-    return total_return, cagr, max_dd, sharpedef calculate_sharpe_mdd(returns):
+    return total_return, cagr, max_dd, sharpe
+
+def calculate_sharpe_mdd(returns):
     cum_ret = np.cumprod(1 + returns)
     if cum_ret.size == 0 or cum_ret.iloc[0] == 0: return 0, 0
     
