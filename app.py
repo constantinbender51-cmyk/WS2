@@ -167,11 +167,9 @@ def run_greedy_optimization(df):
         if len(final_top_25) >= 25:
             break
             
-    # Print Top 5 for debug
-    print("Top 5 Strategies:")
-    for i, s in enumerate(final_top_25[:5]):
-        smas = [str(x+1) for x in s['indices']]
-        print(f"{i+1}. Sharpe {s['sharpe']:.2f} | SMAs: {smas}")
+    print(f"Total Unique Strategies selected: {len(final_top_25)}")
+    if len(final_top_25) < 25:
+        print("WARNING: Fewer than 25 strategies found. Consensus will be based on available strategies.")
 
     # --- CALCULATE CONSENSUS SCORE ---
     print("Calculating Consensus Score...")
@@ -196,6 +194,7 @@ def run_greedy_optimization(df):
         consensus_sum += sig
         
     # Scale: Divide by 5 to fit 0-5 range (technically -5 to +5)
+    # Logic: 25 max votes / 5 = 5.0 max score
     df['consensus_raw'] = consensus_sum
     df['consensus_score'] = consensus_sum / 5.0
     
@@ -274,9 +273,10 @@ if __name__ == '__main__':
     app.layout = html.Div([
         dcc.Graph(figure=create_figure(df), style={'height': '95vh'}),
         
-        # Display Top 5 Strats text
+        # Display Info
         html.Div([
-            html.H4("Top 5 Component Strategies:", style={'color': '#888'}),
+            html.H3(f"Consensus based on {len(top_strats)} Best Strategies", style={'color': 'white'}),
+            html.H4("Top 5 Contributing Strategies:", style={'color': '#888'}),
             html.Ul([
                 html.Li(f"Level {s['level']} | SMAs: {[x+1 for x in s['indices']]} | Sharpe: {s['sharpe']:.3f}") 
                 for s in top_strats[:5]
