@@ -13,8 +13,8 @@ timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
 # Strategy Params
-SMA_FAST = 57
-SMA_SLOW = 128
+SMA_FAST = 40
+SMA_SLOW = 120
 SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 35 
