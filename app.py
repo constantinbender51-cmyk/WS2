@@ -53,17 +53,32 @@ def fetch_binance_history(symbol, start_str):
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv: break
+            if not ohlcv:
+                print('No more data to fetch.')
+                break
             all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            if since > exchange.milliseconds(): break
+            since = ohlcv[-1][0] + 1 # Move 'since' to the end of the fetched candle
+            # Optional: Add a small delay to avoid hitting rate limits too quickly
+            # time.sleep(0.1) 
+        except ccxt.NetworkError as e:
+            print(f"Network error: {e}. Retrying...")
+            # Implement retry logic here if desired
+            break # Or continue, depending on desired behavior
+        except ccxt.ExchangeError as e:
+            print(f"Exchange error: {e}. Stopping.")
+            break
         except Exception as e:
-            print(f"Error fetching: {e}")
+            print(f"An unexpected error occurred: {e}. Stopping.")
+            break
+        # Check if we've fetched up to the current time or a reasonable limit
+        if since >= exchange.milliseconds():
+            print('Reached current time, stopping fetch.')
             break
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df[~df.index.duplicated(keep='first')]
     return df
 
 # Metrics
