@@ -115,13 +115,44 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
     # Compute SMA
     df['sma'] = df['close'].rolling(window=window).mean()
     
-    # Add Gaussian noise to SMA
+    # Add noise to SMA
     # Only add noise where SMA is not NaN
     sma_values = df['sma'].dropna()
     if len(sma_values) > 0:
-        # Create noise as absolute value based on SMA magnitude
-        noise = np.random.normal(0, noise_level * sma_values.mean(), len(sma_values))
-        # Add noise to SMA (not multiply)
+        # Calculate derivative of SMA using gradient
+        sma_derivative = np.gradient(sma_values.values)
+        
+        # Identify SMA values close to zero (within 5% of mean absolute value)
+        sma_mean_abs = np.abs(sma_values).mean()
+        zero_threshold = 0.05 * sma_mean_abs
+        near_zero_mask = np.abs(sma_values.values) < zero_threshold
+        
+        # Create noise array
+        noise = np.zeros(len(sma_values))
+        
+        # For points near zero, use noise proportional to derivative magnitude
+        if np.any(near_zero_mask):
+            derivative_magnitude = np.abs(sma_derivative[near_zero_mask])
+            if len(derivative_magnitude) > 0:
+                # Scale derivative-based noise by noise_level
+                derivative_noise = np.random.normal(
+                    0, 
+                    noise_level * derivative_magnitude.mean(), 
+                    len(derivative_magnitude)
+                )
+                noise[near_zero_mask] = derivative_noise
+        
+        # For other points, use standard Gaussian noise based on SMA magnitude
+        other_mask = ~near_zero_mask
+        if np.any(other_mask):
+            standard_noise = np.random.normal(
+                0, 
+                noise_level * sma_values.mean(), 
+                np.sum(other_mask)
+            )
+            noise[other_mask] = standard_noise
+        
+        # Add noise to SMA
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
         
         # Shift noisy SMA 60 periods to the left
