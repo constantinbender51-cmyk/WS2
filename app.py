@@ -115,7 +115,7 @@ base_ret_arr = np.array(base_returns)
 iii_prev = df['iii'].shift(1).fillna(0).values
 
 best_sharpe = -999
-best_combo = (0.13, 0.18, 0.5, 4.5, 2.45) # T_Low, T_High, L_Low, L_Mid, L_High
+best_combo = None
 best_mdd = 0
 
 # Metrics function optimized for arrays
@@ -151,16 +151,20 @@ def get_final_metrics(equity_series):
     return total_return, cagr, max_dd, sharpe
 
 def calculate_sharpe_mdd(returns):
-    cum_ret = np.cumprod(1 + returns)
-    if cum_ret.size == 0 or cum_ret.iloc[0] == 0: return 0, 0
+    if len(returns) == 0:
+        return 0, 0
+    returns_series = pd.Series(returns)
+    cum_ret = (1 + returns_series).cumprod()
+    if cum_ret.iloc[0] == 0:
+        return 0, 0
     
     # Sharpe
-    mean_ret = np.mean(returns)
-    std_ret = np.std(returns)
+    mean_ret = returns_series.mean()
+    std_ret = returns_series.std()
     sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
     
     # MDD
-    roll_max = np.maximum.accumulate(cum_ret)
+    roll_max = cum_ret.cummax()
     drawdown = (cum_ret - roll_max) / roll_max
     max_dd = drawdown.min()
     
@@ -191,10 +195,10 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
         final_rets = base_ret_arr * lev_arr
         
         # Calculate Sharpe and MDD (Only analyze period where strategy is active)
-        sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
+        sharpe, mdd = calculate_sharpe_mdd(final_rets[start_idx:])
         
         # Check against MDD constraint
-        if mdd > MAX_MDD_CONSTRAINT: 
+        if mdd <= MAX_MDD_CONSTRAINT: 
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2))
@@ -203,6 +207,10 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
 
 # 4. FINAL BACKTEST WITH FIXED PARAMS
 # Use the best combination from grid search
+if best_combo is None:
+    # Fallback to default values if no valid combination found
+    best_combo = (0.13, 0.18, 0.5, 4.5, 2.45)
+    print("Warning: No valid combination found in grid search, using default parameters.")
 OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
 
 # Create tier mask for best thresholds
