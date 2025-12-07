@@ -100,7 +100,7 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
 
 def compute_sma_with_noise(df, window=120, noise_level=0.1):
     """
-    Compute SMA and add noise to it.
+    Compute SMA and add static noise to it.
     
     Args:
         df: DataFrame with 'close' column
@@ -115,33 +115,14 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
     # Compute SMA
     df['sma'] = df['close'].rolling(window=window).mean()
     
-    # Add noise to SMA
+    # Add static noise to SMA
     # Only add noise where SMA is not NaN
     sma_values = df['sma'].dropna()
     if len(sma_values) > 0:
-        # Calculate derivative of SMA using gradient
-        sma_derivative = np.gradient(sma_values.values)
+        # Create static noise with fixed standard deviation
+        noise = np.random.normal(0, noise_level * 100, len(sma_values))
         
-        # Calculate absolute distance traveled using a 30-day rolling window
-        # Create a rolling window of 30 periods for cumulative sum of absolute derivatives
-        abs_derivatives = np.abs(sma_derivative)
-        
-        # Initialize absolute_distance_traveled array
-        absolute_distance_traveled = np.zeros_like(sma_derivative)
-        
-        # Calculate rolling cumulative sum for 30-day window
-        for i in range(len(abs_derivatives)):
-            start_idx = max(0, i - 29)  # 30-day window (inclusive of current point)
-            absolute_distance_traveled[i] = np.sum(abs_derivatives[start_idx:i+1])
-        
-        # Use the natural logarithm of SMA value as the base for noise magnitude
-        # Higher SMA values result in more noise, but logarithmically scaled
-        noise_magnitude = np.log1p(sma_values.values) * noise_level * 100
-        
-        # Create noise array based on the log of SMA value
-        noise = np.random.normal(0, noise_magnitude, len(sma_values))
-        
-        # Add noise to SMA (no longer dependent on distance traveled)
+        # Add noise to SMA
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
         
         # Shift noisy SMA 60 periods to the left
