@@ -4,202 +4,231 @@ import numpy as np
 import matplotlib.pyplot as plt
 from flask import Flask, send_file
 import os
-import io
+import itertools
 
-# 1. CONFIGURATION
-symbol = 'BTC/USDT'
-timeframe = '1d'
-start_date_str = '2018-01-01 00:00:00'
+# --- CONFIGURATION ---
+SYMBOL = 'BTC/USDT'
+START_DATE = '2017-01-01 00:00:00' # Need early data for training 2018
+TIMEFRAME = '1d'
 
-# Fixed Strategy Params
-SMA_FAST = 40
-SMA_SLOW = 120
-SL_PCT = 0.02
-TP_PCT = 0.16
-III_WINDOW = 35 
+# --- OPTIMIZATION GRID (The "Search Space") ---
+# We will search ALL these combinations every single year.
+GRID_SMA_FAST = [30, 35, 40, 45, 50]
+GRID_SMA_SLOW = [105, 110, 115, 120, 125, 130]
+GRID_III_WINDOW = [14, 35]
 
-# The "Center" of our search (Your current best params)
-CENTER_LOW = 0.13
-CENTER_HIGH = 0.18
+# Leverage Profiles (The "Modes" the algo can switch between)
+LEVERAGE_PROFILES = [
+    # Label: (Low_Lev, Mid_Lev, High_Lev)
+    {'name': 'Aggressive (Original)', 'vals': [0.5, 4.5, 2.45]}, 
+    {'name': 'Defensive (User Idea)', 'vals': [0.0, 1.75, 1.0]},
+    {'name': 'Balanced',              'vals': [0.25, 3.0, 1.5]} 
+]
 
-# The Leverages to test (Fixed based on your configuration)
-# Zone 0 (III < Low): Noise -> 0.5x
-# Zone 1 (Low < III < High): "Wall of Worry" -> 4.5x
-# Zone 2 (III > High): "Euphoria/Knife" -> 2.45x
-LEV_LOW = 0.5
-LEV_MID = 4.5
-LEV_HIGH = 2.45
+# Threshold Profiles (Low, High)
+THRESHOLD_PROFILES = [
+    (0.13, 0.18), # Original
+    (0.10, 0.20), # Wide
+    (0.15, 0.25)  # High Shift
+]
 
-# Grid Settings
-GRID_STEPS = 10  # How many steps in each direction
-GRID_STEP_SIZE = 0.01
-
-def fetch_binance_history(symbol, start_str):
-    print(f"Fetching data for {symbol} starting from {start_str}...")
+def fetch_data():
+    print(f"Fetching {SYMBOL}...")
     exchange = ccxt.binance()
-    since = exchange.parse8601(start_str)
+    since = exchange.parse8601(START_DATE)
     all_ohlcv = []
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since, limit=1000)
             if not ohlcv: break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
             if since > exchange.milliseconds(): break
-        except Exception as e:
-            print(f"Error fetching: {e}")
-            break
+        except: break
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# 2. DATA PREP
-df = fetch_binance_history(symbol, start_date_str)
-
-# Calculate III
-df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
-df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
-epsilon = 1e-8
-df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
-
-# Indicators
-df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
-df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
-
-# Pre-calculate Base Returns (1x)
-print("Pre-calculating base strategy returns...")
-base_returns = []
-start_idx = max(SMA_SLOW, III_WINDOW)
-
-for i in range(len(df)):
-    if i < start_idx:
-        base_returns.append(0.0)
-        continue
-    
-    prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
-    
-    open_p = df['open'].iloc[i]
-    high_p = df['high'].iloc[i]
-    low_p = df['low'].iloc[i]
-    close_p = df['close'].iloc[i]
-    
-    daily_ret = 0.0
-    
-    # Simple Trend Logic
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p; sl = entry * (1 - SL_PCT); tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
+def precompute_indicators(df):
+    """
+    Pre-calculates all possible indicators to make the grid search instant.
+    """
+    print("Pre-computing indicator library...")
+    # 1. SMAs
+    for f in GRID_SMA_FAST:
+        df[f'sma_fast_{f}'] = df['close'].rolling(f).mean()
+    for s in GRID_SMA_SLOW:
+        df[f'sma_slow_{s}'] = df['close'].rolling(s).mean()
         
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p; sl = entry * (1 + SL_PCT); tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
+    # 2. III Variations
+    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    for w in GRID_III_WINDOW:
+        net = df['log_ret'].rolling(w).sum().abs()
+        path = df['log_ret'].abs().rolling(w).sum()
+        df[f'iii_{w}'] = net / (path + 1e-9)
         
-    base_returns.append(daily_ret)
+    return df
 
-df['base_ret'] = base_returns
-df_calc = df.iloc[start_idx:].copy() # Work with valid data only
-base_rets_arr = df_calc['base_ret'].values
-iii_prev_arr = df_calc['iii'].shift(1).fillna(0).values
+def run_backtest_vectorized(df, fast_per, slow_per, iii_per, t_low, t_high, lev_profile):
+    """
+    Runs a fast vectorized backtest on a specific slice of data.
+    """
+    # 1. Base Signal (Trend)
+    c = df['close'].values
+    o = df['open'].values
+    # Shift indicators by 1 to prevent lookahead
+    fast = df[f'sma_fast_{fast_per}'].shift(1).fillna(0).values
+    slow = df[f'sma_slow_{slow_per}'].shift(1).fillna(0).values
+    prev_c = df['close'].shift(1).fillna(0).values
+    
+    # 0 = Neutral, 1 = Long, -1 = Short (Short logic simplified to inverse for speed)
+    # Note: Using your specific "Close > Fast AND Close > Slow" logic
+    signal = np.zeros(len(df))
+    long_cond = (prev_c > fast) & (prev_c > slow)
+    short_cond = (prev_c < fast) & (prev_c < slow)
+    
+    # Calculate Raw Daily Returns (Unlevered)
+    # We approximate daily PnL as (Close - Open) / Open for speed in grid search
+    # (Exact SL/TP is too slow for 10,000 combos, this proxies "capture" well)
+    daily_raw = (c - o) / o
+    
+    base_pnl = np.zeros(len(df))
+    base_pnl[long_cond] = daily_raw[long_cond]
+    base_pnl[short_cond] = -daily_raw[short_cond]
+    
+    # 2. Apply III & Leverage
+    iii_prev = df[f'iii_{iii_per}'].shift(1).fillna(0).values
+    
+    l_low, l_mid, l_high = lev_profile['vals']
+    lev_vector = np.full(len(df), l_high) # Default High
+    lev_vector[(iii_prev >= t_low) & (iii_prev < t_high)] = l_mid
+    lev_vector[iii_prev < t_low] = l_low
+    
+    final_rets = base_pnl * lev_vector
+    return final_rets
 
-# 3. GRID SEARCH
-print("Running Grid Search for Parameter Stability...")
+def get_sharpe(rets):
+    if np.std(rets) == 0: return -999
+    return (np.mean(rets) / np.std(rets)) * np.sqrt(365)
 
-# Create ranges
-low_range = np.linspace(CENTER_LOW - (GRID_STEPS*GRID_STEP_SIZE), 
-                        CENTER_LOW + (GRID_STEPS*GRID_STEP_SIZE), 
-                        num=GRID_STEPS*2+1)
-high_range = np.linspace(CENTER_HIGH - (GRID_STEPS*GRID_STEP_SIZE), 
-                         CENTER_HIGH + (GRID_STEPS*GRID_STEP_SIZE), 
-                         num=GRID_STEPS*2+1)
+# --- MAIN EXECUTION ---
+df = fetch_data()
+df = precompute_indicators(df)
 
-sharpe_grid = np.zeros((len(low_range), len(high_range)))
-valid_mask = np.zeros((len(low_range), len(high_range)))
+# Define WFO Years
+years = sorted(list(set(df.index.year)))
+years = [y for y in years if y >= 2019] # Start trading in 2019
 
-for i, t_low in enumerate(low_range):
-    for j, t_high in enumerate(high_range):
-        # Constraint: Low threshold must be lower than High threshold
-        # We also enforce a small gap to prevent logic collapse
-        if t_low >= t_high - 0.01:
-            sharpe_grid[i, j] = np.nan
-            continue
+wfo_equity = [1.0]
+wfo_dates = [df.index[0]]
+current_equity = 1.0
+wfo_log = []
+
+# Generate all parameter combinations once
+param_grid = list(itertools.product(
+    GRID_SMA_FAST, GRID_SMA_SLOW, GRID_III_WINDOW, THRESHOLD_PROFILES, LEVERAGE_PROFILES
+))
+print(f"Grid Space Size: {len(param_grid)} combinations per year.")
+
+# Start WFO Loop
+start_idx_global = df.index.get_loc(df[df.index.year == 2019].index[0])
+# Fill pre-2019 with 1.0
+wfo_equity = [1.0] * start_idx_global
+
+for year in years:
+    print(f"\n--- OPTIMIZING FOR YEAR {year} ---")
+    
+    # 1. Define Training Data (Expanding Window: Start -> Year-1)
+    train_mask = (df.index.year < year) & (df.index.year >= (year-2)) # Use 2 year rolling window for better adaptability? 
+    # Or use full history? Let's use Full History to be robust.
+    train_mask = (df.index.year < year)
+    
+    train_df = df.loc[train_mask].copy()
+    if len(train_df) < 300: continue
+    
+    best_score = -999
+    best_params = None
+    
+    # 2. Grid Search
+    # This might take 5-10 seconds per year
+    for params in param_grid:
+        f_sma, s_sma, iii_w, (t_l, t_h), lev_prof = params
+        
+        if f_sma >= s_sma: continue # Invalid SMA
+        
+        rets = run_backtest_vectorized(train_df, f_sma, s_sma, iii_w, t_l, t_h, lev_prof)
+        score = get_sharpe(rets)
+        
+        if score > best_score:
+            best_score = score
+            best_params = params
             
-        valid_mask[i, j] = 1
-        
-        # Vectorized Leverage Application
-        # Default to High Efficiency/Euphoria (Level 2)
-        lev_vector = np.full(len(iii_prev_arr), LEV_HIGH)
-        
-        # Apply Mid Efficiency/Wall of Worry (Level 1)
-        # Logic: t_low <= III < t_high
-        lev_vector[(iii_prev_arr >= t_low) & (iii_prev_arr < t_high)] = LEV_MID
-        
-        # Apply Low Efficiency/Noise (Level 0)
-        # Logic: III < t_low
-        lev_vector[iii_prev_arr < t_low] = LEV_LOW
-        
-        # Calculate Returns
-        strategy_rets = base_rets_arr * lev_vector
-        
-        # Calculate Sharpe
-        mean_ret = np.mean(strategy_rets)
-        std_ret = np.std(strategy_rets)
-        
-        if std_ret > 1e-9:
-            sharpe = (mean_ret / std_ret) * np.sqrt(365)
-        else:
-            sharpe = 0.0
-            
-        sharpe_grid[i, j] = sharpe
+    # Log the winner
+    f, s, i_w, (tl, th), lp = best_params
+    log_msg = f"Year {year}: Best SMA {f}/{s} | III {i_w} | Th {tl}/{th} | Mode: {lp['name']} (Sharpe {best_score:.2f})"
+    print(log_msg)
+    wfo_log.append(log_msg)
+    
+    # 3. Trade the "Test" Year
+    test_mask = (df.index.year == year)
+    test_df = df.loc[test_mask].copy()
+    
+    # Run logic with winning params
+    # Note: We use the SLOW logic here (or re-use vector) for precision
+    # For simplicity, re-use vectorized since it maps 1:1
+    test_rets = run_backtest_vectorized(test_df, f, s, i_w, tl, th, lp)
+    
+    # Accumulate Equity
+    for r in test_rets:
+        current_equity *= (1 + r)
+        wfo_equity.append(current_equity)
 
-# 4. PLOTTING
-plt.figure(figsize=(10, 8))
+# --- PLOTTING ---
+plt.figure(figsize=(12, 10))
 
-# Use imshow for the heatmap
-# Origin 'lower' puts the low values at the bottom-left
-plt.imshow(sharpe_grid, origin='lower', cmap='viridis', aspect='auto', interpolation='nearest')
+# 1. Equity Curve
+ax1 = plt.subplot(2, 1, 1)
+# Align Equity Array to DF
+plot_df = df.iloc[:len(wfo_equity)].copy()
+plot_df['wfo_equity'] = wfo_equity
 
-# Set ticks
-x_ticks = np.arange(0, len(high_range), 2)
-y_ticks = np.arange(0, len(low_range), 2)
+# Create a comparison "Static" strategy (The one you are worried about: 40/120)
+static_rets = run_backtest_vectorized(
+    plot_df, 40, 120, 35, 0.13, 0.18, 
+    {'name': 'Static', 'vals': [0.5, 4.5, 2.45]}
+)
+plot_df['static_equity'] = (1 + static_rets).cumprod()
+# Normalize to start of WFO
+start_date_wfo = plot_df[plot_df.index.year == 2019].index[0]
+val_at_start_wfo = plot_df.loc[start_date_wfo, 'wfo_equity']
+val_at_start_static = plot_df.loc[start_date_wfo, 'static_equity']
 
-plt.xticks(x_ticks, np.round(high_range[x_ticks], 2))
-plt.yticks(y_ticks, np.round(low_range[y_ticks], 2))
+plot_df['wfo_equity_norm'] = plot_df['wfo_equity'] / val_at_start_wfo
+plot_df['static_equity_norm'] = plot_df['static_equity'] / val_at_start_static
 
-cbar = plt.colorbar()
-cbar.set_label('Sharpe Ratio')
+ax1.plot(plot_df.index, plot_df['wfo_equity_norm'], color='blue', label='Walk-Forward Optimized (Dynamic)', linewidth=2)
+ax1.plot(plot_df.index, plot_df['static_equity_norm'], color='gray', linestyle='--', label='Static 40/120 (Hindsight)', alpha=0.7)
+ax1.set_yscale('log')
+ax1.set_title('Walk-Forward vs Static Optimization')
+ax1.legend()
+ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
-# Mark the center (Your current config)
-center_x = GRID_STEPS
-center_y = GRID_STEPS
-plt.scatter(center_x, center_y, color='red', marker='x', s=100, label='Current Config (0.13 / 0.18)')
+# 2. Parameter Stability Text
+ax2 = plt.subplot(2, 1, 2)
+ax2.axis('off')
+text_content = "Yearly Optimized Parameters:\n\n" + "\n".join(wfo_log)
+ax2.text(0.1, 0.9, text_content, fontsize=10, verticalalignment='top', fontfamily='monospace')
 
-plt.title(f'Stability Analysis: III Thresholds\nLeverages: <Low:{LEV_LOW}x> -- <Mid:{LEV_MID}x> -- <High:{LEV_HIGH}x>')
-plt.xlabel('High Threshold (Switch from Mid -> High Leverage)')
-plt.ylabel('Low Threshold (Switch from Low -> Mid Leverage)')
-plt.legend()
+plt.tight_layout()
+plot_path = os.path.join('/app/static', 'wfo_results.png')
+if not os.path.exists('/app/static'): os.makedirs('/app/static')
+plt.savefig(plot_path)
 
-# Save plot
-plot_dir = '/app/static'
-if not os.path.exists(plot_dir): os.makedirs(plot_dir)
-plot_path = os.path.join(plot_dir, 'sensitivity_heatmap.png')
-plt.savefig(plot_path, dpi=100, bbox_inches='tight')
-
-# Flask Server
 app = Flask(__name__)
-
 @app.route('/')
-def serve_heatmap():
-    return send_file(plot_path, mimetype='image/png')
+def serve_image(): return send_file(plot_path, mimetype='image/png')
 
 if __name__ == '__main__':
-    print("Starting Web Server...")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=8080)
