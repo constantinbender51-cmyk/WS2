@@ -29,7 +29,7 @@ MIN_LEV = 0.0
 
 def fetch_data():
     exchange = ccxt.binance()
-    since = exchange.parse8601(start_date_str=START_DATE)
+    since = exchange.parse8601(START_DATE)
     all_ohlcv = []
     while True:
         try:
