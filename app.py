@@ -1,6 +1,9 @@
 import ccxt
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+from dash import Dash, dcc, html
+from plotly.subplots import make_subplots
 import time
 
 # --- Configuration ---
@@ -8,7 +11,7 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 MAX_SMA = 365
-TOP_N_SURVIVORS = 50  # Number of best strategies to carry over to the next level
+TOP_N_SURVIVORS = 40 # Keep top 40 candidates per level to breed next level
 RISK_FREE_RATE = 0.0
 
 def fetch_data(symbol, timeframe, start_str):
@@ -25,7 +28,7 @@ def fetch_data(symbol, timeframe, start_str):
             since = ohlcv[-1][0] + 1
             if len(ohlcv) < 1000: break
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error fetching data: {e}")
             break
 
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -35,133 +38,83 @@ def fetch_data(symbol, timeframe, start_str):
     return df
 
 def get_sharpe_vectorized(returns_matrix):
-    """
-    Calculates Annualized Sharpe Ratio for a matrix of returns (Time x N_Strategies).
-    """
+    """Calculates Annualized Sharpe Ratio for a matrix of returns."""
     means = np.mean(returns_matrix, axis=0)
     stds = np.std(returns_matrix, axis=0)
-    
     with np.errstate(divide='ignore', invalid='ignore'):
         sharpes = np.divide(means, stds) * np.sqrt(365)
-    
     sharpes[np.isnan(sharpes)] = 0
     return sharpes
 
-def run_greedy_search(df):
+def run_greedy_optimization(df):
+    """
+    Performs greedy forward selection to find best SMA combinations.
+    Logic: Long if Price > ALL SMAs, Short if Price < ALL SMAs.
+    Returns: DataFrame with consensus score and metadata.
+    """
+    print("--- Starting Greedy Optimization ---")
     start_time = time.time()
     
-    # 1. Prepare Data
     prices = df['close'].to_numpy()
-    market_returns = df['close'].pct_change().fillna(0).to_numpy() # (T,)
-    n_days = len(market_returns)
+    market_returns = df['close'].pct_change().fillna(0).to_numpy()
+    n_days = len(prices)
     
-    print("Pre-calculating SMA Boolean Matrices...")
-    # sma_values: (T, 365)
-    sma_values = np.zeros((n_days, MAX_SMA))
+    # 1. Pre-calculate all Boolean conditions (Price > SMA)
+    # Shape: (T, MAX_SMA)
+    print("Pre-calculating SMA matrix...")
+    sma_conds_long = np.zeros((n_days, MAX_SMA), dtype=bool)
+    sma_conds_short = np.zeros((n_days, MAX_SMA), dtype=bool)
+    
     for i in range(MAX_SMA):
-        sma_values[:, i] = df['close'].rolling(window=i+1).mean().fillna(0).to_numpy()
-        
-    # Pre-calculate boolean conditions for speed
-    # long_conds[t, i] is True if Price[t] > SMA_i[t]
-    long_conds = prices[:, None] > sma_values
-    short_conds = prices[:, None] < sma_values
-    
-    all_results = [] # To store dicts of {indices: [1, 2], sharpe: 1.5}
-    
+        sma = df['close'].rolling(window=i+1).mean().fillna(0).to_numpy()
+        sma_conds_long[:, i] = prices > sma
+        sma_conds_short[:, i] = prices < sma
+
+    # Master list to store all valid strategies found across all levels
+    # List of dicts: {'indices': [1, 50], 'sharpe': 1.2, 'level': 2}
+    master_strategy_list = []
+
     # --- LEVEL 1: Single SMAs ---
-    print("\n--- Level 1: Single SMAs ---")
-    # Signal: 1 if L, -1 if S, 0 else
-    l1_sigs = long_conds.astype(np.int8) - short_conds.astype(np.int8)
-    
-    # Shift signals (Trade tomorrow based on today)
-    l1_sigs = np.roll(l1_sigs, 1, axis=0)
+    print("Scanning Level 1 (Single SMAs)...")
+    # 1 if Long, -1 if Short, 0 else
+    l1_sigs = sma_conds_long.astype(np.int8) - sma_conds_short.astype(np.int8)
+    l1_sigs = np.roll(l1_sigs, 1, axis=0) # Shift 1 day
     l1_sigs[0, :] = 0
     
     l1_rets = l1_sigs * market_returns[:, None]
     l1_sharpes = get_sharpe_vectorized(l1_rets)
     
-    level_1_results = []
+    level_results = []
     for i in range(MAX_SMA):
-        s = l1_sharpes[i]
-        level_1_results.append({'indices': [i], 'sharpe': s, 'level': 1})
-    
-    # Sort and Keep Best
-    level_1_results.sort(key=lambda x: x['sharpe'], reverse=True)
-    all_results.extend(level_1_results[:25]) # Keep top 25 for final report
-    print(f"Best L1: SMA {level_1_results[0]['indices'][0]+1} (Sharpe: {level_1_results[0]['sharpe']:.3f})")
-
-    # --- LEVEL 2: All Pairs (Brute Force) ---
-    print("\n--- Level 2: All Pairs (Brute Force) ---")
-    # We loop through SMA 'i' and compare against all 'j'
-    level_2_results = []
-    
-    # Optimization: To avoid N^2 loop in Python, we vectorize the inner loop.
-    for i in range(MAX_SMA):
-        # Base condition for SMA i
-        base_L = long_conds[:, i] # (T,)
-        base_S = short_conds[:, i] # (T,)
-        
-        # Combine with ALL other SMAs (j)
-        # Broadcasting: (T, 1) & (T, 365) -> (T, 365)
-        combined_L = base_L[:, None] & long_conds
-        combined_S = base_S[:, None] & short_conds
-        
-        # Signal logic: Long if Both > Price, Short if Both < Price
-        sigs = combined_L.astype(np.int8) - combined_S.astype(np.int8)
-        
-        # Shift
-        sigs = np.roll(sigs, 1, axis=0)
-        sigs[0, :] = 0
-        
-        # Returns
-        rets = sigs * market_returns[:, None]
-        sharpes = get_sharpe_vectorized(rets)
-        
-        # Store results where j > i (to avoid duplicates and self-pairs)
-        # We can iterate the numpy array result directly
-        for j in range(i + 1, MAX_SMA):
-            s = sharpes[j]
-            if s > 0: # Filter out garbage
-                level_2_results.append({'indices': [i, j], 'sharpe': s, 'level': 2})
-                
-    level_2_results.sort(key=lambda x: x['sharpe'], reverse=True)
-    all_results.extend(level_2_results[:25])
-    
-    best_l2 = level_2_results[0]
-    p1, p2 = [x+1 for x in best_l2['indices']]
-    print(f"Best L2: SMA {p1} & {p2} (Sharpe: {best_l2['sharpe']:.3f})")
-    
-    # Check User's Specific 120 & 40 Case
-    # indices are 1-based in prompt, 0-based in array
-    u_idx = sorted([39, 119]) 
-    found_user = next((r for r in level_2_results if sorted(r['indices']) == u_idx), None)
-    if found_user:
-        print(f"Specific Check (SMA 40 & 120): Sharpe {found_user['sharpe']:.3f}")
-
-    # --- LEVEL 3 to 5: Greedy Extension ---
-    # Start with top survivors from previous level and add 1 SMA
-    current_survivors = level_2_results[:TOP_N_SURVIVORS]
-    
-    for level in range(3, 6):
-        print(f"\n--- Level {level}: Greedy Search ---")
-        next_gen_results = []
-        
-        for strat in current_survivors:
-            base_indices = strat['indices']
+        if l1_sharpes[i] > 0:
+            level_results.append({'indices': [i], 'sharpe': l1_sharpes[i], 'level': 1})
             
-            # Construct Base Signals (Logic: AND across all indices)
-            # We calculate this once per survivor
+    level_results.sort(key=lambda x: x['sharpe'], reverse=True)
+    master_strategy_list.extend(level_results[:50]) # Add best singles to master list
+    
+    # Survivors continue to breed in Level 2
+    current_survivors = level_results[:TOP_N_SURVIVORS]
+    
+    # --- LEVEL 2 to 5: Greedy Additions ---
+    for level in range(2, 6):
+        print(f"Scanning Level {level} (adding confirmation)...")
+        next_gen = []
+        
+        for survivor in current_survivors:
+            base_indices = survivor['indices']
+            
+            # Construct Base Condition (AND logic)
+            # Start true, AND with every SMA in the set
             base_L = np.ones(n_days, dtype=bool)
             base_S = np.ones(n_days, dtype=bool)
-            
             for idx in base_indices:
-                base_L &= long_conds[:, idx]
-                base_S &= short_conds[:, idx]
+                base_L &= sma_conds_long[:, idx]
+                base_S &= sma_conds_short[:, idx]
             
-            # Try adding every possible remaining SMA
-            # Vectorized test against all columns
-            combined_L = base_L[:, None] & long_conds
-            combined_S = base_S[:, None] & short_conds
+            # Vectorized test adding one more SMA
+            # Combined = Base AND New_Column
+            combined_L = base_L[:, None] & sma_conds_long
+            combined_S = base_S[:, None] & sma_conds_short
             
             sigs = combined_L.astype(np.int8) - combined_S.astype(np.int8)
             sigs = np.roll(sigs, 1, axis=0)
@@ -170,118 +123,166 @@ def run_greedy_search(df):
             rets = sigs * market_returns[:, None]
             sharpes = get_sharpe_vectorized(rets)
             
-            # Scan results
-            for k in range(MAX_SMA):
-                if k not in base_indices:
-                    new_indices = base_indices + [k]
-                    # Sort indices for consistent ID
-                    new_indices.sort()
-                    next_gen_results.append({
-                        'indices': new_indices,
-                        'sharpe': sharpes[k],
-                        'level': level
-                    })
+            # Collect results
+            # We only look at indices > max(base_indices) to avoid permutations/duplicates 
+            # (e.g., [10, 20] is same as [20, 10])
+            start_search = max(base_indices) + 1
+            if start_search < MAX_SMA:
+                for k in range(start_search, MAX_SMA):
+                    # Only add if Sharpe improves or is high enough
+                    if sharpes[k] > 0.5: 
+                        new_idx = base_indices + [k]
+                        next_gen.append({'indices': new_idx, 'sharpe': sharpes[k], 'level': level})
         
-        # Deduplicate results (since [A, B] + C is same as [A, C] + B)
-        # Use tuple of indices as key
-        unique_results = {}
-        for r in next_gen_results:
-            key = tuple(r['indices'])
-            if key not in unique_results:
-                unique_results[key] = r
-            else:
-                # theoretical duplicate should have same sharpe
-                pass
+        # Sort and Keep Best
+        next_gen.sort(key=lambda x: x['sharpe'], reverse=True)
         
-        next_gen_results = list(unique_results.values())
-        next_gen_results.sort(key=lambda x: x['sharpe'], reverse=True)
+        # Deduplicate (just in case logic above missed something)
+        unique_next = []
+        seen = set()
+        for item in next_gen:
+            t = tuple(sorted(item['indices']))
+            if t not in seen:
+                seen.add(t)
+                unique_next.append(item)
         
-        best = next_gen_results[0]
-        smas_str = ", ".join([str(x+1) for x in best['indices']])
-        print(f"Best L{level}: SMAs [{smas_str}] (Sharpe: {best['sharpe']:.3f})")
-        
-        all_results.extend(next_gen_results[:25])
-        current_survivors = next_gen_results[:TOP_N_SURVIVORS]
+        # Add to master list and set survivors
+        master_strategy_list.extend(unique_next[:50])
+        current_survivors = unique_next[:TOP_N_SURVIVORS]
 
-    # --- FINAL RANKING ---
-    print("\n" + "="*60)
-    print("TOP 25 CONFIRMATION STRATEGIES (ALL LEVELS)")
-    print("="*60)
-    all_results.sort(key=lambda x: x['sharpe'], reverse=True)
+    # --- SELECT TOP 25 OVERALL ---
+    print("Selecting Top 25 Strategies from all levels...")
+    # Sort master list by Sharpe
+    master_strategy_list.sort(key=lambda x: x['sharpe'], reverse=True)
     
-    # Deduplicate global list just in case
-    seen = set()
-    unique_final = []
-    for r in all_results:
-        k = tuple(r['indices'])
-        if k not in seen:
-            seen.add(k)
-            unique_final.append(r)
+    # Ensure uniqueness (strategies might appear in multiple levels if we aren't careful, 
+    # though strict > logic usually prevents it. Just being safe.)
+    final_top_25 = []
+    seen_sets = set()
+    for strat in master_strategy_list:
+        k = tuple(sorted(strat['indices']))
+        if k not in seen_sets:
+            seen_sets.add(k)
+            final_top_25.append(strat)
+        if len(final_top_25) >= 25:
+            break
             
-    top_25 = unique_final[:25]
-    for i, r in enumerate(top_25):
-        smas = [str(x+1) for x in r['indices']]
-        print(f"{i+1:2d}. Level {r['level']} | SMAs: {', '.join(smas):<20} | Sharpe: {r['sharpe']:.3f}")
+    # Print Top 5 for debug
+    print("Top 5 Strategies:")
+    for i, s in enumerate(final_top_25[:5]):
+        smas = [str(x+1) for x in s['indices']]
+        print(f"{i+1}. Sharpe {s['sharpe']:.2f} | SMAs: {smas}")
 
-    # --- CONSENSUS SCORE (0-5) ---
-    print("\n" + "="*60)
-    print("CONSENSUS SCORE ANALYSIS (Using Best Strategy from Levels 1-5)")
-    print("="*60)
+    # --- CALCULATE CONSENSUS SCORE ---
+    print("Calculating Consensus Score...")
+    consensus_sum = np.zeros(n_days)
     
-    # 1. Identify the champion for each level (1 to 5)
-    # We re-find them to ensure we have exactly one per level
-    champions = []
-    for lvl in range(1, 6):
-        champ = next((r for r in unique_final if r['level'] == lvl), None)
-        if champ:
-            champions.append(champ)
+    for strat in final_top_25:
+        indices = strat['indices']
+        
+        # Rebuild signal
+        is_long = np.ones(n_days, dtype=bool)
+        is_short = np.ones(n_days, dtype=bool)
+        
+        for idx in indices:
+            is_long &= sma_conds_long[:, idx]
+            is_short &= sma_conds_short[:, idx]
             
-    print(f"Consensus built from {len(champions)} strategies (Best L1, Best L2, etc.)")
-    
-    # 2. Generate Signals for these champions
-    # signals_matrix: (T, N_Champs)
-    signals_list = []
-    
-    for champ in champions:
-        # Reconstruct signal
-        base_L = np.ones(n_days, dtype=bool)
-        base_S = np.ones(n_days, dtype=bool)
-        for idx in champ['indices']:
-            base_L &= long_conds[:, idx]
-            base_S &= short_conds[:, idx]
-            
-        sig = base_L.astype(np.int8) - base_S.astype(np.int8)
+        sig = is_long.astype(np.int8) - is_short.astype(np.int8)
+        # Shift (Trade tomorrow)
         sig = np.roll(sig, 1)
         sig[0] = 0
-        signals_list.append(sig)
         
-    signals_matrix = np.column_stack(signals_list) # (T, 5)
-    
-    # 3. Compute Score (Sum of signals)
-    # Range: -5 to +5 (if 5 strategies found)
-    consensus_score = np.sum(signals_matrix, axis=1)
-    
-    # 4. Evaluate Trading the Score
-    # We test thresholds: Go Long if Score >= X, Short if Score <= -X
-    print(f"\n{'Threshold':<10} {'Condition':<20} {'Sharpe':<10} {'Ann. Ret':<10} {'Trades'}")
-    print("-" * 65)
-    
-    max_score = len(champions)
-    # Test thresholds 1 to 5
-    for thresh in range(1, max_score + 1):
-        # Long if Score >= thresh
-        # Short if Score <= -thresh
-        final_sig = np.zeros(n_days)
-        final_sig[consensus_score >= thresh] = 1
-        final_sig[consensus_score <= -thresh] = -1
+        consensus_sum += sig
         
-        rets = final_sig * market_returns
-        sharpe = (np.mean(rets) / np.std(rets)) * np.sqrt(365) if np.std(rets) > 0 else 0
-        ann_ret = np.mean(rets) * 365 * 100
-        trades = np.sum(np.abs(np.diff(final_sig)))
-        
-        print(f"{thresh:<10} Score >= {thresh}/{max_score}      {sharpe:<10.3f} {ann_ret:6.1f}%    {trades:.0f}")
+    # Scale: Divide by 5 to fit 0-5 range (technically -5 to +5)
+    df['consensus_raw'] = consensus_sum
+    df['consensus_score'] = consensus_sum / 5.0
+    
+    print(f"Optimization finished in {time.time() - start_time:.2f}s")
+    return df, final_top_25
 
+def create_figure(df):
+    # Create subplots: Price on top, Consensus on bottom
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.03,
+        row_heights=[0.7, 0.3],
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
+    )
+
+    # --- Top Panel: Price ---
+    # Candlestick (simplified to line for speed if dense, but user likes details)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['close'],
+        name='BTC Price',
+        line=dict(color='white', width=1)
+    ), row=1, col=1, secondary_y=False)
+
+    # --- Bottom Panel: Consensus Score ---
+    # We color the area: Green if > 0, Red if < 0
+    
+    # Split into positive and negative for coloring
+    pos_score = df['consensus_score'].clip(lower=0)
+    neg_score = df['consensus_score'].clip(upper=0)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=pos_score,
+        name='Consensus (Long)',
+        fill='tozeroy',
+        mode='none',
+        fillcolor='rgba(0, 255, 100, 0.5)'
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=neg_score,
+        name='Consensus (Short)',
+        fill='tozeroy',
+        mode='none',
+        fillcolor='rgba(255, 50, 50, 0.5)'
+    ), row=2, col=1)
+
+    # Add a horizontal line at 0
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+
+    # Layout
+    fig.update_layout(
+        title='Bitcoin Price vs. SMA Consensus Score (Top 25 Strategies)',
+        template='plotly_dark',
+        height=800,
+        hovermode='x unified',
+        showlegend=False
+    )
+    
+    fig.update_yaxes(title_text="Price (USDT)", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Consensus (-5 to +5)", row=2, col=1, range=[-5.5, 5.5])
+
+    return fig
+
+# --- Main ---
 if __name__ == '__main__':
+    # 1. Fetch
     df = fetch_data(SYMBOL, TIMEFRAME, START_DATE)
-    run_greedy_search(df)
+    
+    # 2. Optimize & Calc
+    df, top_strats = run_greedy_optimization(df)
+    
+    # 3. Server
+    app = Dash(__name__)
+    
+    app.layout = html.Div([
+        dcc.Graph(figure=create_figure(df), style={'height': '95vh'}),
+        
+        # Display Top 5 Strats text
+        html.Div([
+            html.H4("Top 5 Component Strategies:", style={'color': '#888'}),
+            html.Ul([
+                html.Li(f"Level {s['level']} | SMAs: {[x+1 for x in s['indices']]} | Sharpe: {s['sharpe']:.3f}") 
+                for s in top_strats[:5]
+            ], style={'color': '#aaa'})
+        ], style={'padding': '20px'})
+    ], style={'backgroundColor': '#111', 'margin': '-8px'})
+    
+    print("Starting server on port 8080...")
+    app.run(debug=False, port=8080, host='0.0.0.0')
