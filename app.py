@@ -111,6 +111,38 @@ for i in range(len(df)):
 df['base_ret'] = base_returns
 
 # 3. FIXED PARAMETERS IMPLEMENTATION
+# Function to calculate metrics from equity series
+def get_final_metrics(equity_series):
+    """
+    Calculate total return, CAGR, max drawdown, and Sharpe ratio from equity series.
+    Assumes daily returns (252 trading days per year).
+    """
+    if len(equity_series) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    
+    # Total return
+    total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
+    
+    # CAGR
+    years = len(equity_series) / 252  # Approximate trading days per year
+    if years > 0:
+        cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (1 / years) - 1
+    else:
+        cagr = 0.0
+    
+    # Max drawdown
+    roll_max = equity_series.cummax()
+    drawdown = (equity_series - roll_max) / roll_max
+    max_drawdown = drawdown.min()
+    
+    # Sharpe ratio (assuming risk-free rate = 0 for simplicity)
+    daily_returns = equity_series.pct_change().dropna()
+    if len(daily_returns) > 0 and daily_returns.std() != 0:
+        sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+    
+    return total_return, cagr, max_drawdown, sharpe
 print("Using fixed parameters without grid search...")
 
 base_ret_arr = np.array(base_returns)
