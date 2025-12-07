@@ -135,8 +135,8 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
             net_distance_traveled[i] = np.sum(abs_derivatives[start_idx:i+1])
         
         # Use the net distance traveled as the base for noise magnitude
-        # Scale by noise_level to control the noise intensity
-        noise_magnitude = net_distance_traveled * noise_level
+        # Scale by noise_level to control the noise intensity and multiply by 2
+        noise_magnitude = net_distance_traveled * noise_level * 2
         
         # Create noise array based on the net distance traveled
         noise = np.random.normal(0, noise_magnitude, len(sma_values))
