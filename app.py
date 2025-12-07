@@ -27,7 +27,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA (Shifted 60 Left)</h1>
+        <h1>Binance BTC/USDT OHLCV with Noisy 30-period SMA (Shifted 60 Left)</h1>
         <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices and the noisy SMA shifted 60 periods left.</p>
         <img src="data:image/png;base64,{{ plot_data }}" alt="OHLCV with Noisy SMA Plot">
         <p>Generated at: {{ timestamp }}</p>
@@ -98,13 +98,13 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
     return df[['open', 'high', 'low', 'close', 'volume']]
 
 
-def compute_sma_with_noise(df, window=120, noise_level=0.1):
+def compute_sma_with_noise(df, window=30, noise_level=0.1):
     """
     Compute SMA and add noise to it.
     
     Args:
         df: DataFrame with 'close' column
-        window: SMA window period (default: 120)
+        window: SMA window period (default: 30)
         noise_level: Standard deviation of Gaussian noise as fraction of SMA (default: 0.1 = 10%)
     
     Returns:
@@ -122,26 +122,26 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         # Calculate derivative of SMA using gradient
         sma_derivative = np.gradient(sma_values.values)
         
-        # Calculate net distance traveled using a 60-day rolling window
+        # Calculate absolute distance traveled using a 60-day rolling window
         # Create a rolling window of 60 periods for cumulative sum of absolute derivatives
         abs_derivatives = np.abs(sma_derivative)
         
-        # Initialize net_distance_traveled array
-        net_distance_traveled = np.zeros_like(sma_derivative)
+        # Initialize absolute_distance_traveled array
+        absolute_distance_traveled = np.zeros_like(sma_derivative)
         
         # Calculate rolling cumulative sum for 60-day window
         for i in range(len(abs_derivatives)):
             start_idx = max(0, i - 59)  # 60-day window (inclusive of current point)
-            net_distance_traveled[i] = np.sum(abs_derivatives[start_idx:i+1])
+            absolute_distance_traveled[i] = np.sum(abs_derivatives[start_idx:i+1])
         
-        # Use the net distance traveled squared as the base for noise magnitude
+        # Use the absolute distance traveled squared as the base for noise magnitude
         # Scale by noise_level to control the noise intensity
-        noise_magnitude = (net_distance_traveled ** 2) * noise_level
+        noise_magnitude = (absolute_distance_traveled ** 2) * noise_level
         
-        # Create noise array based on the net distance traveled
+        # Create noise array based on the absolute distance traveled
         noise = np.random.normal(0, noise_magnitude, len(sma_values))
         
-        # Add noise to entire SMA based on net distance traveled
+        # Add noise to entire SMA based on absolute distance traveled
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
         
         # Shift noisy SMA 60 periods to the left
@@ -201,7 +201,7 @@ def index():
         
         # Compute SMA with noise
         print("Computing SMA with noise...")
-        df = compute_sma_with_noise(df, window=120, noise_level=0.00002)
+        df = compute_sma_with_noise(df, window=30, noise_level=0.00002)
         
         # Create plot
         print("Creating plot...")
