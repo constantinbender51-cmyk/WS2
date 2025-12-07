@@ -98,14 +98,14 @@ def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'
     return df[['open', 'high', 'low', 'close', 'volume']]
 
 
-def compute_sma_with_noise(df, window=120, noise_level=0.01):
+def compute_sma_with_noise(df, window=120, noise_level=0.1):
     """
     Compute SMA and add noise to it.
     
     Args:
         df: DataFrame with 'close' column
         window: SMA window period (default: 120)
-        noise_level: Standard deviation of Gaussian noise as fraction of SMA (default: 0.01 = 1%)
+        noise_level: Standard deviation of Gaussian noise as fraction of SMA (default: 0.1 = 10%)
     
     Returns:
         DataFrame with added 'sma', 'noisy_sma', and 'noisy_sma_shifted' columns
@@ -124,7 +124,7 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
         
         # Identify points where the slope is horizontal (derivative close to 0)
         # Use a threshold relative to the SMA value at each point
-        horizontal_threshold = 0.001 * sma_values.values
+        horizontal_threshold = 0.005 * sma_values.values
         horizontal_mask = np.abs(sma_derivative) < horizontal_threshold
         
         # Create noise array (initially zeros - no noise)
@@ -200,7 +200,7 @@ def index():
         
         # Compute SMA with noise
         print("Computing SMA with noise...")
-        df = compute_sma_with_noise(df, window=120, noise_level=0.05)
+        df = compute_sma_with_noise(df, window=120, noise_level=0.1)
         
         # Create plot
         print("Creating plot...")
