@@ -127,25 +127,17 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         horizontal_threshold = 0.001 * sma_values.values
         horizontal_mask = np.abs(sma_derivative) < horizontal_threshold
         
-        # Calculate last 60 days of SMA returns and take absolute value of their sum
-        sma_returns = sma_values.pct_change(periods=1)
-        sma_returns_sum = sma_returns.rolling(window=60).sum().abs()
-        # Fill NaN values with 0 for periods where sum can't be computed
-        sma_returns_sum = sma_returns_sum.fillna(0)
+        # Create noise array with significant magnitude
+        # Use a fixed base magnitude of 1000 and multiply by 1000000 to make noise clearly visible
+        noise_magnitude = 1000 * 1000000
         
-        # Create noise array (initially zeros - no noise)
-        noise = np.zeros(len(sma_values))
+        # Create noise array
+        noise = np.random.normal(0, noise_level * noise_magnitude, len(sma_values))
         
-        # Add noise only where slope is horizontal
-        if np.any(horizontal_mask):
-            # Generate Gaussian noise based on absolute sum of last 60 days of SMA returns and noise_level
-            # Multiply by huge number (1000) to make noise clearly visible
-            horizontal_noise = np.random.normal(
-                0, 
-                noise_level * sma_returns_sum.values[horizontal_mask] * 1000, 
-                np.sum(horizontal_mask)
-            )
-            noise[horizontal_mask] = horizontal_noise
+        # Apply noise only where slope is horizontal
+        # Create a mask for non-horizontal points and set their noise to 0
+        non_horizontal_mask = ~horizontal_mask
+        noise[non_horizontal_mask] = 0
         
         # Add noise to SMA
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
