@@ -134,11 +134,11 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
             start_idx = max(0, i - 29)  # 30-day window (inclusive of current point)
             absolute_distance_traveled[i] = np.sum(abs_derivatives[start_idx:i+1])
         
-        # Use the absolute distance traveled squared as the base for noise magnitude
-        # Scale by noise_level to control the noise intensity
-        noise_magnitude = (absolute_distance_traveled ** 2) * noise_level
+        # Use the SMA value as the base for noise magnitude
+        # Higher SMA values result in more noise
+        noise_magnitude = sma_values.values * noise_level
         
-        # Create noise array based on the absolute distance traveled
+        # Create noise array based on the SMA value
         noise = np.random.normal(0, noise_magnitude, len(sma_values))
         
         # Add noise to entire SMA based on absolute distance traveled
