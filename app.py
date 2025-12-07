@@ -201,7 +201,7 @@ def index():
         
         # Compute SMA with noise
         print("Computing SMA with noise...")
-        df = compute_sma_with_noise(df, window=120, noise_level=0.1)
+        df = compute_sma_with_noise(df, window=120, noise_level=0.09)
         
         # Create plot
         print("Creating plot...")
