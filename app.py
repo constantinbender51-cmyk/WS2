@@ -84,7 +84,7 @@ def calculate_log_returns(df, column='close'):
     return np.log(df[column] / df[column].shift(1))
 
 # Function to prepare features and target for linear regression
-def prepare_regression_data(log_returns, poly_degree=2):
+def prepare_regression_data(log_returns, poly_degree=1):
     """Prepare polynomial features from log returns for regression."""
     # Remove NaN values
     log_returns_clean = log_returns.dropna().values.reshape(-1, 1)
@@ -142,19 +142,12 @@ def index():
         # Calculate log returns
         log_returns = calculate_log_returns(df)
         
-        # Prepare data for regression with degree 2
-        X_deg2, y_deg2, poly_deg2 = prepare_regression_data(log_returns, poly_degree=2)
+        # Prepare data for regression with degree 1 (straight line)
+        X, y, poly = prepare_regression_data(log_returns, poly_degree=1)
         
-        # Train linear regression model for degree 2
-        model_deg2 = LinearRegression()
-        model_deg2.fit(X_deg2, y_deg2)
-        
-        # Prepare data for regression with degree 3
-        X_deg3, y_deg3, poly_deg3 = prepare_regression_data(log_returns, poly_degree=3)
-        
-        # Train linear regression model for degree 3
-        model_deg3 = LinearRegression()
-        model_deg3.fit(X_deg3, y_deg3)
+        # Train linear regression model for degree 1
+        model = LinearRegression()
+        model.fit(X, y)
         
         # Get last log return for projection
         last_log_return = log_returns.dropna().iloc[-1]
@@ -163,56 +156,37 @@ def index():
         # Project future data (16 years = 16 * 365 days)
         periods = 16 * 365
         
-        # Project using degree 2 model
-        projected_returns_deg2 = project_future_data(model_deg2, poly_deg2, last_log_return, periods)
-        projected_prices_deg2 = log_returns_to_price(last_price, projected_returns_deg2)
-        
-        # Project using degree 3 model
-        projected_returns_deg3 = project_future_data(model_deg3, poly_deg3, last_log_return, periods)
-        projected_prices_deg3 = log_returns_to_price(last_price, projected_returns_deg3)
+        # Project using degree 1 model
+        projected_returns = project_future_data(model, poly, last_log_return, periods)
+        projected_prices = log_returns_to_price(last_price, projected_returns)
         
         # Create future dates
         last_date = df.index[-1]
         future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
         
-        # Create visualization
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        # Create visualization - single plot with both datasets
+        fig, ax = plt.subplots(figsize=(14, 7))
         
-        # Plot 1: Historical price
-        axes[0, 0].plot(df.index, df['close'], label='Historical Close Price', color='blue', linewidth=1)
-        axes[0, 0].set_title('Historical BTC/USDT Price (2018-Present)')
-        axes[0, 0].set_xlabel('Date')
-        axes[0, 0].set_ylabel('Price (USDT)')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
+        # Plot historical price
+        ax.plot(df.index, df['close'], label='Historical Price (2018-Present)', color='blue', linewidth=1.5)
         
-        # Plot 2: Historical log returns
-        axes[0, 1].plot(log_returns.index, log_returns, label='Log Returns', color='green', linewidth=1)
-        axes[0, 1].axhline(y=0, color='red', linestyle='--', alpha=0.5)
-        axes[0, 1].set_title('Historical Log Returns')
-        axes[0, 1].set_xlabel('Date')
-        axes[0, 1].set_ylabel('Log Return')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+        # Plot projected continuation price
+        ax.plot(future_dates, projected_prices, label='Projected Continuation (Next 16 Years)', color='orange', linewidth=1.5, linestyle='--')
         
-        # Plot 3: Projected prices (degree 2)
-        axes[1, 0].plot(future_dates, projected_prices_deg2, label='Projected Price (Degree 2)', color='orange', linewidth=1)
-        axes[1, 0].axhline(y=last_price, color='red', linestyle='--', alpha=0.5, label=f'Last Price: ${last_price:.2f}')
-        axes[1, 0].set_title('Projected Price - Polynomial Degree 2 (Next 16 Years)')
-        axes[1, 0].set_xlabel('Date')
-        axes[1, 0].set_ylabel('Projected Price (USDT)')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
+        # Add vertical line at the transition point
+        ax.axvline(x=last_date, color='red', linestyle=':', alpha=0.7, label=f'Transition: {last_date.date()}')
         
-        # Plot 4: Projected prices (degree 3)
-        axes[1, 1].plot(future_dates, projected_prices_deg3, label='Projected Price (Degree 3)', color='purple', linewidth=1)
-        axes[1, 1].axhline(y=last_price, color='red', linestyle='--', alpha=0.5, label=f'Last Price: ${last_price:.2f}')
-        axes[1, 1].set_title('Projected Price - Polynomial Degree 3 (Next 16 Years)')
-        axes[1, 1].set_xlabel('Date')
-        axes[1, 1].set_ylabel('Projected Price (USDT)')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
+        # Add horizontal line at last price
+        ax.axhline(y=last_price, color='green', linestyle='--', alpha=0.5, label=f'Last Price: ${last_price:.2f}')
         
+        ax.set_title('BTC/USDT Price with Linear Regression Projection (Degree 1)')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Price (USDT)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Format x-axis dates for better readability
+        fig.autofmt_xdate()
         plt.tight_layout()
         
         # Convert plot to base64 for HTML display
@@ -232,8 +206,7 @@ def index():
             'projection_start': future_dates[0].strftime('%Y-%m-%d'),
             'projection_end': future_dates[-1].strftime('%Y-%m-%d'),
             'projection_periods': periods,
-            'model_deg2_score': f"{model_deg2.score(X_deg2, y_deg2):.4f}",
-            'model_deg3_score': f"{model_deg3.score(X_deg3, y_deg3):.4f}"
+            'model_score': f"{model.score(X, y):.4f}"
         }
         
         # Create HTML template
@@ -269,14 +242,14 @@ def index():
                         <div class="summary-item"><strong>Last Log Return:</strong> {{ last_log_return }}</div>
                         <div class="summary-item"><strong>Projection Period:</strong> {{ projection_start }} to {{ projection_end }}</div>
                         <div class="summary-item"><strong>Projection Periods:</strong> {{ projection_periods }} days (16 years)</div>
-                        <div class="summary-item"><strong>Model R² Score (Degree 2):</strong> {{ model_deg2_score }}</div>
-                        <div class="summary-item"><strong>Model R² Score (Degree 3):</strong> {{ model_deg3_score }}</div>
+                        <div class="summary-item"><strong>Model R² Score (Degree 1):</strong> {{ model_score }}</div>
                     </div>
                 </div>
                 
                 <div class="plot-container">
-                    <h2>Analysis Plots</h2>
-                    <img src="data:image/png;base64,{{ plot_url }}" alt="Analysis Plots">
+                    <h2>Price and Continuation Dataset</h2>
+                    <p>Historical price (blue solid line) and projected continuation (orange dashed line) using linear regression with degree 1 polynomial features.</p>
+                    <img src="data:image/png;base64,{{ plot_url }}" alt="Price and Continuation Plot">
                 </div>
                 
                 <div class="disclaimer">
