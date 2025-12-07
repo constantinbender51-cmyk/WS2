@@ -143,4 +143,4 @@ if __name__ == '__main__':
     ], style={'backgroundColor': '#111', 'margin': '-8px'})
 
     print(f"Starting server on port {PORT}...")
-    app.run_server(debug=False, port=PORT)
+    app.run(debug=False, port=PORT)
