@@ -9,7 +9,7 @@ from datetime import datetime
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'  # Daily candles. Change to '4h' or '1h' for more granularity.
 START_DATE = '2018-01-01 00:00:00'
-SMA_PERIODS = sorted(set([round(1.5 ** x) for x in range(1, 13)]))  # x from 1 to 12
+SMA_PERIODS = sorted(set([2 ** x for x in range(0, 9)]))  # x from 0 to 8: 1, 2, 4, 8, 16, 32, 64, 128, 256
 PORT = 8080
 
 def fetch_data(symbol, timeframe, start_str):
