@@ -141,7 +141,7 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         # Create noise array based on the SMA value
         noise = np.random.normal(0, noise_magnitude, len(sma_values))
         
-        # Add noise to entire SMA based on absolute distance traveled
+        # Add noise to SMA (no longer dependent on distance traveled)
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
         
         # Shift noisy SMA 60 periods to the left
