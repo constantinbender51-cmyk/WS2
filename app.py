@@ -141,17 +141,7 @@ def compute_sma_with_noise(df, window=120, noise_level=0.1):
         # Create noise array based on the net distance traveled
         noise = np.random.normal(0, noise_magnitude, len(sma_values))
         
-        # Identify points where the slope is horizontal (derivative close to 0)
-        # Use a threshold relative to the SMA value at each point
-        horizontal_threshold = 0.001 * sma_values.values
-        horizontal_mask = np.abs(sma_derivative) < horizontal_threshold
-        
-        # Apply noise only where slope is horizontal
-        # Create a mask for non-horizontal points and set their noise to 0
-        non_horizontal_mask = ~horizontal_mask
-        noise[non_horizontal_mask] = 0
-        
-        # Add noise to SMA
+        # Add noise to entire SMA based on net distance traveled
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
         
         # Shift noisy SMA 60 periods to the left
