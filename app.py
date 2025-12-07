@@ -27,8 +27,8 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA</h1>
-        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices and a 120-period simple moving average with added noise.</p>
+        <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA (Shifted 120 Left)</h1>
+        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices, a 120-period simple moving average with added noise, and the same noisy SMA shifted 120 periods left to overlap with close price swings.</p>
         <img src="data:image/png;base64,{{ plot_data }}" alt="OHLCV with Noisy SMA Plot">
         <p>Generated at: {{ timestamp }}</p>
     </div>
@@ -108,7 +108,7 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
         noise_level: Standard deviation of Gaussian noise as fraction of SMA (default: 0.01 = 1%)
     
     Returns:
-        DataFrame with added 'sma' and 'noisy_sma' columns
+        DataFrame with added 'sma', 'noisy_sma', and 'noisy_sma_shifted' columns
     """
     df = df.copy()
     
@@ -123,8 +123,12 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
         noise = np.random.normal(0, noise_level * sma_values.mean(), len(sma_values))
         # Add noise to SMA (not multiply)
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
+        
+        # Shift noisy SMA 120 periods to the left to overlap with close price swings
+        df['noisy_sma_shifted'] = df['noisy_sma'].shift(-window)
     else:
         df['noisy_sma'] = np.nan
+        df['noisy_sma_shifted'] = np.nan
     
     return df
 
@@ -134,7 +138,7 @@ def create_plot(df):
     Create a plot of closing prices and noisy SMA.
     
     Args:
-        df: DataFrame with 'close' and 'noisy_sma' columns
+        df: DataFrame with 'close', 'noisy_sma', and 'noisy_sma_shifted' columns
     
     Returns:
         Base64 encoded PNG image string
@@ -147,9 +151,14 @@ def create_plot(df):
     # Plot noisy SMA if available
     if 'noisy_sma' in df.columns and not df['noisy_sma'].isna().all():
         plt.plot(df.index, df['noisy_sma'], label='Noisy 120-period SMA', 
-                color='red', linewidth=2, alpha=0.8)
+                color='red', linewidth=2, alpha=0.5)
     
-    plt.title('Binance BTC/USDT - Close Price with Noisy 120-period SMA')
+    # Plot shifted noisy SMA if available
+    if 'noisy_sma_shifted' in df.columns and not df['noisy_sma_shifted'].isna().all():
+        plt.plot(df.index, df['noisy_sma_shifted'], label='Noisy SMA (shifted 120 left)', 
+                color='green', linewidth=2, alpha=0.8)
+    
+    plt.title('Binance BTC/USDT - Close Price with Noisy 120-period SMA (Shifted 120 Left)')
     plt.xlabel('Date')
     plt.ylabel('Price (USDT)')
     plt.legend()
