@@ -19,13 +19,15 @@ SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 35 
 
-# --- GRID SEARCH SPACE DEFINITION (5 VARIABLES) ---
+# --- GRID SEARCH SPACE DEFINITION (2 VARIABLES) ---
 
 # Threshold Search Space (T_Low, T_High): 0.13 and 0.18 only
 THRESH_RANGE = np.array([0.13, 0.18]) 
 
-# Leverage Search Space (L_Low, L_Mid, L_High): 0.5, 4.5, and 2.45 only
-LEV_RANGE = np.array([0.5, 4.5, 2.45]) 
+# Fixed Leverage Values (L_Low, L_Mid, L_High): 0.5, 4.5, and 2.45 as specified
+FIXED_L_LOW = 0.5
+FIXED_L_MID = 4.5
+FIXED_L_HIGH = 2.45
 
 # MDD Constraint
 MAX_MDD_CONSTRAINT = -0.50 # Must be less than 50% drawdown
@@ -108,8 +110,8 @@ for i in range(len(df)):
 df['base_ret'] = base_returns
 
 # 3. LEVERAGE GRID SEARCH (Vectorized for Speed)
-total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3
-print(f"Starting Exhaustive 5-Variable Grid Search ({total_iterations} total combinations)...")
+total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE)
+print(f"Starting Exhaustive 2-Variable Grid Search ({total_iterations} total combinations)...")
 
 base_ret_arr = np.array(base_returns)
 iii_prev = df['iii'].shift(1).fillna(0).values
@@ -170,10 +172,10 @@ def calculate_sharpe_mdd(returns):
     
     return sharpe, max_dd
 
-# Outer loop: Thresholds (T_Low, T_High)
+# Outer loop: Thresholds (T_Low, T_High) only
 for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
     # Enforce logical constraint
-    if t_low >= t_high: continue 
+    if t_low >= t_igh: continue 
     
     # Create Tier Mask for this specific threshold combo
     # 0 = Low Tier (III < T_Low)
@@ -185,31 +187,28 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
     tier_mask[iii_prev < t_high] = 1 # Mid
     tier_mask[iii_prev < t_low] = 0  # Low
 
-    # Inner loop: Leverages (L_Low, L_Mid, L_High)
-    for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
-        
-        # Construct leverage array using the calculated tiers
-        lookup = np.array([l_low, l_mid, l_high])
-        lev_arr = lookup[tier_mask]
-        
-        final_rets = base_ret_arr * lev_arr
-        
-        # Calculate Sharpe and MDD (Only analyze period where strategy is active)
-        sharpe, mdd = calculate_sharpe_mdd(final_rets[start_idx:])
-        
-        # Check against MDD constraint
-        if mdd <= MAX_MDD_CONSTRAINT: 
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2))
-                best_mdd = mdd
+    # Use fixed leverage values: 0.5, 4.5, 2.45
+    lookup = np.array([FIXED_L_LOW, FIXED_L_MID, FIXED_L_HIGH])
+    lev_arr = lookup[tier_mask]
+    
+    final_rets = base_ret_arr * lev_arr
+    
+    # Calculate Sharpe and MDD (Only analyze period where strategy is active)
+    sharpe, mdd = calculate_sharpe_mdd(final_rets[start_idx:])
+    
+    # Check against MDD constraint
+    if mdd <= MAX_MDD_CONSTRAINT: 
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_combo = (round(t_low, 2), round(t_high, 2), FIXED_L_LOW, FIXED_L_MID, FIXED_L_HIGH)
+            best_mdd = mdd
 
 
 # 4. FINAL BACKTEST WITH FIXED PARAMS
 # Use the best combination from grid search
 if best_combo is None:
     # Fallback to default values if no valid combination found
-    best_combo = (0.13, 0.18, 0.5, 4.5, 2.45)
+    best_combo = (0.13, 0.18, FIXED_L_LOW, FIXED_L_MID, FIXED_L_HIGH)
     print("Warning: No valid combination found in grid search, using default parameters.")
 OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
 
