@@ -7,15 +7,13 @@ from datetime import datetime
 
 # --- Configuration ---
 SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1d'  # Daily candles. Change to '4h' or '1h' for more granularity.
+TIMEFRAME = '1d'  
 START_DATE = '2018-01-01 00:00:00'
-SMA_PERIODS = sorted(set([2 ** x for x in range(0, 9)]))  # x from 0 to 8: 1, 2, 4, 8, 16, 32, 64, 128, 256
+SMA_PERIODS = sorted(set([2 ** x for x in range(0, 9)]))  # 1, 2, 4, 8, 16, 32, 64, 128, 256
 PORT = 8080
+INITIAL_CAPITAL = 10000
 
 def fetch_data(symbol, timeframe, start_str):
-    """
-    Fetches historical OHLCV data from Binance with pagination handling.
-    """
     print(f"Fetching {symbol} data since {start_str}...")
     exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(start_str)
@@ -26,15 +24,8 @@ def fetch_data(symbol, timeframe, start_str):
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
             if not ohlcv:
                 break
-            
             all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1  # Move to next timestamp
-            
-            # Print progress
-            last_date = datetime.fromtimestamp(ohlcv[-1][0] / 1000)
-            print(f"Fetched up to {last_date}")
-            
-            # Stop if we reached current time (approx)
+            since = ohlcv[-1][0] + 1
             if len(ohlcv) < 1000:
                 break
         except Exception as e:
@@ -47,58 +38,79 @@ def fetch_data(symbol, timeframe, start_str):
     return df
 
 def compute_sma_metrics(df):
-    """
-    Vectorized computation of SMAs using periods round(1.25^x) for x=1..22
-    and the count below price.
-    """
     print("Computing SMAs and regime metrics...")
-    
-    # optimize: store SMAs in a separate DataFrame for vectorized comparison
     sma_dict = {}
     for period in SMA_PERIODS:
         sma_dict[f'SMA_{period}'] = df['close'].rolling(window=period).mean()
     
     df_smas = pd.DataFrame(sma_dict, index=df.index)
     
-    # 1. Count how many SMAs are BELOW the current close price
-    # We use .lt() (less than) for broadcasting comparison
-    # sum(axis=1) counts the True values per row
+    # Count SMAs BELOW price
     df['count_below'] = df_smas.lt(df['close'], axis=0).sum(axis=1)
     
-    # 2. The "Rest" is simply Total SMAs - Count Below
+    # The "Rest" is Total SMAs - Count Below
     total_smas = len(SMA_PERIODS)
     df['count_above'] = total_smas - df['count_below']
     
     return df
 
-def create_figure(df):
+def backtest_strategy(df):
     """
-    Creates the Dual-Axis Plotly figure.
+    Calculates strategy returns based on the count of SMAs below price.
+    Long if Yesterday > 4, Short if Yesterday < 4.
     """
+    print("Running backtest...")
+    
+    # 1. Calculate underlying asset daily returns
+    df['pct_change'] = df['close'].pct_change()
+    
+    # 2. Define Signal (1 = Long, -1 = Short, 0 = Flat)
+    # This signal is based on the current row's data
+    conditions = [
+        (df['count_below'] > 4),
+        (df['count_below'] < 4)
+    ]
+    choices = [1, -1]
+    # Default is 0 (Flat) if count == 4
+    df['raw_signal'] = np.select(conditions, choices, default=0)
+    
+    # 3. Shift Signal
+    # We trade TODAY based on YESTERDAY's signal. 
+    df['position'] = df['raw_signal'].shift(1)
+    
+    # 4. Calculate Strategy Returns
+    df['strategy_return'] = df['position'] * df['pct_change']
+    df['strategy_return'] = df['strategy_return'].fillna(0)
+    
+    # 5. Cumulative Capital
+    df['capital'] = INITIAL_CAPITAL * (1 + df['strategy_return']).cumprod()
+    
+    return df
+
+def create_regime_figure(df):
     fig = go.Figure()
 
-    # --- Stacked Area Chart (Counts) on Primary Y-Axis ---
-    # "Below" Count (Green area)
+    # Stacked Area: Below (Green)
     fig.add_trace(go.Scatter(
         x=df.index, y=df['count_below'],
         name='SMAs Below Price',
-        stackgroup='one', # Enable stacking
-        mode='none',      # No lines, just filled area
-        fillcolor='rgba(0, 200, 100, 0.5)', # Semi-transparent Green
+        stackgroup='one',
+        mode='none',
+        fillcolor='rgba(0, 200, 100, 0.5)', 
         hoverinfo='x+y'
     ))
 
-    # "Above" Count (Red/Grey area) - The "Rest"
+    # Stacked Area: Above (Red)
     fig.add_trace(go.Scatter(
         x=df.index, y=df['count_above'],
         name='SMAs Above Price',
         stackgroup='one', 
         mode='none',
-        fillcolor='rgba(200, 50, 50, 0.3)', # Semi-transparent Red
+        fillcolor='rgba(200, 50, 50, 0.3)', 
         hoverinfo='x+y'
     ))
 
-    # --- Price Line on Secondary Y-Axis ---
+    # Price Line
     fig.add_trace(go.Scatter(
         x=df.index, y=df['close'],
         name='Price (BTC)',
@@ -106,24 +118,37 @@ def create_figure(df):
         yaxis='y2'
     ))
 
-    # Layout Configuration
     fig.update_layout(
-        title=f'Market Regime: SMA Counts ({SMA_PERIODS[0]}-{SMA_PERIODS[-1]}) vs Price',
+        title=f'Market Regime: SMA Counts vs Price',
         template='plotly_dark',
-        height=700,
+        height=500, # Reduced height to fit both charts
         hovermode='x unified',
-        yaxis=dict(
-            title='Count of SMAs',
-            range=[0, len(SMA_PERIODS)],
-            fixedrange=True
-        ),
-        yaxis2=dict(
-            title='Price (USDT)',
-            overlaying='y',
-            side='right',
-            showgrid=False
-        ),
-        legend=dict(x=0, y=1.05, orientation='h')
+        yaxis=dict(title='Count of SMAs', range=[0, len(SMA_PERIODS)], fixedrange=True),
+        yaxis2=dict(title='Price (USDT)', overlaying='y', side='right', showgrid=False),
+        legend=dict(x=0, y=1.05, orientation='h'),
+        margin=dict(l=50, r=50, t=50, b=20)
+    )
+    return fig
+
+def create_capital_figure(df):
+    fig = go.Figure()
+
+    # Capital Curve
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['capital'],
+        name='Strategy Capital',
+        line=dict(color='#00d4ff', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(0, 212, 255, 0.1)'
+    ))
+
+    fig.update_layout(
+        title=f'Strategy Performance (Start: ${INITIAL_CAPITAL})',
+        template='plotly_dark',
+        height=400,
+        hovermode='x unified',
+        yaxis=dict(title='Capital (USDT)', type='log'), # Log scale usually better for crypto
+        margin=dict(l=50, r=50, t=50, b=50)
     )
     return fig
 
@@ -135,12 +160,19 @@ if __name__ == '__main__':
     # 2. Compute
     df = compute_sma_metrics(df)
     
-    # 3. Server Setup
+    # 3. Backtest
+    df = backtest_strategy(df)
+    
+    # 4. Server Setup
     app = Dash(__name__)
     
     app.layout = html.Div([
-        dcc.Graph(figure=create_figure(df), style={'height': '95vh'})
-    ], style={'backgroundColor': '#111', 'margin': '-8px'})
+        # Graph 1: Regime
+        dcc.Graph(figure=create_regime_figure(df)),
+        
+        # Graph 2: Capital
+        dcc.Graph(figure=create_capital_figure(df))
+    ], style={'backgroundColor': '#111', 'padding': '20px'})
 
     print(f"Starting server on port {PORT}...")
     app.run(debug=False, port=PORT, host='0.0.0.0')
