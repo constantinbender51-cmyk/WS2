@@ -9,8 +9,7 @@ from datetime import datetime
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'  # Daily candles. Change to '4h' or '1h' for more granularity.
 START_DATE = '2018-01-01 00:00:00'
-SMA_WINDOW_MIN = 1
-SMA_WINDOW_MAX = 120
+SMA_PERIODS = sorted(set([round(1.25 ** x) for x in range(1, 23)]))  # x from 1 to 22
 PORT = 8080
 
 def fetch_data(symbol, timeframe, start_str):
@@ -49,14 +48,15 @@ def fetch_data(symbol, timeframe, start_str):
 
 def compute_sma_metrics(df):
     """
-    Vectorized computation of 120 SMAs and the count below price.
+    Vectorized computation of SMAs using periods round(1.25^x) for x=1..22
+    and the count below price.
     """
     print("Computing SMAs and regime metrics...")
     
     # optimize: store SMAs in a separate DataFrame for vectorized comparison
     sma_dict = {}
-    for i in range(SMA_WINDOW_MIN, SMA_WINDOW_MAX + 1):
-        sma_dict[f'SMA_{i}'] = df['close'].rolling(window=i).mean()
+    for period in SMA_PERIODS:
+        sma_dict[f'SMA_{period}'] = df['close'].rolling(window=period).mean()
     
     df_smas = pd.DataFrame(sma_dict, index=df.index)
     
@@ -66,7 +66,7 @@ def compute_sma_metrics(df):
     df['count_below'] = df_smas.lt(df['close'], axis=0).sum(axis=1)
     
     # 2. The "Rest" is simply Total SMAs - Count Below
-    total_smas = SMA_WINDOW_MAX - SMA_WINDOW_MIN + 1
+    total_smas = len(SMA_PERIODS)
     df['count_above'] = total_smas - df['count_below']
     
     return df
@@ -108,13 +108,13 @@ def create_figure(df):
 
     # Layout Configuration
     fig.update_layout(
-        title=f'Market Regime: SMA Counts (1-{SMA_WINDOW_MAX}) vs Price',
+        title=f'Market Regime: SMA Counts ({SMA_PERIODS[0]}-{SMA_PERIODS[-1]}) vs Price',
         template='plotly_dark',
         height=700,
         hovermode='x unified',
         yaxis=dict(
             title='Count of SMAs',
-            range=[0, SMA_WINDOW_MAX],
+            range=[0, len(SMA_PERIODS)],
             fixedrange=True
         ),
         yaxis2=dict(
