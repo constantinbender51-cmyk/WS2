@@ -58,8 +58,9 @@ def fetch_binance_history(symbol, start_str):
                 break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1 # Move 'since' to the end of the fetched candle
-            # Optional: Add a small delay to avoid hitting rate limits too quickly
-            # time.sleep(0.1) 
+            # Add a small delay to avoid hitting rate limits too quickly
+            import time
+            time.sleep(0.1)
         except ccxt.NetworkError as e:
             print(f"Network error: {e}. Retrying...")
             # Implement retry logic here if desired
@@ -190,7 +191,7 @@ for name, params in scenarios.items():
         scenario_equity.append(equity)
         
     # C. Metrics
-    eq_series = pd.Series(scenario_equity, index=df.index[start_idx_max-len(scenario_equity):])
+    eq_series = pd.Series(scenario_equity, index=df.index)
     # Recalculate pure Buy Hold for comparison on same timeframe
     bh_series = df['close'].iloc[start_idx_max:] / df['close'].iloc[start_idx_max]
     
