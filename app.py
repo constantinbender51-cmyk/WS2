@@ -116,13 +116,13 @@ def get_final_metrics(equity_series):
     """
     Calculate total return, CAGR, max drawdown, and Sharpe ratio from equity series.
     Assumes daily returns (252 trading days per year).
-    Starts from the second element to exclude warmup period (initial equity = 1.0).
+    Uses the full equity series starting from the first valid value.
     """
-    if len(equity_series) < 3:  # Need at least 2 points after skipping first
-        return 0.0, 0.0, 0.0, 0.0
+    # Drop NaN values (warmup period)
+    equity_series = equity_series.dropna()
     
-    # Skip the first element (warmup period)
-    equity_series = equity_series.iloc[1:]
+    if len(equity_series) < 2:
+        return 0.0, 0.0, 0.0, 0.0
     
     # Total return
     total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
@@ -171,19 +171,12 @@ final_rets_final = base_ret_arr * lev_arr_final
 
 # 4. FINAL BACKTEST WITH FIXED PARAMS
 
-# Create tier mask for best thresholds
-tier_mask_final = np.full(len(df), 2, dtype=int) # Default High
-tier_mask_final[iii_prev < OPT_T_HIGH] = 1 # Mid
-tier_mask_final[iii_prev < OPT_T_LOW] = 0  # Low
-
-# Construct leverage array for best leverages
-lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
-lev_arr_final = lookup_final[tier_mask_final]
-final_rets_final = base_ret_arr * lev_arr_final
+# Remove duplicate tier mask and leverage array creation (already done above)
+# Use the existing tier_mask_final and lev_arr_final from section 3
 
 # Backtest simulation for plot data
-df['strategy_equity'] = 1.0
-df['leverage_used'] = 0.0
+df['strategy_equity'] = np.nan
+df['leverage_used'] = np.nan
 equity = 1.0
 is_busted = False
 
@@ -200,9 +193,11 @@ for i in range(start_idx, len(df)):
     df.at[df.index[i], 'strategy_equity'] = equity
     df.at[df.index[i], 'leverage_used'] = leverage
 
+# Set equity before start_idx to NaN to exclude from metrics
+df.loc[:df.index[start_idx-1], 'strategy_equity'] = np.nan
+
 # 5. METRICS & PLOT
 plot_data = df.iloc[start_idx:].copy()
-s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 # Calculate buy & hold equity for comparison
 plot_data['buy_hold_equity'] = plot_data['close'] / plot_data['close'].iloc[0]
 
