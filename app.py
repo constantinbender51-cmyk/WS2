@@ -116,9 +116,13 @@ def get_final_metrics(equity_series):
     """
     Calculate total return, CAGR, max drawdown, and Sharpe ratio from equity series.
     Assumes daily returns (252 trading days per year).
+    Starts from the second element to exclude warmup period (initial equity = 1.0).
     """
-    if len(equity_series) < 2:
+    if len(equity_series) < 3:  # Need at least 2 points after skipping first
         return 0.0, 0.0, 0.0, 0.0
+    
+    # Skip the first element (warmup period)
+    equity_series = equity_series.iloc[1:]
     
     # Total return
     total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
