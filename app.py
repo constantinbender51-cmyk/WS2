@@ -9,7 +9,6 @@ import io
 import base64
 
 # 1. CONFIGURATION
-# ----------------
 symbol = 'BTC/USDT'
 timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
@@ -22,26 +21,26 @@ TP_PCT = 0.16
 
 # --- SCENARIO DEFINITIONS (The Core Test) ---
 scenarios = {
-    "0. BASELINE (Optimal)": {
-        "III_WINDOW": 35,
-        "T_LOW": 0.13, "T_HIGH": 0.18,
-        "L_LOW": 0.5, "L_MID": 4.5, "L_HIGH": 2.45
+    "0. BASELINE (T=0.10/0.50)": {
+        "III_WINDOW": 14,
+        "T_LOW": 0.10, "T_HIGH": 0.50,
+        "L_LOW": 0.0, "L_MID": 1.75, "L_HIGH": 1.0
     },
-    "1. T_SHIFT (-0.05)": {
-        "III_WINDOW": 35,
-        "T_LOW": 0.08, "T_HIGH": 0.13, # Nudged down
-        "L_LOW": 0.5, "L_MID": 4.5, "L_HIGH": 2.45
+    "1. T_SHIFT (+0.05)": {
+        "III_WINDOW": 14,
+        "T_LOW": 0.15, "T_HIGH": 0.55, 
+        "L_LOW": 0.0, "L_MID": 1.75, "L_HIGH": 1.0
     },
-    "2. LAG_SLOW (+10 Days)": {
-        "III_WINDOW": 45, # Slower lookback
-        "T_LOW": 0.13, "T_HIGH": 0.18,
-        "L_LOW": 0.5, "L_MID": 4.5, "L_HIGH": 2.45
+    "2. LAG_SLOW (+4 Days)": {
+        "III_WINDOW": 18, 
+        "T_LOW": 0.10, "T_HIGH": 0.50,
+        "L_LOW": 0.0, "L_MID": 1.75, "L_HIGH": 1.0
     },
-    "3. LEV_MID (-1.0x)": {
-        "III_WINDOW": 35,
-        "T_LOW": 0.13, "T_HIGH": 0.18,
-        "L_LOW": 0.5, "L_MID": 3.5, # Reduced aggression
-        "L_HIGH": 2.45
+    "3. LEV_MID (-0.25x)": {
+        "III_WINDOW": 14,
+        "T_LOW": 0.10, "T_HIGH": 0.50,
+        "L_LOW": 0.0, "L_MID": 1.50, # Reduced aggression
+        "L_HIGH": 1.0
     },
 }
 
@@ -101,7 +100,6 @@ for i in range(len(df)):
         base_returns.append(0.0)
         continue
     
-    # Standard 1x Base Return Calculation
     prev_close = df['close'].iloc[i-1]
     prev_fast = df['sma_fast'].iloc[i-1]
     prev_slow = df['sma_slow'].iloc[i-1]
@@ -158,7 +156,6 @@ for name, params in scenarios.items():
     # --- C. CALCULATE EQUITY & METRICS ---
     equity_series = pd.Series(np.cumprod(1 + final_rets), index=df.index)
     
-    # Only evaluate starting from the latest required start index
     eval_series = equity_series.iloc[start_idx_max:]
     eval_base_rets = df['base_ret'].iloc[start_idx_max:]
 
@@ -185,25 +182,20 @@ print("-" * 70)
 for index, row in results_df.iterrows():
     name = row['Scenario']
     params = scenarios[name]
-    param_str = f"W:{params['III_WINDOW']}, T:{params['T_LOW']}/{params['T_HIGH']}, L:{params['L_LOW']}/{params['L_MID']}/{params['L_HIGH']}"
+    param_str = f"W:{params['III_WINDOW']}, T:{params['T_LOW']:.2f}/{params['T_HIGH']:.2f}, L:{params['L_LOW']:.2f}/{params['L_MID']:.2f}/{params['L_HIGH']:.2f}"
     
     print(f"{name:<25} | {row['Sharpe']:.2f}<{' ':<2} | {row['CAGR']*100:.1f}%<{' ':<1} | {row['MDD']*100:.1f}%<{' ':<1} | {param_str}")
 
 print("="*70 + "\n")
 
+# 5. VISUALIZATION
+# --- Setup plotting ---
+fig, ax = plt.subplots(figsize=(14, 8))
 
-# 5. VISUALIZATION (Plotting the best and worst for comparison)
-plt.figure(figsize=(14, 8))
-
-# Find Baseline and Worst Sharpe for visual check
-baseline_series = results_df[results_df['Scenario'] == "0. BASELINE (Optimal)"].iloc[0]
-best_sharpe_series = results_df.loc[results_df['Sharpe'].idxmax()]
-worst_sharpe_series = results_df.loc[results_df['Sharpe'].idxmin()]
-
-
-# Function to get the full equity curve for a scenario
+# Function to retrieve and plot equity curve for visualization
 def get_equity_curve(params):
     iii_window = params['III_WINDOW']
+    # Recalculate III for visualization fidelity
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     df['net_direction'] = df['log_ret'].rolling(iii_window).sum().abs()
     df['path_length'] = df['log_ret'].abs().rolling(iii_window).sum()
@@ -225,74 +217,69 @@ def get_equity_curve(params):
     equity_curve = pd.Series(np.cumprod(1 + final_rets), index=df.index)
     return equity_curve.iloc[start_idx_max:]
 
-# Plotting the three curves
-baseline_eq = get_equity_curve(scenarios["0. BASELINE (Optimal)"])
-best_eq = get_equity_curve(scenarios[best_sharpe_series['Scenario']])
-worst_eq = get_equity_curve(scenarios[worst_sharpe_series['Scenario']])
+# Plotting the four curves
+colors = ['blue', 'green', 'orange', 'red']
+for (i, row), color in zip(results_df.iterrows(), colors):
+    params = scenarios[row['Scenario']]
+    eq = get_equity_curve(params)
+    ax.plot(eq.index, eq, label=f"{row['Scenario']} (Sharpe: {row['Sharpe']:.2f})", color=color, linewidth=2 if i==0 else 1)
 
-plt.plot(baseline_eq.index, baseline_eq, label=f"Baseline (Sharpe: {baseline_series['Sharpe']:.2f})", color='blue', linewidth=2)
-plt.plot(best_eq.index, best_eq, label=f"{best_sharpe_series['Scenario']} (Sharpe: {best_sharpe_series['Sharpe']:.2f})", color='green', linestyle='--')
-plt.plot(worst_eq.index, worst_eq, label=f"{worst_sharpe_series['Scenario']} (Sharpe: {worst_sharpe_series['Sharpe']:.2f})", color='red', linestyle=':')
+ax.set_yscale('log')
+ax.set_title(f'Robustness Check: III-14 Architecture Sensitivity')
+ax.legend()
+ax.grid(True, which='both', linestyle='--', alpha=0.3)
+plt.tight_layout()
 
-plt.yscale('log')
-plt.title('Sensitivity Analysis: Equity Curves (Log Scale)')
-plt.legend()
-plt.grid(True, which='both', linestyle='--', alpha=0.3)
-
-# Save plot to buffer
-buf = io.BytesIO()
-plt.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-plt.close()
-buf.seek(0)
-plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
-
-# 6. FLASK APP TO SERVE PLOT
-plot_path = os.path.join('/app/static', 'sensitivity_plot.png')
-# This is a bit complex in this environment, so we'll serve the output table and analysis.
-# The plot file itself cannot be dynamically created and served within this markdown block.
-
-print("Starting Web Server...")
-# Create a dummy image file for the environment to show the plot
+# Save plot to file
 plot_dir = '/app/static'
 if not os.path.exists(plot_dir): os.makedirs(plot_dir)
-with open(plot_path, "wb") as f:
-    f.write(base64.b64decode(plot_base64))
+plot_path = os.path.join(plot_dir, 'robustness_plot.png')
+plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+plt.close(fig)
 
+
+# 6. FLASK APP TO SERVE PLOT
+table_html = results_df.to_html(classes='table table-striped', float_format='%.2f', 
+                                    formatters={'CAGR': '{:.1%}'.format, 'MDD': '{:.1%}'.format})
+    
+response_html = f"""
+<html>
+<head>
+    <title>Robustness Check Results</title>
+    <style>
+        body {{ font-family: sans-serif; }}
+        h2 {{ color: #1E90FF; }}
+        table {{ width: 90%; border-collapse: collapse; margin: 20px 0; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: right; }}
+        th {{ background-color: #f2f2f2; }}
+        .container {{ display: flex; flex-direction: column; align-items: center; }}
+        .header-box {{ border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; background-color: #f9f9f9; width: 90%; max-width: 900px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header-box">
+            <h2>Robustness Check: III 14-Day Architecture</h2>
+            <p><strong>Baseline Parameters:</strong> W=14, T=0.10/0.50, L=0.0/1.75/1.0</p>
+            <p><strong>Goal:</strong> Validate that slight parameter shifts cause graceful degradation, not catastrophic failure.</p>
+        </div>
+        <img src="/static/robustness_plot.png" alt="Equity Curve Comparison" style="width: 80%; max-width: 900px;">
+        <h3>Metric Comparison</h3>
+        <p>Baseline B&H CAGR: {bh_cagr*100:.1f}%</p>
+        {table_html}
+    </div>
+</body>
+</html>
+"""
 
 app = Flask(__name__)
 @app.route('/')
-def serve_plot(): 
-    # Create HTML response containing the analysis table and the image
-    table_html = results_df.to_html(classes='table table-striped', float_format='%.2f')
-    
-    response_html = f"""
-    <html>
-    <head>
-        <title>Sensitivity Analysis</title>
-        <style>
-            body {{ font-family: sans-serif; }}
-            h2 {{ color: #1E90FF; }}
-            table {{ width: 90%; border-collapse: collapse; margin: 20px 0; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: right; }}
-            th {{ background-color: #f2f2f2; }}
-            .container {{ display: flex; flex-direction: column; align-items: center; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Sensitivity Analysis Results</h2>
-            <img src="/static/sensitivity_plot.png" alt="Equity Curve Comparison" style="width: 80%; max-width: 900px;">
-            <h3>Metric Comparison</h3>
-            <p>Baseline B&H CAGR: {bh_cagr*100:.1f}%</p>
-            {table_html}
-        </div>
-    </body>
-    </html>
-    """
-    return response_html
-
+def serve_html(): return response_html
+@app.route('/static/<path:path>')
+def serve_static(path): return send_file(os.path.join(plot_dir, path))
 @app.route('/health')
 def health(): return 'OK', 200
 
 if __name__ == '__main__':
+    print("Starting Web Server...")
     app.run(host='0.0.0.0', port=8080, debug=False)
