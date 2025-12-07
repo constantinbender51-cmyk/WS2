@@ -121,25 +121,24 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
     if len(sma_values) > 0:
         # Calculate derivative of SMA using gradient
         sma_derivative = np.gradient(sma_values.values)
-        derivative_magnitude = np.abs(sma_derivative)
         
-        # Identify points where derivative magnitude is close to 0 (within 5% of mean derivative magnitude)
-        mean_derivative_magnitude = derivative_magnitude.mean()
-        zero_derivative_threshold = 0.05 * mean_derivative_magnitude
-        near_zero_derivative_mask = derivative_magnitude < zero_derivative_threshold
+        # Identify points where the slope is horizontal (derivative close to 0)
+        # Use a threshold relative to the SMA value at each point
+        horizontal_threshold = 0.001 * sma_values.values
+        horizontal_mask = np.abs(sma_derivative) < horizontal_threshold
         
         # Create noise array (initially zeros - no noise)
         noise = np.zeros(len(sma_values))
         
-        # Add noise only where derivative is close to 0
-        if np.any(near_zero_derivative_mask):
+        # Add noise only where slope is horizontal
+        if np.any(horizontal_mask):
             # Generate Gaussian noise based on SMA magnitude and noise_level
-            derivative_noise = np.random.normal(
+            horizontal_noise = np.random.normal(
                 0, 
                 noise_level * sma_values.mean(), 
-                np.sum(near_zero_derivative_mask)
+                np.sum(horizontal_mask)
             )
-            noise[near_zero_derivative_mask] = derivative_noise
+            noise[horizontal_mask] = horizontal_noise
         
         # Add noise to SMA
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
