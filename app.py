@@ -8,8 +8,8 @@ import time
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
-MAX_SMA = 120
-RISK_FREE_RATE = 0.0  # Simplified for raw Sharpe comparison
+MAX_SMA = 365  # Extended search space
+RISK_FREE_RATE = 0.0
 
 def fetch_data(symbol, timeframe, start_str):
     """Fetches full history from Binance."""
@@ -35,25 +35,19 @@ def fetch_data(symbol, timeframe, start_str):
     print(f"Data loaded: {len(df)} candles.")
     return df
 
-def calculate_sharpe(returns):
-    """Calculates Annualized Sharpe Ratio (assuming 365 trading days for Crypto)."""
-    if np.std(returns) == 0: return 0
-    return (np.mean(returns) / np.std(returns)) * np.sqrt(365)
-
 def run_massive_analysis(df):
     print(f"\n--- Starting Massive Analysis (Max SMA: {MAX_SMA}) ---")
+    start_time = time.time()
     
     # 1. Pre-calculate Returns and Price Array
-    # 'returns' is the daily percent change of the asset
     market_returns = df['close'].pct_change().fillna(0).to_numpy()
     close_prices = df['close'].to_numpy()
     
-    # 2. Pre-calculate ALL SMAs into a Matrix (Time x 120)
-    # This avoids re-calculating rolling means inside loops
-    print("Pre-calculating SMA Matrix...")
+    # 2. Pre-calculate ALL SMAs into a Matrix (Time x MAX_SMA)
+    print(f"Pre-calculating SMA Matrix (1 to {MAX_SMA})...")
     sma_matrix = np.zeros((len(df), MAX_SMA))
     
-    # Fill matrix: Column 0 is SMA_1, Column 119 is SMA_120
+    # Fill matrix: Column 0 is SMA_1, Column 364 is SMA_365
     for i in range(MAX_SMA):
         period = i + 1
         sma_matrix[:, i] = df['close'].rolling(window=period).mean().fillna(0).to_numpy()
@@ -61,25 +55,19 @@ def run_massive_analysis(df):
     results = []
 
     # --- STRATEGY TYPE 1: Price vs SMA ---
-    # Long if Price > SMA, Short if Price < SMA
-    print("Backtesting Type 1: Price vs SMA (1-120)...")
+    print(f"Backtesting Type 1: Price vs SMA (1-{MAX_SMA})...")
     
-    # Vectorized comparison: Price (T,1) vs SMA_Matrix (T, 120)
-    # signal_raw: 1 if Price > SMA, -1 if Price < SMA
-    # We use broadcasting: close_prices[:, None] makes it a column vector to compare against matrix
+    # Vectorized comparison: Price (T,1) vs SMA_Matrix (T, MAX_SMA)
     price_signal_raw = np.where(close_prices[:, None] > sma_matrix, 1, -1)
     
-    # Shift signals by 1 day (Trade today based on Yesterday's signal)
-    # We roll the array forward and set the first row to 0
+    # Shift signals by 1 day
     price_signals = np.roll(price_signal_raw, 1, axis=0)
     price_signals[0, :] = 0
     
-    # Calculate Strategy Returns: Signal * Market_Returns
-    # Market Returns (T,) needs to be broadcast to (T, 120)
+    # Calculate Strategy Returns
     type1_returns = price_signals * market_returns[:, None]
     
-    # Compute Sharpes for all 120 strategies at once
-    # mean and std along axis 0 (time)
+    # Compute Sharpes
     means = np.mean(type1_returns, axis=0)
     stds = np.std(type1_returns, axis=0)
     sharpes = np.divide(means, stds, out=np.zeros_like(means), where=stds!=0) * np.sqrt(365)
@@ -91,21 +79,14 @@ def run_massive_analysis(df):
         })
 
     # --- STRATEGY TYPE 2: SMA vs SMA Crossover ---
-    # SMA1 > SMA2 -> Long, SMA1 < SMA2 -> Short
-    # Combinations: 120 * 119 = ~14,280 pairs
-    print("Backtesting Type 2: SMA vs SMA Crossovers (This may take a moment)...")
+    print(f"Backtesting Type 2: SMA vs SMA Crossovers (~{MAX_SMA**2} combinations)...")
     
-    # We iterate through all unique pairs to save memory, 
-    # though full matrix broadcasting (120x120xT) would be too RAM heavy (~1GB+ for 2000 days).
-    # A loop over 120 outer SMAs is efficient enough.
-    
+    # Iterate through Fast SMAs
     for fast_idx in range(MAX_SMA):
-        # We want to compare SMA(fast_idx+1) against ALL other SMAs
-        # fast_sma is a vector (T,)
         fast_sma = sma_matrix[:, fast_idx]
         
-        # Compare fast_sma against the entire sma_matrix
-        # Result is (T, 120) signals for this specific fast_sma
+        # Compare this fast_sma against ALL other SMAs in the matrix at once
+        # Result is (T, MAX_SMA) signals
         cross_signals_raw = np.where(fast_sma[:, None] > sma_matrix, 1, -1)
         
         # Shift
@@ -121,19 +102,23 @@ def run_massive_analysis(df):
         c_sharpes = np.divide(c_means, c_stds, out=np.zeros_like(c_means), where=c_stds!=0) * np.sqrt(365)
         
         for slow_idx in range(MAX_SMA):
-            if fast_idx == slow_idx: continue # Skip comparing SMA to itself
+            if fast_idx == slow_idx: continue
             
-            # fast_idx + 1 is the period
             p1 = fast_idx + 1
             p2 = slow_idx + 1
             
+            # Only record if Sharpe is somewhat meaningful to save list overhead? 
+            # (Optional optimization, currently keeping all)
             results.append({
                 'Strategy': f"SMA({p1}) vs SMA({p2})",
                 'Sharpe': c_sharpes[slow_idx]
             })
 
     # --- Final Ranking ---
-    print("\nSorting results...")
+    elapsed = time.time() - start_time
+    print(f"Analysis complete in {elapsed:.2f} seconds.")
+    print("Sorting results...")
+    
     df_results = pd.DataFrame(results)
     df_results = df_results.sort_values(by='Sharpe', ascending=False).reset_index(drop=True)
     
