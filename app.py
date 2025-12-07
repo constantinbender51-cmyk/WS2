@@ -119,22 +119,37 @@ def prepare_logistic_data(log_returns, poly_degree=2):
 # Function to project future data using linear regression
 def project_future_data(model, poly, last_log_return, periods=16*365):
     """Project future log returns using trained linear regression model."""
-    # Start with the last known log return
-    current_features = np.array([[last_log_return]])
-    current_features_poly = poly.transform(current_features)
+    # For degree 1 polynomial, we can use simple linear extrapolation
+    # The model is: y = b0 + b1*x
+    # Where x is the log return at time t, y is log return at time t+1
     
-    projected_returns = []
-    
-    for _ in range(periods):
-        # Predict next log return
-        next_return = model.predict(current_features_poly)[0]
-        projected_returns.append(next_return)
-        
-        # Update features for next prediction
-        current_features = np.array([[next_return]])
+    # Get model coefficients
+    if hasattr(model, 'coef_') and hasattr(model, 'intercept_'):
+        b1 = model.coef_[0]
+        b0 = model.intercept_
+    else:
+        # Fallback to iterative method
+        current_features = np.array([[last_log_return]])
         current_features_poly = poly.transform(current_features)
+        
+        projected_returns = []
+        
+        for _ in range(periods):
+            next_return = model.predict(current_features_poly)[0]
+            projected_returns.append(next_return)
+            
+            current_features = np.array([[next_return]])
+            current_features_poly = poly.transform(current_features)
+        
+        return np.array(projected_returns)
     
-    return np.array(projected_returns)
+    # For straight line projection: each predicted return is constant
+    # y = b0 + b1*x, but for projection we use the same x (last_log_return)
+    # This gives constant predicted returns
+    constant_return = b0 + b1 * last_log_return
+    projected_returns = np.full(periods, constant_return)
+    
+    return projected_returns
 
 # Function to convert log returns back to price
 def log_returns_to_price(initial_price, log_returns):
@@ -216,8 +231,16 @@ def index():
         # Plot historical price
         ax1.plot(df.index, df['close'], label='Historical Price (2018-Present)', color='blue', linewidth=1.5)
         
-        # Plot projected continuation price
+        # Plot projected continuation price - ensure it's a straight line
+        # Calculate the linear trend line for the projection
+        projection_days = np.arange(len(projected_prices))
+        projection_trend = np.polyfit(projection_days, projected_prices, 1)
+        projection_line = np.polyval(projection_trend, projection_days)
+        
         ax1.plot(future_dates, projected_prices, label='Projected Continuation (Next 16 Years)', color='orange', linewidth=1.5, linestyle='--')
+        
+        # Add a straight line overlay to show the linear trend
+        ax1.plot(future_dates, projection_line, label='Linear Trend Line', color='red', linewidth=2, linestyle='-', alpha=0.7)
         
         # Add vertical line at the transition point
         ax1.axvline(x=last_date, color='red', linestyle=':', alpha=0.7, label=f'Transition: {last_date.date()}')
@@ -225,7 +248,7 @@ def index():
         # Add horizontal line at last price
         ax1.axhline(y=last_price, color='green', linestyle='--', alpha=0.5, label=f'Last Price: ${last_price:.2f}')
         
-        ax1.set_title('BTC/USDT Price with Linear Regression Projection (Degree 1)')
+        ax1.set_title('BTC/USDT Price with Linear Regression Projection (Degree 1 - Straight Line)')
         ax1.set_xlabel('Date')
         ax1.set_ylabel('Price (USDT)')
         ax1.legend()
@@ -334,7 +357,7 @@ def index():
                 
                 <div class="plot-container">
                     <h2 class="section-title">Price and Continuation Dataset</h2>
-                    <p>Historical price (blue solid line) and projected continuation (orange dashed line) using linear regression with degree 1 polynomial features.</p>
+                    <p>Historical price (blue solid line) and projected continuation (orange dashed line) using linear regression with degree 1 polynomial features. Red solid line shows the straight-line trend.</p>
                     <img src="data:image/png;base64,{{ plot_url1 }}" alt="Price and Continuation Plot">
                 </div>
                 
