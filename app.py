@@ -170,19 +170,11 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
                 best_mdd = mdd
 
 
-# 4. FINAL BACKTEST WITH BEST PARAMS
-OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
-
-# Recalculate tier mask for the final run
-iii_prev = df['iii'].shift(1).fillna(0).values
-tier_mask_final = np.full(len(df), 2, dtype=int) 
-tier_mask_final[iii_prev < OPT_T_HIGH] = 1
-tier_mask_final[iii_prev < OPT_T_LOW] = 0
-
-# Final optimized leverage array
-lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
-lev_arr_final = lookup_final[tier_mask_final]
-final_rets_final = base_ret_arr * lev_arr_final
+# 4. FINAL BACKTEST WITH FIXED PARAMS
+# Use the same tier mask and leverage array from fixed calculation
+tier_mask_final = tier_mask
+lev_arr_final = lev_arr
+final_rets_final = final_rets
 
 # Backtest simulation for plot data
 df['strategy_equity'] = 1.0
@@ -208,9 +200,9 @@ plot_data = df.iloc[start_idx:].copy()
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 
 print("\n" + "="*45)
-print(f"BEST 5-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
-print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
-print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
+print(f"FIXED PARAMETERS BASED ON USER INPUT (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
+print(f"Fixed Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
+print(f"Fixed Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
 print("-" * 45)
 print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
 print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
@@ -223,7 +215,7 @@ ax1 = plt.subplot(3, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
-ax1.set_title(f'Final Optimized Strategy (T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
+ax1.set_title(f'Strategy with Fixed Parameters (T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
