@@ -84,7 +84,7 @@ def calculate_indicators(df):
     
     def calc_rolling_iii(x):
         abs_net_dir = abs(x.sum())
-        path_len = x.abs().sum()
+        path_len = np.abs(x).sum()
         if path_len == 0: return 0
         return abs_net_dir / path_len
 
