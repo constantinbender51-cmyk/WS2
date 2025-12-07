@@ -19,10 +19,11 @@ SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 35 
 
-# --- GRID SEARCH SPACE DEFINITION (2 VARIABLES) ---
+# --- FIXED PARAMETERS ---
 
-# Threshold Search Space (T_Low, T_High): 0.13 and 0.18 only
-THRESH_RANGE = np.array([0.13, 0.18]) 
+# Fixed Threshold Values
+FIXED_T_LOW = 0.13
+FIXED_T_HIGH = 0.18
 
 # Fixed Leverage Values (L_Low, L_Mid, L_High): 0.5, 4.5, and 2.45 as specified
 FIXED_L_LOW = 0.5
@@ -109,108 +110,30 @@ for i in range(len(df)):
 
 df['base_ret'] = base_returns
 
-# 3. LEVERAGE GRID SEARCH (Vectorized for Speed)
-total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE)
-print(f"Starting Exhaustive 2-Variable Grid Search ({total_iterations} total combinations)...")
+# 3. FIXED PARAMETERS IMPLEMENTATION
+print("Using fixed parameters without grid search...")
 
 base_ret_arr = np.array(base_returns)
 iii_prev = df['iii'].shift(1).fillna(0).values
 
-best_sharpe = -999
-best_combo = None
-best_mdd = 0
+# Fixed parameters
+OPT_T_LOW = FIXED_T_LOW
+OPT_T_HIGH = FIXED_T_HIGH
+OPT_L_LOW = FIXED_L_LOW
+OPT_L_MID = FIXED_L_MID
+OPT_L_HIGH = FIXED_L_HIGH
 
-# Metrics function optimized for arrays
+# Create tier mask for fixed thresholds
+tier_mask_final = np.full(len(df), 2, dtype=int) # Default High
+tier_mask_final[iii_prev < OPT_T_HIGH] = 1 # Mid
+tier_mask_final[iii_prev < OPT_T_LOW] = 0  # Low
 
-
-def get_final_metrics(equity_series):
-    """Calculate total return, CAGR, max drawdown, and Sharpe ratio from equity series."""
-    if len(equity_series) < 2:
-        return 0, 0, 0, 0
-    
-    # Total return
-    total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
-    
-    # CAGR
-    years = (equity_series.index[-1] - equity_series.index[0]).days / 365.25
-    if years > 0:
-        cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (1 / years) - 1
-    else:
-        cagr = 0
-    
-    # Max drawdown
-    roll_max = equity_series.cummax()
-    drawdown = (equity_series - roll_max) / roll_max
-    max_dd = drawdown.min()
-    
-    # Sharpe ratio (assuming daily returns)
-    daily_returns = equity_series.pct_change().dropna()
-    if len(daily_returns) > 0:
-        sharpe = np.sqrt(365) * daily_returns.mean() / daily_returns.std() if daily_returns.std() > 0 else 0
-    else:
-        sharpe = 0
-    
-    return total_return, cagr, max_dd, sharpe
-
-def calculate_sharpe_mdd(returns):
-    if len(returns) == 0:
-        return 0, 0
-    returns_series = pd.Series(returns)
-    cum_ret = (1 + returns_series).cumprod()
-    if cum_ret.iloc[0] == 0:
-        return 0, 0
-    
-    # Sharpe
-    mean_ret = returns_series.mean()
-    std_ret = returns_series.std()
-    sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
-    
-    # MDD
-    roll_max = cum_ret.cummax()
-    drawdown = (cum_ret - roll_max) / roll_max
-    max_dd = drawdown.min()
-    
-    return sharpe, max_dd
-
-# Outer loop: Thresholds (T_Low, T_High) only
-for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
-    # Enforce logical constraint
-    if t_low >= t_igh: continue 
-    
-    # Create Tier Mask for this specific threshold combo
-    # 0 = Low Tier (III < T_Low)
-    # 1 = Mid Tier (T_Low <= III < T_High)
-    # 2 = High Tier (III >= T_High)
-    
-    # Vectorized mask creation
-    tier_mask = np.full(len(df), 2, dtype=int) # Default High
-    tier_mask[iii_prev < t_high] = 1 # Mid
-    tier_mask[iii_prev < t_low] = 0  # Low
-
-    # Use fixed leverage values: 0.5, 4.5, 2.45
-    lookup = np.array([FIXED_L_LOW, FIXED_L_MID, FIXED_L_HIGH])
-    lev_arr = lookup[tier_mask]
-    
-    final_rets = base_ret_arr * lev_arr
-    
-    # Calculate Sharpe and MDD (Only analyze period where strategy is active)
-    sharpe, mdd = calculate_sharpe_mdd(final_rets[start_idx:])
-    
-    # Check against MDD constraint
-    if mdd <= MAX_MDD_CONSTRAINT: 
-        if sharpe > best_sharpe:
-            best_sharpe = sharpe
-            best_combo = (round(t_low, 2), round(t_high, 2), FIXED_L_LOW, FIXED_L_MID, FIXED_L_HIGH)
-            best_mdd = mdd
-
+# Construct leverage array for fixed leverages
+lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
+lev_arr_final = lookup_final[tier_mask_final]
+final_rets_final = base_ret_arr * lev_arr_final
 
 # 4. FINAL BACKTEST WITH FIXED PARAMS
-# Use the best combination from grid search
-if best_combo is None:
-    # Fallback to default values if no valid combination found
-    best_combo = (0.13, 0.18, FIXED_L_LOW, FIXED_L_MID, FIXED_L_HIGH)
-    print("Warning: No valid combination found in grid search, using default parameters.")
-OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
 
 # Create tier mask for best thresholds
 tier_mask_final = np.full(len(df), 2, dtype=int) # Default High
@@ -251,7 +174,7 @@ plot_data['buy_hold_equity'] = plot_data['close'] / plot_data['close'].iloc[0]
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 
 print("\n" + "="*45)
-print(f"FIXED PARAMETERS BASED ON USER INPUT (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
+print(f"FIXED PARAMETERS (No Grid Search)")
 print(f"Fixed Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
 print(f"Fixed Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
 print("-" * 45)
@@ -266,7 +189,7 @@ ax1 = plt.subplot(3, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
-ax1.set_title(f'Strategy with Fixed Parameters (T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
+ax1.set_title(f'Strategy with Fixed Parameters (No Grid Search) (T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
