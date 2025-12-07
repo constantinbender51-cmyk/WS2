@@ -121,36 +121,25 @@ def compute_sma_with_noise(df, window=120, noise_level=0.01):
     if len(sma_values) > 0:
         # Calculate derivative of SMA using gradient
         sma_derivative = np.gradient(sma_values.values)
+        derivative_magnitude = np.abs(sma_derivative)
         
-        # Identify SMA values close to zero (within 5% of mean absolute value)
-        sma_mean_abs = np.abs(sma_values).mean()
-        zero_threshold = 0.05 * sma_mean_abs
-        near_zero_mask = np.abs(sma_values.values) < zero_threshold
+        # Identify points where derivative magnitude is close to 0 (within 5% of mean derivative magnitude)
+        mean_derivative_magnitude = derivative_magnitude.mean()
+        zero_derivative_threshold = 0.05 * mean_derivative_magnitude
+        near_zero_derivative_mask = derivative_magnitude < zero_derivative_threshold
         
-        # Create noise array
+        # Create noise array (initially zeros - no noise)
         noise = np.zeros(len(sma_values))
         
-        # For points near zero, use noise proportional to derivative magnitude
-        if np.any(near_zero_mask):
-            derivative_magnitude = np.abs(sma_derivative[near_zero_mask])
-            if len(derivative_magnitude) > 0:
-                # Scale derivative-based noise by noise_level
-                derivative_noise = np.random.normal(
-                    0, 
-                    noise_level * derivative_magnitude.mean(), 
-                    len(derivative_magnitude)
-                )
-                noise[near_zero_mask] = derivative_noise
-        
-        # For other points, use standard Gaussian noise based on SMA magnitude
-        other_mask = ~near_zero_mask
-        if np.any(other_mask):
-            standard_noise = np.random.normal(
+        # Add noise only where derivative is close to 0
+        if np.any(near_zero_derivative_mask):
+            # Generate Gaussian noise based on SMA magnitude and noise_level
+            derivative_noise = np.random.normal(
                 0, 
                 noise_level * sma_values.mean(), 
-                np.sum(other_mask)
+                np.sum(near_zero_derivative_mask)
             )
-            noise[other_mask] = standard_noise
+            noise[near_zero_derivative_mask] = derivative_noise
         
         # Add noise to SMA
         df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
