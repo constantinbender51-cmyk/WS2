@@ -66,12 +66,12 @@ def fetch_data():
 def generate_mock_data(original_df, noise_std=0.02):
     """
     Generates a synthetic price history by adding Gaussian noise to daily returns
-    and applying a noisy sine wave oscillator (0.9 to 1.1) with 100-day frequency.
-    Distorts returns faster and slower over time based on the oscillator,
-    and compresses/expands time intervals (rows) along the x-axis.
+    and applying a noisy sine wave oscillator between 0.1 and 10.
+    Distorts time by selecting OHLCV data points based on cumulative rounding of the oscillator,
+    creating compression/expansion of time intervals.
     Preserves general trend but changes specific price action and time spacing.
     """
-    print(f"Generating Mock Data with {noise_std*100}% return noise and noisy sine wave oscillator (100-day freq)...")
+    print(f"Generating Mock Data with {noise_std*100}% return noise and time-distorting oscillator...")
     df = original_df.copy()
     
     # 1. Calculate original returns
@@ -82,17 +82,16 @@ def generate_mock_data(original_df, noise_std=0.02):
     noise = np.random.normal(0, noise_std, size=len(df))
     df['distorted_returns'] = df['pct_change'] + noise
     
-    # 3. Create noisy oscillator: sine wave from 0.9 to 1.1 with 100-day period
-    # Add noise to the sine wave to make it vary faster/slower
+    # 3. Create noisy oscillator: sine wave between 0.1 and 10
     days = np.arange(len(df))
-    frequency = 2 * np.pi / 100
+    frequency = 2 * np.pi / 100  # 100-day period
     sine_wave = np.sin(frequency * days)
-    # Add noise to the sine wave (e.g., 10% of amplitude)
-    sine_noise = np.random.normal(0, 0.1, size=len(df))
+    # Add noise to the sine wave
+    sine_noise = np.random.normal(0, 0.5, size=len(df))  # Increased noise for more variation
     noisy_sine = sine_wave + sine_noise
-    # Scale to 0.9-1.1 range: (noisy_sine + 1) * 0.1 + 0.9, clamp to avoid extreme values
-    oscillator = (noisy_sine + 1) * 0.1 + 0.9
-    oscillator = np.clip(oscillator, 0.8, 1.2)  # Clamp to reasonable bounds
+    # Scale to 0.1-10 range: (noisy_sine + 1) * 4.95 + 0.1, clamp to avoid extreme values
+    oscillator = (noisy_sine + 1) * 4.95 + 0.1
+    oscillator = np.clip(oscillator, 0.1, 10.0)
     
     # 4. Apply oscillator to distorted returns to distort faster/slower
     df['oscillated_returns'] = df['distorted_returns'] * oscillator
@@ -111,49 +110,36 @@ def generate_mock_data(original_df, noise_std=0.02):
     df['mock_low'] = df['mock_close'] * df['low_ratio']
     df['mock_open'] = df['mock_close'] * df['open_ratio']
     
-    # 7. Time distortion: compress/expand rows along x-axis based on oscillator
-    # Create a new irregular time index by cumulatively summing time intervals scaled by oscillator
-    # Start with the original timestamps as a base
-    original_timestamps = df.index
-    # Convert to numeric days for easier manipulation
-    days_numeric = np.arange(len(original_timestamps))
-    # Calculate time intervals (in days) scaled by oscillator: when oscillator > 1, time expands (longer intervals); <1, time compresses (shorter intervals)
-    # Use cumulative sum to get new time positions
-    scaled_intervals = oscillator  # oscillator values around 1, representing scaling factor for daily intervals
-    new_days = np.cumsum(scaled_intervals)  # Cumulative sum to get new day positions
-    # Normalize to start at 0 and match the original time range for alignment
-    new_days = new_days - new_days[0]  # Start at 0
-    # Scale to match the original number of days to keep similar overall duration
-    scale_factor = (len(df) - 1) / new_days[-1] if new_days[-1] != 0 else 1
-    new_days = new_days * scale_factor
-    # Create new timestamps by interpolating from original timestamps based on new_days
-    # Use linear interpolation of timestamps in numeric form
-    original_days_numeric = days_numeric
-    # Interpolate to get new timestamps at integer day positions (0, 1, 2, ...) to maintain daily frequency for alignment
-    # We'll resample the mock data to the original daily frequency by interpolating at integer day positions
-    from scipy import interpolate
-    # Interpolate OHLCV data as functions of new_days
-    interp_func_close = interpolate.interp1d(new_days, df['mock_close'].values, kind='linear', fill_value='extrapolate')
-    interp_func_high = interpolate.interp1d(new_days, df['mock_high'].values, kind='linear', fill_value='extrapolate')
-    interp_func_low = interpolate.interp1d(new_days, df['mock_low'].values, kind='linear', fill_value='extrapolate')
-    interp_func_open = interpolate.interp1d(new_days, df['mock_open'].values, kind='linear', fill_value='extrapolate')
-    interp_func_volume = interpolate.interp1d(new_days, df['volume'].values, kind='linear', fill_value='extrapolate')
-    # Sample at integer day positions (0, 1, 2, ... up to len(df)-1) to keep same number of rows
-    sample_days = np.arange(len(df))
-    mock_close_interp = interp_func_close(sample_days)
-    mock_high_interp = interp_func_high(sample_days)
-    mock_low_interp = interp_func_low(sample_days)
-    mock_open_interp = interp_func_open(sample_days)
-    volume_interp = interp_func_volume(sample_days)
+    # 7. Time distortion: select OHLCV data points based on cumulative rounding of oscillator
+    # Generate cumulative oscillator values rounded to integers to determine index jumps
+    cum_oscillator = np.cumsum(oscillator)
+    cum_rounded = np.round(cum_oscillator).astype(int)
+    
+    # Ensure we stay within bounds of the original data
+    max_index = len(df) - 1
+    selected_indices = []
+    current_cum = 0
+    
+    for i in range(len(df)):
+        # Find the next index based on cumulative rounded value
+        target_index = min(cum_rounded[i], max_index)
+        selected_indices.append(target_index)
+    
+    # Use selected indices to pick data from the mock OHLCV columns
+    mock_close = df['mock_close'].iloc[selected_indices].values
+    mock_high = df['mock_high'].iloc[selected_indices].values
+    mock_low = df['mock_low'].iloc[selected_indices].values
+    mock_open = df['mock_open'].iloc[selected_indices].values
+    mock_volume = df['volume'].iloc[selected_indices].values
     
     # Create mock DataFrame with original timestamps to maintain alignment for downstream functions
     mock_df = pd.DataFrame({
-        'open': mock_open_interp,
-        'high': mock_high_interp,
-        'low': mock_low_interp,
-        'close': mock_close_interp,
-        'volume': volume_interp
-    }, index=original_timestamps)
+        'open': mock_open,
+        'high': mock_high,
+        'low': mock_low,
+        'close': mock_close,
+        'volume': mock_volume
+    }, index=df.index)  # Use original timestamps to keep same length and alignment
     mock_df.index.name = 'timestamp'
     
     return mock_df
