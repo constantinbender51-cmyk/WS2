@@ -1,216 +1,261 @@
+import ccxt
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
-import io
-import base64
-from flask import Flask, render_template_string
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import http.server
+import socketserver
+import webbrowser
+import os
+import threading
+import time
+from datetime import datetime
 
-app = Flask(__name__)
+# --- Configuration ---
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '1d'
+START_DATE = '2018-01-01 00:00:00'
+PORT = 8080
+SEQ_LENGTH = 30  # 30 lag features
 
-# HTML template for the web page
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Binance OHLCV with Noisy SMA</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        h1 { color: #333; }
-        p { color: #666; }
-        img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Binance BTC/USDT OHLCV with Noisy 120-period SMA (Shifted 60 Left)</h1>
-        <p>Data fetched from Binance starting from 2018-01-01. The plot shows the closing prices and the noisy SMA shifted 60 periods left.</p>
-        <img src="data:image/png;base64,{{ plot_data }}" alt="OHLCV with Noisy SMA Plot">
-        <p>Generated at: {{ timestamp }}</p>
-    </div>
-</body>
-</html>
-"""
+# Explicit Retest Dates (Ground Truth)
+RETEST_DATES = [
+    '2020-08-01',
+    '2021-07-12',
+    '2022-03-28',
+    '2023-09-04',
+    '2024-09-02',
+    '2025-03-31'
+]
 
-def fetch_binance_ohlcv(symbol='BTCUSDT', interval='1d', start_date='2018-01-01'):
-    """
-    Fetch OHLCV data from Binance API.
-    
-    Args:
-        symbol: Trading pair symbol (default: BTCUSDT)
-        interval: Kline interval (default: 1d)
-        start_date: Start date in YYYY-MM-DD format (default: 2018-01-01)
-    
-    Returns:
-        pandas.DataFrame with columns: timestamp, open, high, low, close, volume
-    """
-    base_url = 'https://api.binance.com/api/v3/klines'
-    
-    # Convert start_date to timestamp in milliseconds
-    start_timestamp = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
-    
-    all_data = []
-    limit = 1000  # Binance API limit per request
+def fetch_data():
+    print(f"Fetching {SYMBOL} data from Binance starting {START_DATE}...")
+    exchange = ccxt.binance()
+    since = exchange.parse8601(START_DATE)
+    all_ohlcv = []
     
     while True:
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'startTime': start_timestamp,
-            'limit': limit
-        }
-        
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data:
+        try:
+            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1 
+            # Break if we've reached current time (approx)
+            if len(ohlcv) < 500: # binance usually returns 500 or 1000
+                break
+            time.sleep(0.1) # Rate limit politeness
+        except Exception as e:
+            print(f"Error fetching data: {e}")
             break
             
-        all_data.extend(data)
-        
-        # Update start_timestamp for next batch
-        start_timestamp = data[-1][0] + 1
-        
-        # Break if we've fetched all data up to now
-        if len(data) < limit:
-            break
-    
-    # Convert to DataFrame
-    df = pd.DataFrame(all_data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'number_of_trades',
-        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-    ])
-    
-    # Convert columns to appropriate types
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-    df[numeric_cols] = df[numeric_cols].astype(float)
-    
-    # Convert timestamp to datetime
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     
-    return df[['open', 'high', 'low', 'close', 'volume']]
-
-
-def compute_sma_with_noise(df, window=120, noise_level=0.1):
-    """
-    Compute SMA and add static noise to it.
-    
-    Args:
-        df: DataFrame with 'close' column
-        window: SMA window period (default: 120)
-        noise_level: Standard deviation of Gaussian noise (default: 0.1)
-    
-    Returns:
-        DataFrame with added 'sma', 'noisy_sma', and 'noisy_sma_shifted' columns
-    """
-    df = df.copy()
-    
-    # Compute SMA
-    df['sma'] = df['close'].rolling(window=window).mean()
-    
-    # Add static noise to SMA
-    # Only add noise where SMA is not NaN
-    sma_values = df['sma'].dropna()
-    if len(sma_values) > 0:
-        # Create static noise with fixed standard deviation (independent of SMA)
-        noise = np.random.normal(0, noise_level, len(sma_values))
-        
-        # Add noise to SMA
-        df.loc[sma_values.index, 'noisy_sma'] = sma_values + noise
-        
-        # Shift noisy SMA 60 periods to the left
-        df['noisy_sma_shifted'] = df['noisy_sma'].shift(-60)
-    else:
-        df['noisy_sma'] = np.nan
-        df['noisy_sma_shifted'] = np.nan
-    
+    # Filter to ensure uniqueness and order
+    df = df[~df.index.duplicated(keep='first')].sort_index()
     return df
 
+def add_features(df):
+    print("Engineering features...")
+    # Calculate SMAs
+    df['sma365'] = df['close'].rolling(window=365).mean()
+    df['sma120'] = df['close'].rolling(window=120).mean()
+    df['sma40'] = df['close'].rolling(window=40).mean()
+    
+    # Calculate Distances (Percent)
+    # distance = (price - sma) / sma
+    df['dist_365'] = (df['close'] - df['sma365']) / df['sma365']
+    df['dist_120'] = (df['close'] - df['sma120']) / df['sma120']
+    df['dist_40'] = (df['close'] - df['sma40']) / df['sma40']
+    
+    # Drop NaN values generated by largest SMA (365 days)
+    df.dropna(inplace=True)
+    return df
 
-def create_plot(df):
+def prepare_data(df):
+    print("Preparing LSTM sequences...")
+    
+    # Target Labeling
+    df['target'] = 0
+    # Mark specific dates as 1. 
+    # Note: We might mark a small window, but prompt implies specific identification.
+    # We will mark the exact day.
+    for date_str in RETEST_DATES:
+        if date_str in df.index:
+            df.loc[date_str, 'target'] = 1
+        else:
+            print(f"Warning: Retest date {date_str} not found in data (might be a weekend or missing).")
+
+    # Features for LSTM
+    feature_cols = ['dist_365', 'dist_120', 'dist_40']
+    data = df[feature_cols].values
+    targets = df['target'].values
+    dates = df.index
+    
+    # Scaling
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(data)
+    
+    X, y, prediction_dates = [], [], []
+    
+    # Create sequences
+    # Constraint: "Only use yesterday's data for today's prediction"
+    # Logic: To predict target at index `i`, we use sequence `i-SEQ_LENGTH` to `i-1`
+    
+    for i in range(SEQ_LENGTH, len(data)):
+        # x_seq = data from (i-30) to (i-1)
+        x_seq = data_scaled[i-SEQ_LENGTH:i]
+        
+        X.append(x_seq)
+        y.append(targets[i])
+        prediction_dates.append(dates[i])
+        
+    return np.array(X), np.array(y), prediction_dates, df
+
+def build_model(input_shape):
+    print("Building LSTM model...")
+    model = Sequential([
+        Input(shape=input_shape),
+        LSTM(64, return_sequences=True),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(16, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
+    return model
+
+def create_plot(df, pred_dates, y_true, y_pred_prob):
+    print("Generating mobile-friendly plot...")
+    
+    # Filter df to match prediction range
+    plot_df = df.loc[pred_dates].copy()
+    plot_df['prediction_prob'] = y_pred_prob
+    plot_df['is_retest'] = y_true
+    
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        subplot_titles=(f"BTC/USDT Price & SMAs", "LSTM Retest Probability")
+    )
+
+    # --- Top Panel: Price & SMAs ---
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma120'], name='SMA 120', line=dict(color='cyan', width=1)), row=1, col=1)
+    
+    # Mark Actual Retests
+    retest_dates_dt = [pd.to_datetime(d) for d in RETEST_DATES if pd.to_datetime(d) in plot_df.index]
+    retest_prices = plot_df.loc[retest_dates_dt]['close']
+    
+    fig.add_trace(go.Scatter(
+        x=retest_dates_dt, 
+        y=retest_prices, 
+        mode='markers', 
+        marker=dict(color='yellow', size=12, symbol='star'),
+        name='True Retest'
+    ), row=1, col=1)
+
+    # --- Bottom Panel: Predictions ---
+    # Probability line
+    fig.add_trace(go.Scatter(
+        x=plot_df.index, 
+        y=plot_df['prediction_prob'], 
+        name='AI Confidence',
+        fill='tozeroy',
+        line=dict(color='#00ff00', width=1)
+    ), row=2, col=1)
+    
+    # Threshold line
+    fig.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Decision Threshold", row=2, col=1)
+
+    # Layout for Mobile
+    fig.update_layout(
+        template='plotly_dark',
+        title="LSTM Retest Identifier",
+        hovermode='x unified',
+        height=800,
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    # Write to HTML
+    html_content = fig.to_html(full_html=True, include_plotlyjs='cdn')
+    
+    # Add some custom CSS for better mobile full-screen experience
+    custom_style = """
+    <style>
+        body { margin: 0; padding: 0; background-color: #111; }
+        .plotly-graph-div { height: 100vh !important; }
+    </style>
     """
-    Create a plot of closing prices and noisy SMA.
+    html_content = html_content.replace('</head>', f'{custom_style}</head>')
     
-    Args:
-        df: DataFrame with 'close', 'noisy_sma', and 'noisy_sma_shifted' columns
-    
-    Returns:
-        Base64 encoded PNG image string
-    """
-    plt.figure(figsize=(12, 6))
-    
-    # Plot closing price
-    plt.plot(df.index, df['close'], label='Close Price', alpha=0.7, linewidth=1)
-    
-    # Plot shifted noisy SMA if available
-    if 'noisy_sma_shifted' in df.columns and not df['noisy_sma_shifted'].isna().all():
-        plt.plot(df.index, df['noisy_sma_shifted'], label='Noisy SMA (shifted 60 left)', 
-                color='green', linewidth=2, alpha=0.8)
-    
-    plt.title('Binance BTC/USDT - Close Price with Noisy 120-period SMA (Shifted 60 Left)')
-    plt.xlabel('Date')
-    plt.ylabel('Price (USDT)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    # Save plot to bytes buffer
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    plt.close()
-    buf.seek(0)
-    
-    # Encode to base64
-    plot_data = base64.b64encode(buf.read()).decode('utf-8')
-    return plot_data
+    with open("index.html", "w") as f:
+        f.write(html_content)
+    print("index.html created.")
 
+def run_server():
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass # Silence logs for cleaner console
 
-@app.route('/')
-def index():
-    """Main endpoint that displays the plot."""
-    try:
-        # Fetch data from Binance
-        print("Fetching data from Binance...")
-        df = fetch_binance_ohlcv()
-        
-        # Compute SMA with noise
-        print("Computing SMA with noise...")
-        df = compute_sma_with_noise(df, window=120, noise_level=7200.0)
-        
-        # Create plot
-        print("Creating plot...")
-        plot_data = create_plot(df)
-        
-        # Get current timestamp
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Render HTML with plot
-        return render_template_string(HTML_TEMPLATE, 
-                                    plot_data=plot_data, 
-                                    timestamp=timestamp)
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        print(f"\nServing results at http://localhost:{PORT}")
+        print("Press Ctrl+C to stop.")
+        httpd.serve_forever()
+
+def main():
+    # 1. Fetch
+    df = fetch_data()
     
-    except Exception as e:
-        error_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head><title>Error</title></head>
-        <body>
-            <h1>Error</h1>
-            <p>An error occurred: {str(e)}</p>
-            <p>Please check the server logs for details.</p>
-        </body>
-        </html>
-        """
-        return error_html
+    # 2. Features
+    df = add_features(df)
+    
+    # 3. Prepare
+    X, y, dates, full_df = prepare_data(df)
+    
+    print(f"Data shape: {X.shape}")
+    print(f"Positive samples: {np.sum(y)}")
+    
+    # 4. Train
+    # Calculate class weights because retests are rare events
+    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+    class_weight_dict = dict(enumerate(weights))
+    print(f"Class weights: {class_weight_dict}")
+    
+    model = build_model((X.shape[1], X.shape[2]))
+    
+    # Train on everything to show fit (as requested: "identify... plot results")
+    # In a strict production ML environment, we would split train/test. 
+    # Here we show how well it learned the specific requested dates.
+    history = model.fit(
+        X, y, 
+        epochs=50, 
+        batch_size=32, 
+        class_weight=class_weight_dict,
+        verbose=1
+    )
+    
+    # 5. Predict
+    y_pred = model.predict(X)
+    
+    # 6. Plot
+    create_plot(full_df, dates, y, y_pred.flatten())
+    
+    # 7. Server
+    run_server()
 
-
-if __name__ == '__main__':
-    print("Starting web server on port 8080...")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+if __name__ == "__main__":
+    main()
