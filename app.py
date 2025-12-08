@@ -18,7 +18,7 @@ TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 PORT = 8080
 SEQ_LENGTH = 30
-NOISE_LEVEL = 0.02  # 2% Standard Deviation noise added to returns
+NOISE_LEVEL = 0.0  # 0% Standard Deviation noise added to returns
 
 # Hyperparameters
 BATCH_SIZE = 64
