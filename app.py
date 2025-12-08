@@ -14,24 +14,23 @@ import webbrowser
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- Configuration ---
-TRAIN_SYMBOL = 'BTC/USDT'
-TEST_SYMBOL = 'ETH/USDT'  # Asset to test performance on
+SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 PORT = 8080
 SEQ_LENGTH = 30  # 30 lag features
 
-# Hyperparameters (Hardcoded based on optimization)
+# Hyperparameters
 BATCH_SIZE = 64
 DROPOUT_RATE = 0.4
 EPOCHS = 50
 UNITS_1 = 32
 UNITS_2 = 16
 
-# Profitable Periods (Visual Reference - based on BTC cycles)
+# Profitable Periods (Start, End) - Inclusive
 PROFITABLE_PERIODS = [
     ('2020-09-06', '2021-02-15'),
     ('2021-07-12', '2021-10-11'),
@@ -41,15 +40,15 @@ PROFITABLE_PERIODS = [
     ('2025-03-31', '2025-07-07')
 ]
 
-def fetch_data(symbol):
-    print(f"Fetching {symbol} data from Binance starting {START_DATE}...")
+def fetch_data():
+    print(f"Fetching {SYMBOL} data from Binance starting {START_DATE}...")
     exchange = ccxt.binance()
     since = exchange.parse8601(START_DATE)
     all_ohlcv = []
     
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=since)
+            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since)
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
@@ -58,7 +57,7 @@ def fetch_data(symbol):
                 break
             time.sleep(0.1) 
         except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
+            print(f"Error fetching data: {e}")
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -66,6 +65,101 @@ def fetch_data(symbol):
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')].sort_index()
     return df
+
+def label_data_by_date(df):
+    """
+    Pre-labels the dataframe based on hardcoded dates.
+    We do this BEFORE augmentation so the labels get warped/augmented with the price.
+    """
+    df['target'] = 0
+    for start_date, end_date in PROFITABLE_PERIODS:
+        mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
+        df.loc[mask, 'target'] = 1
+    return df
+
+def augment_data(df):
+    """
+    Creates a synthetic version of the dataset with smoothing, 
+    time-warping (stretch/contract), and noise injection.
+    """
+    print("Augmenting data (Smoothing, Warping, Noise)...")
+    
+    # 1. Prepare Source Arrays
+    # We will augment OHLCV and the Target.
+    src_len = len(df)
+    orig_indices = np.arange(src_len)
+    
+    # Columns to interpolate
+    cols_to_warp = ['open', 'high', 'low', 'close', 'volume', 'target']
+    data_values = df[cols_to_warp].values
+
+    # 2. Time Warping Logic (Stretch and Contract)
+    # We create a new non-linear time index. 
+    # Using a Sine wave to alternate between speeding up and slowing down the data.
+    # Frequency: How often we switch from stretch to contract.
+    # Amplitude: How intense the stretch/contract is.
+    freq = 4 * np.pi / src_len  # roughly 2 cycles over the dataset
+    amplitude = src_len * 0.1   # Distort time by up to 10% total length in places
+    
+    warped_indices = orig_indices + amplitude * np.sin(freq * orig_indices)
+    
+    # Ensure indices remain within bounds for interpolation
+    warped_indices = np.clip(warped_indices, 0, src_len - 1)
+    
+    # Sort indices to maintain causality (time must move forward)
+    warped_indices = np.sort(warped_indices)
+
+    # 3. Create Synthetic Data Container
+    synthetic_data = np.zeros_like(data_values)
+
+    # 4. Interpolate and Smooth
+    # We interpolate the original values onto the warped time steps.
+    for i, col_name in enumerate(cols_to_warp):
+        # Linear interpolation performs the "Stretch/Contract"
+        interp_series = np.interp(orig_indices, warped_indices, data_values[:, i])
+        
+        # Apply Smoothing (Rolling mean simulation via convolution)
+        # Only smooth price/vol, not the binary target
+        if col_name != 'target':
+            window_size = 5
+            kernel = np.ones(window_size) / window_size
+            # 'same' mode keeps array size same
+            smoothed_series = np.convolve(interp_series, kernel, mode='same')
+            
+            # Fix edge effects from convolution
+            smoothed_series[:window_size] = interp_series[:window_size]
+            smoothed_series[-window_size:] = interp_series[-window_size:]
+            
+            synthetic_data[:, i] = smoothed_series
+        else:
+            # For target, threshold the interpolated values back to 0 or 1
+            synthetic_data[:, i] = (interp_series > 0.5).astype(int)
+
+    # 5. Add Noise
+    # Add roughly 1-2% random noise to prices
+    noise_level = 0.015
+    noise = np.random.normal(0, noise_level, size=synthetic_data.shape)
+    
+    # Only apply noise to OHLC, not Volume or Target
+    # indices 0-3 are OHLC
+    synthetic_data[:, 0:4] = synthetic_data[:, 0:4] * (1 + noise[:, 0:4])
+    
+    # 6. Reconstruct DataFrame
+    syn_df = pd.DataFrame(synthetic_data, columns=cols_to_warp)
+    
+    # 7. Generate New Timestamps
+    # Append this data to the end of the original data.
+    last_date = df.index[-1]
+    # Assume daily data (1D)
+    new_dates = pd.date_range(start=last_date + timedelta(days=1), periods=len(syn_df), freq='D')
+    syn_df.index = new_dates
+    syn_df.index.name = 'timestamp'
+    
+    # Combine
+    combined_df = pd.concat([df, syn_df])
+    
+    print(f"Dataset expanded from {len(df)} to {len(combined_df)} rows.")
+    return combined_df
 
 def add_features(df):
     print("Engineering features...")
@@ -85,18 +179,15 @@ def add_features(df):
     # Simple % Change for Backtesting
     df['pct_change'] = df['close'].pct_change()
     
-    # Drop NaNs
+    # Drop NaNs created by rolling windows (at the very start)
     df.dropna(inplace=True)
     return df
 
-def prepare_data(df, fit_scaler=True, scaler=None):
+def prepare_data(df):
     print("Preparing LSTM sequences...")
     
-    # Target Labeling (Used for training BTC, kept for visual ref on ETH)
-    df['target'] = 0
-    for start_date, end_date in PROFITABLE_PERIODS:
-        mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
-        df.loc[mask, 'target'] = 1
+    # NOTE: 'target' is now already in the dataframe from the `label_data_by_date` step
+    # We do NOT recalculate it here, otherwise we lose the targets for the synthetic data.
 
     feature_cols = ['dist_365', 'dist_120', 'dist_40', 'log_ret']
     
@@ -105,16 +196,12 @@ def prepare_data(df, fit_scaler=True, scaler=None):
     dates = df.index
     
     # Scaling
-    # We fit a NEW scaler for every asset to normalize its specific volatility/beta
-    if fit_scaler:
-        scaler = StandardScaler()
-        data_scaled = scaler.fit_transform(data)
-    else:
-        # If we wanted to use the exact same scaler (not recommended for different assets)
-        data_scaled = scaler.transform(data)
-        
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(data)
+    
     X, y, prediction_dates = [], [], []
     
+    # Create sequences
     for i in range(SEQ_LENGTH, len(data)):
         x_seq = data_scaled[i-SEQ_LENGTH:i]
         X.append(x_seq)
@@ -139,8 +226,8 @@ def build_model(input_shape):
     model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
     return model
 
-def create_plot(df, pred_dates, y_true, y_pred_prob, asset_name):
-    print(f"Generating simulation and plot for {asset_name}...")
+def create_plot(df, pred_dates, y_true, y_pred_prob):
+    print("Generating simulation and plot...")
     
     plot_df = df.loc[pred_dates].copy()
     plot_df['prediction_prob'] = y_pred_prob
@@ -151,7 +238,7 @@ def create_plot(df, pred_dates, y_true, y_pred_prob, asset_name):
     plot_df['prev_close'] = plot_df['close'].shift(1)
     plot_df['prev_sma365'] = plot_df['sma365'].shift(1)
     
-    # Conditions (Strategy logic)
+    # Conditions
     long_condition = (plot_df['pred_signal'] == 1) & (plot_df['prev_close'] > plot_df['prev_sma365'])
     short_condition = (plot_df['pred_signal'] == 1) & (plot_df['prev_close'] < plot_df['prev_sma365'])
     
@@ -159,28 +246,33 @@ def create_plot(df, pred_dates, y_true, y_pred_prob, asset_name):
     plot_df.loc[long_condition, 'strategy_ret'] = plot_df.loc[long_condition, 'pct_change']
     plot_df.loc[short_condition, 'strategy_ret'] = -plot_df.loc[short_condition, 'pct_change']
     
-    # Cumulative Returns
     plot_df['cum_strategy'] = (1 + plot_df['strategy_ret']).cumprod()
     plot_df['cum_bnh'] = (1 + plot_df['pct_change']).cumprod()
 
     # --- Plotting ---
+    # Downsample for plotting performance if dataset is huge
+    if len(plot_df) > 10000:
+        display_df = plot_df.iloc[::2] 
+    else:
+        display_df = plot_df
+
     fig = make_subplots(
         rows=3, cols=1, 
         shared_xaxes=True, 
         vertical_spacing=0.05,
         row_heights=[0.5, 0.25, 0.25],
-        subplot_titles=(f"{asset_name} Price", "Model Confidence (Trained on BTC)", "Strategy Equity Curve")
+        subplot_titles=(f"BTC/USDT Price (Real + Synthetic)", "LSTM Signal", "Strategy Equity Curve")
     )
 
     # Panel 1: Price & SMAs
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=display_df.index, y=display_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=display_df.index, y=display_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
     
-    # Highlight Target Periods (Visual Ref from BTC cycles)
+    # Highlight Target Periods
     fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['is_profitable'] * plot_df['close'].max(), 
-        name='BTC Bull Cycles (Ref)',
+        x=display_df.index, 
+        y=display_df['is_profitable'] * display_df['close'].max(), 
+        name='Target Period',
         fill='tozeroy',
         mode='none',
         fillcolor='rgba(0, 255, 0, 0.1)',
@@ -189,8 +281,8 @@ def create_plot(df, pred_dates, y_true, y_pred_prob, asset_name):
 
     # Panel 2: Predictions
     fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['prediction_prob'], 
+        x=display_df.index, 
+        y=display_df['prediction_prob'], 
         name='AI Confidence',
         fill='tozeroy',
         line=dict(color='#00ff00', width=1)
@@ -199,22 +291,22 @@ def create_plot(df, pred_dates, y_true, y_pred_prob, asset_name):
 
     # Panel 3: Equity Curve
     fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['cum_strategy'], 
+        x=display_df.index, 
+        y=display_df['cum_strategy'], 
         name='Strategy Return',
         line=dict(color='#00ffff', width=2)
     ), row=3, col=1)
     
     fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['cum_bnh'], 
+        x=display_df.index, 
+        y=display_df['cum_bnh'], 
         name='Buy & Hold',
         line=dict(color='gray', width=1, dash='dot')
     ), row=3, col=1)
 
     fig.update_layout(
         template='plotly_dark',
-        title=f"Strategy Transfer Test: {asset_name} (Trained on {TRAIN_SYMBOL})",
+        title="LSTM Strategy Backtest (With Synthetic Data Augmentation)",
         hovermode='x unified',
         height=1000,
         margin=dict(l=10, r=10, t=50, b=10),
@@ -245,44 +337,47 @@ def run_server():
         httpd.serve_forever()
 
 def main():
-    # --- PHASE 1: TRAIN ON BTC ---
-    print(f"\n=== PHASE 1: Training on {TRAIN_SYMBOL} ===")
-    df_train = fetch_data(TRAIN_SYMBOL)
-    df_train = add_features(df_train)
-    X_train, y_train, dates_train, _ = prepare_data(df_train, fit_scaler=True)
+    # 1. Fetch
+    df = fetch_data()
+
+    # 2. Label Targets (BEFORE augmentation so labels warp with price)
+    df = label_data_by_date(df)
     
-    print(f"Training Data shape: {X_train.shape}")
+    # 3. Augment (Double dataset size, smooth, warp, noise)
+    df = augment_data(df)
+
+    # 4. Features (Calculate SMAs on the combined dataset)
+    df = add_features(df)
     
-    # Weights
-    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+    # 5. Prepare (Using existing targets)
+    X, y, dates, full_df = prepare_data(df)
+    
+    print(f"Data shape: {X.shape}")
+    print(f"Profitable days (Target=1): {np.sum(y)}")
+    
+    # 6. Class Weights
+    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
     class_weight_dict = dict(enumerate(weights))
+    print(f"Class weights: {class_weight_dict}")
     
-    # Build & Train
-    model = build_model((X_train.shape[1], X_train.shape[2]))
+    # 7. Build & Train
+    model = build_model((X.shape[1], X.shape[2]))
+    
     model.fit(
-        X_train, y_train, 
+        X, y, 
         epochs=EPOCHS, 
         batch_size=BATCH_SIZE, 
         class_weight=class_weight_dict,
         verbose=1
     )
 
-    # --- PHASE 2: TEST ON ETH ---
-    print(f"\n=== PHASE 2: Testing on {TEST_SYMBOL} ===")
-    df_test = fetch_data(TEST_SYMBOL)
-    df_test = add_features(df_test)
+    # 8. Predict
+    y_pred_prob = model.predict(X)
     
-    # Important: We fit a NEW scaler for ETH. 
-    # This normalizes ETH's volatility to be relative, similar to how BTC's was seen by the model.
-    X_test, y_test_dummy, dates_test, df_test_full = prepare_data(df_test, fit_scaler=True)
+    # 9. Plot & Simulate
+    create_plot(full_df, dates, y, y_pred_prob.flatten())
     
-    # Predict using the BTC-trained model
-    y_pred_prob = model.predict(X_test)
-    
-    # Plot Results for ETH
-    create_plot(df_test_full, dates_test, y_test_dummy, y_pred_prob.flatten(), TEST_SYMBOL)
-    
-    # Server
+    # 10. Server
     run_server()
 
 if __name__ == "__main__":
