@@ -241,7 +241,7 @@ def main():
     # Here we show how well it learned the specific requested dates.
     history = model.fit(
         X, y, 
-        epochs=50, 
+        epochs=25, 
         batch_size=32, 
         class_weight=class_weight_dict,
         verbose=1
