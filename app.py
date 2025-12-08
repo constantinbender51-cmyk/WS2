@@ -81,6 +81,9 @@ def add_features(df):
     # Log Return in Percent
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1)) * 100
     
+    # Simple % Change for Backtesting (Shifted later)
+    df['pct_change'] = df['close'].pct_change()
+    
     # Drop NaNs
     df.dropna(inplace=True)
     return df
@@ -134,37 +137,70 @@ def build_model(input_shape):
     return model
 
 def create_plot(df, pred_dates, y_true, y_pred_prob):
-    print("Generating plot...")
+    print("Generating simulation and plot...")
     
     plot_df = df.loc[pred_dates].copy()
     plot_df['prediction_prob'] = y_pred_prob
     plot_df['is_profitable'] = y_true
+    plot_df['pred_signal'] = (plot_df['prediction_prob'] > 0.5).astype(int)
     
+    # --- Backtest Simulation ---
+    # Logic:
+    # 1. Prediction determines if we play.
+    # 2. Relation to SMA365 determines Direction (Long/Short).
+    # IMPORTANT: We must use Yesterday's data to decide for Today to avoid look-ahead.
+    # The LSTM prediction at index `t` is based on data up to `t-1`.
+    # So we can use `pred_signal` at `t` to trade day `t`.
+    # However, comparison to SMA must also be based on known data (t-1).
+    
+    plot_df['prev_close'] = plot_df['close'].shift(1)
+    plot_df['prev_sma365'] = plot_df['sma365'].shift(1)
+    
+    # Conditions
+    # Long: Signal=1 AND PrevClose > PrevSMA
+    long_condition = (plot_df['pred_signal'] == 1) & (plot_df['prev_close'] > plot_df['prev_sma365'])
+    
+    # Short: Signal=1 AND PrevClose < PrevSMA
+    short_condition = (plot_df['pred_signal'] == 1) & (plot_df['prev_close'] < plot_df['prev_sma365'])
+    
+    # Calculate Strategy Returns
+    plot_df['strategy_ret'] = 0.0
+    
+    # Apply Long returns
+    plot_df.loc[long_condition, 'strategy_ret'] = plot_df.loc[long_condition, 'pct_change']
+    
+    # Apply Short returns (inverse of pct_change)
+    plot_df.loc[short_condition, 'strategy_ret'] = -plot_df.loc[short_condition, 'pct_change']
+    
+    # Cumulative Returns
+    plot_df['cum_strategy'] = (1 + plot_df['strategy_ret']).cumprod()
+    plot_df['cum_bnh'] = (1 + plot_df['pct_change']).cumprod()
+
+    # --- Plotting ---
     fig = make_subplots(
-        rows=2, cols=1, 
+        rows=3, cols=1, 
         shared_xaxes=True, 
         vertical_spacing=0.05,
-        row_heights=[0.7, 0.3],
-        subplot_titles=(f"BTC/USDT Price & Target Periods", "LSTM Trend Signal")
+        row_heights=[0.5, 0.25, 0.25],
+        subplot_titles=(f"BTC/USDT Price", "LSTM Signal", "Strategy Equity Curve")
     )
 
-    # --- Top Panel: Price & SMAs ---
+    # Panel 1: Price & SMAs
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
     
-    # Highlight Profitable Periods (Ground Truth)
-    # We construct a signal line that is high during profitable periods
+    # Highlight Target Periods
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
-        y=plot_df['is_profitable'] * plot_df['close'].max(), # Scale to fit chart roughly
+        y=plot_df['is_profitable'] * plot_df['close'].max(), 
         name='Target Period',
         fill='tozeroy',
         mode='none',
-        fillcolor='rgba(0, 255, 0, 0.1)', # Light green shading
+        fillcolor='rgba(0, 255, 0, 0.1)',
         hoverinfo='skip'
     ), row=1, col=1)
 
-    # --- Bottom Panel: Predictions ---
+    # Panel 2: Predictions
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
         y=plot_df['prediction_prob'], 
@@ -172,14 +208,28 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
         fill='tozeroy',
         line=dict(color='#00ff00', width=1)
     ), row=2, col=1)
+    fig.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1)
+
+    # Panel 3: Equity Curve
+    fig.add_trace(go.Scatter(
+        x=plot_df.index, 
+        y=plot_df['cum_strategy'], 
+        name='Strategy Return',
+        line=dict(color='#00ffff', width=2)
+    ), row=3, col=1)
     
-    fig.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Hold Threshold", row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=plot_df.index, 
+        y=plot_df['cum_bnh'], 
+        name='Buy & Hold',
+        line=dict(color='gray', width=1, dash='dot')
+    ), row=3, col=1)
 
     fig.update_layout(
         template='plotly_dark',
-        title="LSTM Trend Duration Identifier",
+        title="LSTM Strategy Backtest (Long > SMA, Short < SMA)",
         hovermode='x unified',
-        height=800,
+        height=1000,
         margin=dict(l=10, r=10, t=50, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
@@ -226,7 +276,7 @@ def main():
     class_weight_dict = dict(enumerate(weights))
     print(f"Class weights: {class_weight_dict}")
     
-    # 5. Build & Train (Direct)
+    # 5. Build & Train
     model = build_model((X.shape[1], X.shape[2]))
     
     model.fit(
@@ -240,7 +290,7 @@ def main():
     # 6. Predict
     y_pred_prob = model.predict(X)
     
-    # 7. Plot
+    # 7. Plot & Simulate
     create_plot(full_df, dates, y, y_pred_prob.flatten())
     
     # 8. Server
