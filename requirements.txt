@@ -1,5 +1,5 @@
 ccxt
-pandas
+pandas>=2.0.0
 numpy
 tensorflow
 scikit-learn
