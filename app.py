@@ -6,6 +6,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import http.server
@@ -15,6 +16,7 @@ import os
 import threading
 import time
 from datetime import datetime
+import itertools
 
 # --- Configuration ---
 SYMBOL = 'BTC/USDT'
@@ -84,8 +86,6 @@ def prepare_data(df):
     # Target Labeling
     df['target'] = 0
     # Mark specific dates as 1. 
-    # Note: We might mark a small window, but prompt implies specific identification.
-    # We will mark the exact day.
     for date_str in RETEST_DATES:
         if date_str in df.index:
             df.loc[date_str, 'target'] = 1
@@ -106,8 +106,6 @@ def prepare_data(df):
     
     # Create sequences
     # Constraint: "Only use yesterday's data for today's prediction"
-    # Logic: To predict target at index `i`, we use sequence `i-SEQ_LENGTH` to `i-1`
-    
     for i in range(SEQ_LENGTH, len(data)):
         # x_seq = data from (i-30) to (i-1)
         x_seq = data_scaled[i-SEQ_LENGTH:i]
@@ -118,20 +116,94 @@ def prepare_data(df):
         
     return np.array(X), np.array(y), prediction_dates, df
 
-def build_model(input_shape):
-    print("Building LSTM model...")
+def build_model(input_shape, params):
+    # Unpack params
+    units_1 = params.get('units_1', 64)
+    units_2 = params.get('units_2', 32)
+    dropout = params.get('dropout', 0.2)
+    dense_units = params.get('dense_units', 16)
+    lr = params.get('learning_rate', 0.001)
+    
     model = Sequential([
         Input(shape=input_shape),
-        LSTM(64, return_sequences=True),
-        Dropout(0.2),
-        LSTM(32),
-        Dropout(0.2),
-        Dense(16, activation='relu'),
+        LSTM(units_1, return_sequences=True),
+        Dropout(dropout),
+        LSTM(units_2),
+        Dropout(dropout),
+        Dense(dense_units, activation='relu'),
         Dense(1, activation='sigmoid')
     ])
     
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
     return model
+
+def run_grid_search(X, y, class_weight_dict):
+    print("\n--- Starting Grid Search ---")
+    
+    # Define Grid
+    param_grid = {
+        'units_1': [32, 64],
+        'units_2': [16, 32],
+        'dropout': [0.2, 0.4],
+        'batch_size': [16, 32],
+        'epochs': [30] # Keep epochs fixed/lower for search speed, raise for final training if needed
+    }
+    
+    keys, values = zip(*param_grid.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    best_score = -1
+    best_params = None
+    best_model = None
+    
+    print(f"Testing {len(combinations)} combinations...")
+    
+    for i, params in enumerate(combinations):
+        print(f"\n[{i+1}/{len(combinations)}] Testing: {params}")
+        
+        # Build
+        model = build_model((X.shape[1], X.shape[2]), params)
+        
+        # Train (Silent)
+        model.fit(
+            X, y, 
+            epochs=params['epochs'], 
+            batch_size=params['batch_size'], 
+            class_weight=class_weight_dict,
+            verbose=0
+        )
+        
+        # Evaluate
+        y_pred_prob = model.predict(X, verbose=0)
+        y_pred = (y_pred_prob > 0.5).astype(int)
+        
+        # Metrics
+        f1 = f1_score(y, y_pred)
+        prec = precision_score(y, y_pred, zero_division=0)
+        rec = recall_score(y, y_pred)
+        cm = confusion_matrix(y, y_pred)
+        
+        # Custom scoring logic: 
+        # We prioritize finding AT LEAST some True Positives (TP).
+        # Score = F1 score.
+        score = f1
+        
+        tp = cm[1, 1] if cm.shape == (2, 2) else 0
+        fp = cm[0, 1] if cm.shape == (2, 2) else 0
+        
+        print(f"   -> F1: {f1:.4f} | Recall (TP): {tp}/{np.sum(y)} | Precision: {prec:.4f}")
+        
+        if score > best_score:
+            best_score = score
+            best_params = params
+            best_model = model
+            print("   *** New Best Model ***")
+            
+    print("\n--- Grid Search Complete ---")
+    print(f"Best Params: {best_params}")
+    print(f"Best F1 Score: {best_score:.4f}")
+    return best_model, best_params
 
 def create_plot(df, pred_dates, y_true, y_pred_prob):
     print("Generating mobile-friendly plot...")
@@ -182,7 +254,7 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
     # Layout for Mobile
     fig.update_layout(
         template='plotly_dark',
-        title="LSTM Retest Identifier",
+        title="LSTM Retest Identifier (Optimized)",
         hovermode='x unified',
         height=800,
         margin=dict(l=10, r=10, t=50, b=10),
@@ -228,32 +300,26 @@ def main():
     print(f"Data shape: {X.shape}")
     print(f"Positive samples: {np.sum(y)}")
     
-    # 4. Train
-    # Calculate class weights because retests are rare events
+    # 4. Class Weights
     weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
     class_weight_dict = dict(enumerate(weights))
     print(f"Class weights: {class_weight_dict}")
     
-    model = build_model((X.shape[1], X.shape[2]))
+    # 5. Grid Search & Train
+    best_model, best_params = run_grid_search(X, y, class_weight_dict)
     
-    # Train on everything to show fit (as requested: "identify... plot results")
-    # In a strict production ML environment, we would split train/test. 
-    # Here we show how well it learned the specific requested dates.
-    history = model.fit(
-        X, y, 
-        epochs=25, 
-        batch_size=32, 
-        class_weight=class_weight_dict,
-        verbose=1
-    )
+    if best_model is None:
+        print("Grid search failed to produce a model. Falling back to default.")
+        best_model = build_model((X.shape[1], X.shape[2]), {})
+        best_model.fit(X, y, epochs=50, batch_size=32, class_weight=class_weight_dict, verbose=1)
+
+    # 6. Final Prediction
+    y_pred = best_model.predict(X)
     
-    # 5. Predict
-    y_pred = model.predict(X)
-    
-    # 6. Plot
+    # 7. Plot
     create_plot(full_df, dates, y, y_pred.flatten())
     
-    # 7. Server
+    # 8. Server
     run_server()
 
 if __name__ == "__main__":
