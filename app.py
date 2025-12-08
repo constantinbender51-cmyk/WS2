@@ -64,12 +64,16 @@ def fetch_data():
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')].sort_index()
+    
+    # Mark as Real data for training split later
+    df['dataset_type'] = 'real'
+    
     return df
 
 def label_data_by_date(df):
     """
     Pre-labels the dataframe based on hardcoded dates.
-    We do this BEFORE augmentation so the labels get warped/augmented with the price.
+    We do this BEFORE augmentation so the labels get warped with the price.
     """
     df['target'] = 0
     for start_date, end_date in PROFITABLE_PERIODS:
@@ -80,12 +84,11 @@ def label_data_by_date(df):
 def augment_data(df):
     """
     Creates a synthetic version of the dataset with smoothing, 
-    time-warping (stretch/contract), and noise injection.
+    time-warping, noise, AND price continuity adjustment.
     """
-    print("Augmenting data (Smoothing, Warping, Noise)...")
+    print("Augmenting data (Smoothing, Warping, Noise, Continuity)...")
     
     # 1. Prepare Source Arrays
-    # We will augment OHLCV and the Target.
     src_len = len(df)
     orig_indices = np.arange(src_len)
     
@@ -93,64 +96,71 @@ def augment_data(df):
     cols_to_warp = ['open', 'high', 'low', 'close', 'volume', 'target']
     data_values = df[cols_to_warp].values
 
-    # 2. Time Warping Logic (Stretch and Contract)
-    # We create a new non-linear time index. 
-    # Using a Sine wave to alternate between speeding up and slowing down the data.
-    # Frequency: How often we switch from stretch to contract.
-    # Amplitude: How intense the stretch/contract is.
-    freq = 4 * np.pi / src_len  # roughly 2 cycles over the dataset
-    amplitude = src_len * 0.1   # Distort time by up to 10% total length in places
+    # 2. Time Warping (Stretch and Contract)
+    # Sine wave distortion to index
+    freq = 4 * np.pi / src_len 
+    amplitude = src_len * 0.1 
     
     warped_indices = orig_indices + amplitude * np.sin(freq * orig_indices)
-    
-    # Ensure indices remain within bounds for interpolation
     warped_indices = np.clip(warped_indices, 0, src_len - 1)
-    
-    # Sort indices to maintain causality (time must move forward)
-    warped_indices = np.sort(warped_indices)
+    warped_indices = np.sort(warped_indices) # Maintain causality
 
-    # 3. Create Synthetic Data Container
+    # 3. Interpolation & Smoothing
     synthetic_data = np.zeros_like(data_values)
 
-    # 4. Interpolate and Smooth
-    # We interpolate the original values onto the warped time steps.
     for i, col_name in enumerate(cols_to_warp):
-        # Linear interpolation performs the "Stretch/Contract"
+        # Linear interpolation on warped time
         interp_series = np.interp(orig_indices, warped_indices, data_values[:, i])
         
-        # Apply Smoothing (Rolling mean simulation via convolution)
-        # Only smooth price/vol, not the binary target
         if col_name != 'target':
-            window_size = 5
+            # Smooth price/vol
+            window_size = 7
             kernel = np.ones(window_size) / window_size
-            # 'same' mode keeps array size same
             smoothed_series = np.convolve(interp_series, kernel, mode='same')
-            
-            # Fix edge effects from convolution
+            # Fix edges
             smoothed_series[:window_size] = interp_series[:window_size]
             smoothed_series[-window_size:] = interp_series[-window_size:]
-            
             synthetic_data[:, i] = smoothed_series
         else:
-            # For target, threshold the interpolated values back to 0 or 1
+            # Binary target thresholding
             synthetic_data[:, i] = (interp_series > 0.5).astype(int)
 
-    # 5. Add Noise
-    # Add roughly 1-2% random noise to prices
+    # 4. Add Noise
     noise_level = 0.015
     noise = np.random.normal(0, noise_level, size=synthetic_data.shape)
-    
-    # Only apply noise to OHLC, not Volume or Target
-    # indices 0-3 are OHLC
+    # Apply noise to OHLC
     synthetic_data[:, 0:4] = synthetic_data[:, 0:4] * (1 + noise[:, 0:4])
     
-    # 6. Reconstruct DataFrame
+    # 5. Create DataFrame for processing
     syn_df = pd.DataFrame(synthetic_data, columns=cols_to_warp)
     
-    # 7. Generate New Timestamps
-    # Append this data to the end of the original data.
+    # --- PRICE CONTINUITY LOGIC ---
+    # We want the new data to start where the old data ended.
+    # We take the *returns* of the warped data and apply them to the *last real price*.
+    
+    last_real_close = df['close'].iloc[-1]
+    
+    # Calculate returns of the synthetic close price
+    # fillna(0) ensures the first point doesn't jump; it stays at last_real_close
+    syn_returns = syn_df['close'].pct_change().fillna(0)
+    
+    # Reconstruct Close Price: LastReal * CumulativeGrowth
+    new_close_series = last_real_close * (1 + syn_returns).cumprod()
+    
+    # Adjust Open, High, Low to match new Close levels while keeping candle shape
+    # We use the ratio of the distorted O/H/L to the distorted Close
+    for col in ['open', 'high', 'low']:
+        # Avoid division by zero if close happens to be 0 (unlikely for BTC)
+        ratio = syn_df[col] / syn_df['close']
+        syn_df[col] = new_close_series * ratio
+        
+    syn_df['close'] = new_close_series
+    
+    # 6. Finalize Synthetic Data
+    syn_df['dataset_type'] = 'synthetic'
+    
+    # Generate New Timestamps (Append after real data)
     last_date = df.index[-1]
-    # Assume daily data (1D)
     new_dates = pd.date_range(start=last_date + timedelta(days=1), periods=len(syn_df), freq='D')
     syn_df.index = new_dates
     syn_df.index.name = 'timestamp'
@@ -179,16 +189,13 @@ def add_features(df):
     # Simple % Change for Backtesting
     df['pct_change'] = df['close'].pct_change()
     
-    # Drop NaNs created by rolling windows (at the very start)
+    # Drop NaNs created by rolling windows
     df.dropna(inplace=True)
     return df
 
 def prepare_data(df):
     print("Preparing LSTM sequences...")
     
-    # NOTE: 'target' is now already in the dataframe from the `label_data_by_date` step
-    # We do NOT recalculate it here, otherwise we lose the targets for the synthetic data.
-
     feature_cols = ['dist_365', 'dist_120', 'dist_40', 'log_ret']
     
     data = df[feature_cols].values
@@ -229,11 +236,19 @@ def build_model(input_shape):
 def create_plot(df, pred_dates, y_true, y_pred_prob):
     print("Generating simulation and plot...")
     
+    # Slice df to match predictions
     plot_df = df.loc[pred_dates].copy()
     plot_df['prediction_prob'] = y_pred_prob
     plot_df['is_profitable'] = y_true
     plot_df['pred_signal'] = (plot_df['prediction_prob'] > 0.5).astype(int)
     
+    # Identify the split point for plotting visual
+    # We find the first index where dataset_type is 'synthetic'
+    try:
+        split_date = plot_df[plot_df['dataset_type'] == 'synthetic'].index[0]
+    except IndexError:
+        split_date = plot_df.index[-1]
+
     # --- Backtest Simulation ---
     plot_df['prev_close'] = plot_df['close'].shift(1)
     plot_df['prev_sma365'] = plot_df['sma365'].shift(1)
@@ -250,7 +265,7 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
     plot_df['cum_bnh'] = (1 + plot_df['pct_change']).cumprod()
 
     # --- Plotting ---
-    # Downsample for plotting performance if dataset is huge
+    # Downsample for performance
     if len(plot_df) > 10000:
         display_df = plot_df.iloc[::2] 
     else:
@@ -261,23 +276,15 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
         shared_xaxes=True, 
         vertical_spacing=0.05,
         row_heights=[0.5, 0.25, 0.25],
-        subplot_titles=(f"BTC/USDT Price (Real + Synthetic)", "LSTM Signal", "Strategy Equity Curve")
+        subplot_titles=(f"Price (Real vs Synthetic Future)", "LSTM Signal", "Strategy Equity Curve")
     )
 
     # Panel 1: Price & SMAs
     fig.add_trace(go.Scatter(x=display_df.index, y=display_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=display_df.index, y=display_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
     
-    # Highlight Target Periods
-    fig.add_trace(go.Scatter(
-        x=display_df.index, 
-        y=display_df['is_profitable'] * display_df['close'].max(), 
-        name='Target Period',
-        fill='tozeroy',
-        mode='none',
-        fillcolor='rgba(0, 255, 0, 0.1)',
-        hoverinfo='skip'
-    ), row=1, col=1)
+    # Vertical line at split
+    fig.add_vline(x=split_date, line_dash="dash", line_color="yellow", row=1, col=1, annotation_text="Future Start")
 
     # Panel 2: Predictions
     fig.add_trace(go.Scatter(
@@ -306,7 +313,7 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
 
     fig.update_layout(
         template='plotly_dark',
-        title="LSTM Strategy Backtest (With Synthetic Data Augmentation)",
+        title="LSTM Backtest (Training on Real Data -> Simulation on Synthetic Future)",
         hovermode='x unified',
         height=1000,
         margin=dict(l=10, r=10, t=50, b=10),
@@ -340,44 +347,52 @@ def main():
     # 1. Fetch
     df = fetch_data()
 
-    # 2. Label Targets (BEFORE augmentation so labels warp with price)
+    # 2. Label Targets (BEFORE augmentation)
     df = label_data_by_date(df)
     
-    # 3. Augment (Double dataset size, smooth, warp, noise)
+    # 3. Augment with Price Continuity
     df = augment_data(df)
 
-    # 4. Features (Calculate SMAs on the combined dataset)
+    # 4. Features
     df = add_features(df)
     
-    # 5. Prepare (Using existing targets)
-    X, y, dates, full_df = prepare_data(df)
+    # 5. Prepare Full Dataset
+    X, y, dates, full_df_sliced = prepare_data(df)
     
-    print(f"Data shape: {X.shape}")
-    print(f"Profitable days (Target=1): {np.sum(y)}")
+    # 6. SPLIT for Training
+    # We filter based on the 'dataset_type' of the sequences in full_df_sliced
+    # Note: full_df_sliced is aligned with X and y (first SEQ_LENGTH rows removed)
+    train_mask = (full_df_sliced['dataset_type'] == 'real').values
     
-    # 6. Class Weights
-    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+    X_train = X[train_mask]
+    y_train = y[train_mask]
+    
+    print(f"Total Data: {len(X)} | Training Data (Real Only): {len(X_train)}")
+    print(f"Profitable days in Training: {np.sum(y_train)}")
+    
+    # 7. Class Weights (Calculated ONLY on Training Data)
+    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(enumerate(weights))
     print(f"Class weights: {class_weight_dict}")
     
-    # 7. Build & Train
-    model = build_model((X.shape[1], X.shape[2]))
+    # 8. Build & Train (ONLY on X_train)
+    model = build_model((X_train.shape[1], X_train.shape[2]))
     
     model.fit(
-        X, y, 
+        X_train, y_train, 
         epochs=EPOCHS, 
         batch_size=BATCH_SIZE, 
         class_weight=class_weight_dict,
         verbose=1
     )
 
-    # 8. Predict
+    # 9. Predict (On FULL Dataset for simulation)
     y_pred_prob = model.predict(X)
     
-    # 9. Plot & Simulate
-    create_plot(full_df, dates, y, y_pred_prob.flatten())
+    # 10. Plot & Simulate
+    create_plot(full_df_sliced, dates, y, y_pred_prob.flatten())
     
-    # 10. Server
+    # 11. Server
     run_server()
 
 if __name__ == "__main__":
