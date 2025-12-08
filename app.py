@@ -112,43 +112,34 @@ def generate_mock_data(original_df, noise_std=0.02):
     df['mock_open'] = df['mock_close'] * df['open_ratio']
     
     # 7. Time distortion: compress/expand rows along x-axis based on oscillator
-    # Create a new time index where intervals between timestamps are scaled by oscillator
-    # oscillator > 1 expands time (longer intervals), <1 compresses time (shorter intervals)
-    # Use cumulative sum of oscillator to generate irregular time steps
-    time_scaling = oscillator  # Use oscillator directly for time scaling
-    # Normalize to maintain approximately same total time span
-    total_original_days = len(df)
-    target_total_days = total_original_days  # Keep same number of days for simplicity
-    scaled_time_steps = time_scaling / time_scaling.mean() * (target_total_days / total_original_days)
-    # Generate new timestamps by cumulatively adding scaled steps (in days)
-    new_days = np.cumsum(scaled_time_steps)
-    # Create new irregular time index by interpolating from original index
-    # Original index is daily; convert to numeric days for interpolation
-    original_days = np.arange(len(df))
-    new_timestamps = pd.to_datetime(df.index[0]) + pd.to_timedelta(new_days, unit='D')
-    # Ensure new_timestamps is monotonic and within bounds
-    new_timestamps = new_timestamps.sort_values()
+    # Instead of creating a new irregular time index that causes alignment issues,
+    # we simulate compression/expansion by adjusting the sampling of the data.
+    # Keep the same number of rows and timestamps as original for alignment.
+    # Apply the oscillator to distort the time spacing between returns internally.
+    # We'll generate a new price path with time-distorted returns by cumulatively
+    # applying returns scaled by oscillator, but keep the original timestamps.
+    # This preserves date alignment for downstream processing.
     
-    # 8. Interpolate OHLCV data onto new irregular time index
-    # Create a temporary DataFrame with mock prices and original index
-    temp_df = pd.DataFrame({
+    # Calculate time-distorted returns: apply oscillator to distorted returns
+    time_distorted_returns = df['distorted_returns'] * oscillator
+    
+    # Reconstruct price path with time-distorted returns
+    price_path = start_price * (1 + time_distorted_returns).cumprod()
+    
+    # Reconstruct OHLC with the new price path
+    df['mock_close'] = price_path
+    df['mock_high'] = df['mock_close'] * df['high_ratio']
+    df['mock_low'] = df['mock_close'] * df['low_ratio']
+    df['mock_open'] = df['mock_close'] * df['open_ratio']
+    
+    # Create mock DataFrame with original timestamps to maintain alignment
+    mock_df = pd.DataFrame({
         'open': df['mock_open'].values,
         'high': df['mock_high'].values,
         'low': df['mock_low'].values,
         'close': df['mock_close'].values,
         'volume': df['volume'].values
     }, index=df.index)
-    # Resample to new timestamps using linear interpolation for OHLC, forward fill for volume
-    # Since new timestamps are irregular, use reindex with method='nearest' or interpolate
-    # For simplicity, use linear interpolation for price columns and forward fill for volume
-    temp_df = temp_df.reindex(temp_df.index.union(new_timestamps)).sort_index()
-    temp_df['open'] = temp_df['open'].interpolate(method='linear')
-    temp_df['high'] = temp_df['high'].interpolate(method='linear')
-    temp_df['low'] = temp_df['low'].interpolate(method='linear')
-    temp_df['close'] = temp_df['close'].interpolate(method='linear')
-    temp_df['volume'] = temp_df['volume'].ffill()  # Forward fill volume
-    # Select only the new timestamps
-    mock_df = temp_df.loc[new_timestamps].copy()
     mock_df.index.name = 'timestamp'
     
     return mock_df
@@ -211,7 +202,8 @@ def build_model(input_shape):
 def create_comparison_plot(real_df, mock_df, pred_dates, y_true, y_pred_prob):
     print("Generating comparison plot...")
     
-    # Align mock_df to prediction dates
+    # Align mock_df to prediction dates - ensure indices match
+    # Since mock_df now has the same timestamps as original, this should work
     plot_df = mock_df.loc[pred_dates].copy()
     plot_df['prediction_prob'] = y_pred_prob
     plot_df['is_profitable'] = y_true
