@@ -285,7 +285,7 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
     fig.add_trace(go.Scatter(x=display_df.index, y=display_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
     
     # Vertical line at split
-    fig.add_vline(x=split_date, line_dash="dash", line_color="yellow", row=1, col=1, annotation_text="Future Start")
+    fig.add_vline(x=split_date, line_dash="dash", line_color="yellow", row=1, col=1, annotation_text="Future Start", annotation_position="top left")
 
     # Panel 2: Predictions
     fig.add_trace(go.Scatter(
