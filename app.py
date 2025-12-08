@@ -66,10 +66,11 @@ def fetch_data():
 def generate_mock_data(original_df, noise_std=0.02):
     """
     Generates a synthetic price history by adding Gaussian noise to daily returns
-    and applying a 0.9 to 1.1 oscillator with 100-day frequency.
+    and applying a noisy sine wave oscillator (0.9 to 1.1) with 100-day frequency.
+    Distorts returns faster and slower over time based on the oscillator.
     Preserves general trend but changes specific price action.
     """
-    print(f"Generating Mock Data with {noise_std*100}% return noise and 0.9-1.1 oscillator (100-day freq)...")
+    print(f"Generating Mock Data with {noise_std*100}% return noise and noisy sine wave oscillator (100-day freq)...")
     df = original_df.copy()
     
     # 1. Calculate original returns
@@ -80,29 +81,26 @@ def generate_mock_data(original_df, noise_std=0.02):
     noise = np.random.normal(0, noise_std, size=len(df))
     df['distorted_returns'] = df['pct_change'] + noise
     
-    # 3. Create oscillator: sine wave from 0.9 to 1.1 with 100-day period
-    # One complete wave (0.9->1.1->0.9) takes 100 days
-    # Sine wave oscillates between -1 and 1, we scale to 0.9-1.1
+    # 3. Create noisy oscillator: sine wave from 0.9 to 1.1 with 100-day period
+    # Add noise to the sine wave to make it vary faster/slower
     days = np.arange(len(df))
-    # Frequency: 2π / period (100 days)
     frequency = 2 * np.pi / 100
-    # Sine wave oscillating between -1 and 1
     sine_wave = np.sin(frequency * days)
-    # Scale to 0.9-1.1 range: (sine_wave + 1) * 0.1 + 0.9
-    oscillator = (sine_wave + 1) * 0.1 + 0.9
+    # Add noise to the sine wave (e.g., 10% of amplitude)
+    sine_noise = np.random.normal(0, 0.1, size=len(df))
+    noisy_sine = sine_wave + sine_noise
+    # Scale to 0.9-1.1 range: (noisy_sine + 1) * 0.1 + 0.9, clamp to avoid extreme values
+    oscillator = (noisy_sine + 1) * 0.1 + 0.9
+    oscillator = np.clip(oscillator, 0.8, 1.2)  # Clamp to reasonable bounds
     
-    # 4. Apply oscillator to distorted returns
+    # 4. Apply oscillator to distorted returns to distort faster/slower
     df['oscillated_returns'] = df['distorted_returns'] * oscillator
     
     # 5. Reconstruct Price Path
-    # Start from original first close
     start_price = df['close'].iloc[0]
-    # Cumulatively apply oscillated returns
-    # (1 + r1) * (1 + r2) ...
     price_path = start_price * (1 + df['oscillated_returns']).cumprod()
     
     # 6. Reconstruct OHLC roughly to maintain candle structure relative to Close
-    # We assume the ratio of High/Close, Low/Close stays similar to original
     df['high_ratio'] = df['high'] / df['close']
     df['low_ratio'] = df['low'] / df['close']
     df['open_ratio'] = df['open'] / df['close']
