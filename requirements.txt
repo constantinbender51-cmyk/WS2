@@ -1,5 +1,6 @@
-Flask
+ccxt
 pandas
 numpy
-requests
-matplotlib
+tensorflow
+scikit-learn
+plotly
