@@ -361,8 +361,8 @@ def main():
     
     # 6. SPLIT for Training
     # We filter based on the 'dataset_type' of the sequences in full_df_sliced
-    # Note: full_df_sliced is aligned with X and y (first SEQ_LENGTH rows removed)
-    train_mask = (full_df_sliced['dataset_type'] == 'real').values
+    # FIX: Slice the mask by SEQ_LENGTH because X/y don't include the first 30 rows
+    train_mask = (full_df_sliced['dataset_type'] == 'real').iloc[SEQ_LENGTH:].values
     
     X_train = X[train_mask]
     y_train = y[train_mask]
