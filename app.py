@@ -65,10 +65,11 @@ def fetch_data():
 
 def generate_mock_data(original_df, noise_std=0.02):
     """
-    Generates a synthetic price history by adding Gaussian noise to daily returns.
+    Generates a synthetic price history by adding Gaussian noise to daily returns
+    and applying a 0.9 to 1.1 oscillator with 100-day frequency.
     Preserves general trend but changes specific price action.
     """
-    print(f"Generating Mock Data with {noise_std*100}% return noise...")
+    print(f"Generating Mock Data with {noise_std*100}% return noise and 0.9-1.1 oscillator (100-day freq)...")
     df = original_df.copy()
     
     # 1. Calculate original returns
@@ -79,14 +80,28 @@ def generate_mock_data(original_df, noise_std=0.02):
     noise = np.random.normal(0, noise_std, size=len(df))
     df['distorted_returns'] = df['pct_change'] + noise
     
-    # 3. Reconstruct Price Path
+    # 3. Create oscillator: sine wave from 0.9 to 1.1 with 100-day period
+    # One complete wave (0.9->1.1->0.9) takes 100 days
+    # Sine wave oscillates between -1 and 1, we scale to 0.9-1.1
+    days = np.arange(len(df))
+    # Frequency: 2π / period (100 days)
+    frequency = 2 * np.pi / 100
+    # Sine wave oscillating between -1 and 1
+    sine_wave = np.sin(frequency * days)
+    # Scale to 0.9-1.1 range: (sine_wave + 1) * 0.1 + 0.9
+    oscillator = (sine_wave + 1) * 0.1 + 0.9
+    
+    # 4. Apply oscillator to distorted returns
+    df['oscillated_returns'] = df['distorted_returns'] * oscillator
+    
+    # 5. Reconstruct Price Path
     # Start from original first close
     start_price = df['close'].iloc[0]
-    # Cumulatively apply distorted returns
+    # Cumulatively apply oscillated returns
     # (1 + r1) * (1 + r2) ...
-    price_path = start_price * (1 + df['distorted_returns']).cumprod()
+    price_path = start_price * (1 + df['oscillated_returns']).cumprod()
     
-    # 4. Reconstruct OHLC roughly to maintain candle structure relative to Close
+    # 6. Reconstruct OHLC roughly to maintain candle structure relative to Close
     # We assume the ratio of High/Close, Low/Close stays similar to original
     df['high_ratio'] = df['high'] / df['close']
     df['low_ratio'] = df['low'] / df['close']
