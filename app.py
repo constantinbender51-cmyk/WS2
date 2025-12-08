@@ -95,20 +95,32 @@ def generate_mock_data(original_df, noise_std=0.02):
     
     # 4. Apply oscillator to distorted returns to distort faster/slower
     df['oscillated_returns'] = df['distorted_returns'] * oscillator
+    # Clip oscillated_returns to prevent extreme values that could cause overflow
+    df['oscillated_returns'] = np.clip(df['oscillated_returns'], -0.5, 0.5)  # Limit to ±50% daily change
     
     # 5. Reconstruct Price Path
     start_price = df['close'].iloc[0]
     price_path = start_price * (1 + df['oscillated_returns']).cumprod()
+    # Ensure no infinite or NaN values in price_path
+    price_path = np.nan_to_num(price_path, nan=start_price, posinf=start_price, neginf=start_price)
     
     # 6. Reconstruct OHLC roughly to maintain candle structure relative to Close
-    df['high_ratio'] = df['high'] / df['close']
-    df['low_ratio'] = df['low'] / df['close']
-    df['open_ratio'] = df['open'] / df['close']
+    # Avoid division by zero by replacing zero close with a small epsilon
+    epsilon = 1e-10
+    close_nonzero = df['close'].replace(0, epsilon)
+    df['high_ratio'] = df['high'] / close_nonzero
+    df['low_ratio'] = df['low'] / close_nonzero
+    df['open_ratio'] = df['open'] / close_nonzero
     
     df['mock_close'] = price_path
     df['mock_high'] = df['mock_close'] * df['high_ratio']
     df['mock_low'] = df['mock_close'] * df['low_ratio']
     df['mock_open'] = df['mock_close'] * df['open_ratio']
+    
+    # Ensure all mock OHLC values are finite and positive
+    for col in ['mock_close', 'mock_high', 'mock_low', 'mock_open']:
+        df[col] = np.nan_to_num(df[col], nan=start_price, posinf=start_price, neginf=start_price)
+        df[col] = np.clip(df[col], 1e-10, None)  # Ensure positive values
     
     # 7. Time distortion: select OHLCV data points based on cumulative rounding of oscillator
     # Generate cumulative oscillator values rounded to integers to determine index jumps
@@ -118,7 +130,6 @@ def generate_mock_data(original_df, noise_std=0.02):
     # Ensure we stay within bounds of the original data
     max_index = len(df) - 1
     selected_indices = []
-    current_cum = 0
     
     for i in range(len(df)):
         # Find the next index based on cumulative rounded value
@@ -141,6 +152,11 @@ def generate_mock_data(original_df, noise_std=0.02):
         'volume': mock_volume
     }, index=df.index)  # Use original timestamps to keep same length and alignment
     mock_df.index.name = 'timestamp'
+    
+    # Final check: ensure no infinite or NaN values in the mock DataFrame
+    mock_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    mock_df.fillna(method='ffill', inplace=True)
+    mock_df.fillna(method='bfill', inplace=True)
     
     return mock_df
 
