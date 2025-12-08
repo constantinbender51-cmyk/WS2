@@ -112,34 +112,48 @@ def generate_mock_data(original_df, noise_std=0.02):
     df['mock_open'] = df['mock_close'] * df['open_ratio']
     
     # 7. Time distortion: compress/expand rows along x-axis based on oscillator
-    # Instead of creating a new irregular time index that causes alignment issues,
-    # we simulate compression/expansion by adjusting the sampling of the data.
-    # Keep the same number of rows and timestamps as original for alignment.
-    # Apply the oscillator to distort the time spacing between returns internally.
-    # We'll generate a new price path with time-distorted returns by cumulatively
-    # applying returns scaled by oscillator, but keep the original timestamps.
-    # This preserves date alignment for downstream processing.
+    # Create a new irregular time index by cumulatively summing time intervals scaled by oscillator
+    # Start with the original timestamps as a base
+    original_timestamps = df.index
+    # Convert to numeric days for easier manipulation
+    days_numeric = np.arange(len(original_timestamps))
+    # Calculate time intervals (in days) scaled by oscillator: when oscillator > 1, time expands (longer intervals); <1, time compresses (shorter intervals)
+    # Use cumulative sum to get new time positions
+    scaled_intervals = oscillator  # oscillator values around 1, representing scaling factor for daily intervals
+    new_days = np.cumsum(scaled_intervals)  # Cumulative sum to get new day positions
+    # Normalize to start at 0 and match the original time range for alignment
+    new_days = new_days - new_days[0]  # Start at 0
+    # Scale to match the original number of days to keep similar overall duration
+    scale_factor = (len(df) - 1) / new_days[-1] if new_days[-1] != 0 else 1
+    new_days = new_days * scale_factor
+    # Create new timestamps by interpolating from original timestamps based on new_days
+    # Use linear interpolation of timestamps in numeric form
+    original_days_numeric = days_numeric
+    # Interpolate to get new timestamps at integer day positions (0, 1, 2, ...) to maintain daily frequency for alignment
+    # We'll resample the mock data to the original daily frequency by interpolating at integer day positions
+    from scipy import interpolate
+    # Interpolate OHLCV data as functions of new_days
+    interp_func_close = interpolate.interp1d(new_days, df['mock_close'].values, kind='linear', fill_value='extrapolate')
+    interp_func_high = interpolate.interp1d(new_days, df['mock_high'].values, kind='linear', fill_value='extrapolate')
+    interp_func_low = interpolate.interp1d(new_days, df['mock_low'].values, kind='linear', fill_value='extrapolate')
+    interp_func_open = interpolate.interp1d(new_days, df['mock_open'].values, kind='linear', fill_value='extrapolate')
+    interp_func_volume = interpolate.interp1d(new_days, df['volume'].values, kind='linear', fill_value='extrapolate')
+    # Sample at integer day positions (0, 1, 2, ... up to len(df)-1) to keep same number of rows
+    sample_days = np.arange(len(df))
+    mock_close_interp = interp_func_close(sample_days)
+    mock_high_interp = interp_func_high(sample_days)
+    mock_low_interp = interp_func_low(sample_days)
+    mock_open_interp = interp_func_open(sample_days)
+    volume_interp = interp_func_volume(sample_days)
     
-    # Calculate time-distorted returns: apply oscillator to distorted returns
-    time_distorted_returns = df['distorted_returns'] * oscillator
-    
-    # Reconstruct price path with time-distorted returns
-    price_path = start_price * (1 + time_distorted_returns).cumprod()
-    
-    # Reconstruct OHLC with the new price path
-    df['mock_close'] = price_path
-    df['mock_high'] = df['mock_close'] * df['high_ratio']
-    df['mock_low'] = df['mock_close'] * df['low_ratio']
-    df['mock_open'] = df['mock_close'] * df['open_ratio']
-    
-    # Create mock DataFrame with original timestamps to maintain alignment
+    # Create mock DataFrame with original timestamps to maintain alignment for downstream functions
     mock_df = pd.DataFrame({
-        'open': df['mock_open'].values,
-        'high': df['mock_high'].values,
-        'low': df['mock_low'].values,
-        'close': df['mock_close'].values,
-        'volume': df['volume'].values
-    }, index=df.index)
+        'open': mock_open_interp,
+        'high': mock_high_interp,
+        'low': mock_low_interp,
+        'close': mock_close_interp,
+        'volume': volume_interp
+    }, index=original_timestamps)
     mock_df.index.name = 'timestamp'
     
     return mock_df
