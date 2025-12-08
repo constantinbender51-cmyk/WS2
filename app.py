@@ -161,7 +161,7 @@ def augment_data(df):
     
     # Generate New Timestamps (Append after real data)
     last_date = df.index[-1]
-    new_dates = pd.date_range(start=last_date + timedelta(days=1), periods=len(syn_df), freq='D')
+    new_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=len(syn_df), freq='D')
     syn_df.index = new_dates
     syn_df.index.name = 'timestamp'
     
