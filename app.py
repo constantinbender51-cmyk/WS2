@@ -6,7 +6,6 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.model_selection import TimeSeriesSplit
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import http.server
@@ -19,16 +18,16 @@ TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 PORT = 8080
 SEQ_LENGTH = 30
-N_SPLITS = 5  # Number of walk-forward folds
+NOISE_LEVEL = 0.02  # 2% Standard Deviation noise added to returns
 
 # Hyperparameters
 BATCH_SIZE = 64
 DROPOUT_RATE = 0.4
-EPOCHS = 30  # Reduced slightly for speed during WFV
+EPOCHS = 50
 UNITS_1 = 32
 UNITS_2 = 16
 
-# Profitable Periods (Start, End) - Inclusive
+# Profitable Periods
 PROFITABLE_PERIODS = [
     ('2020-09-06', '2021-02-15'),
     ('2021-07-12', '2021-10-11'),
@@ -64,8 +63,52 @@ def fetch_data():
     df = df[~df.index.duplicated(keep='first')].sort_index()
     return df
 
+def generate_mock_data(original_df, noise_std=0.02):
+    """
+    Generates a synthetic price history by adding Gaussian noise to daily returns.
+    Preserves general trend but changes specific price action.
+    """
+    print(f"Generating Mock Data with {noise_std*100}% return noise...")
+    df = original_df.copy()
+    
+    # 1. Calculate original returns
+    df['pct_change'] = df['close'].pct_change()
+    df['pct_change'].fillna(0, inplace=True)
+    
+    # 2. Add Noise to returns
+    noise = np.random.normal(0, noise_std, size=len(df))
+    df['distorted_returns'] = df['pct_change'] + noise
+    
+    # 3. Reconstruct Price Path
+    # Start from original first close
+    start_price = df['close'].iloc[0]
+    # Cumulatively apply distorted returns
+    # (1 + r1) * (1 + r2) ...
+    price_path = start_price * (1 + df['distorted_returns']).cumprod()
+    
+    # 4. Reconstruct OHLC roughly to maintain candle structure relative to Close
+    # We assume the ratio of High/Close, Low/Close stays similar to original
+    df['high_ratio'] = df['high'] / df['close']
+    df['low_ratio'] = df['low'] / df['close']
+    df['open_ratio'] = df['open'] / df['close']
+    
+    df['mock_close'] = price_path
+    df['mock_high'] = df['mock_close'] * df['high_ratio']
+    df['mock_low'] = df['mock_close'] * df['low_ratio']
+    df['mock_open'] = df['mock_close'] * df['open_ratio']
+    
+    # Replace original columns for feature engineering
+    mock_df = pd.DataFrame(index=df.index)
+    mock_df['open'] = df['mock_open']
+    mock_df['high'] = df['mock_high']
+    mock_df['low'] = df['mock_low']
+    mock_df['close'] = df['mock_close']
+    mock_df['volume'] = df['volume'] # Keep volume same
+    
+    return mock_df
+
 def add_features(df):
-    print("Engineering features...")
+    # Recalculate features on the passed dataframe (Real or Mock)
     df['sma365'] = df['close'].rolling(window=365).mean()
     df['sma120'] = df['close'].rolling(window=120).mean()
     df['sma40'] = df['close'].rolling(window=40).mean()
@@ -81,8 +124,6 @@ def add_features(df):
     return df
 
 def prepare_data(df):
-    print("Preparing LSTM sequences...")
-    
     df['target'] = 0
     for start_date, end_date in PROFITABLE_PERIODS:
         mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
@@ -99,20 +140,15 @@ def prepare_data(df):
     
     X, y, prediction_dates = [], [], []
     
-    # Need to keep track of original indices to map back to dataframe
-    original_indices = []
-
     for i in range(SEQ_LENGTH, len(data)):
         x_seq = data_scaled[i-SEQ_LENGTH:i]
         X.append(x_seq)
         y.append(targets[i])
         prediction_dates.append(dates[i])
-        original_indices.append(i)
         
-    return np.array(X), np.array(y), np.array(prediction_dates), df, np.array(original_indices)
+    return np.array(X), np.array(y), prediction_dates, df
 
 def build_model(input_shape):
-    # Reduced verbosity for loop
     model = Sequential([
         Input(shape=input_shape),
         LSTM(UNITS_1, return_sequences=True),
@@ -126,68 +162,19 @@ def build_model(input_shape):
     model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
     return model
 
-def walk_forward_validation(X, y, dates, original_indices):
-    """
-    Performs TimeSeriesSplit Walk-Forward Validation.
-    Returns arrays of collected test predictions and their corresponding dates.
-    """
-    tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+def create_comparison_plot(real_df, mock_df, pred_dates, y_true, y_pred_prob):
+    print("Generating comparison plot...")
     
-    wf_dates = []
-    wf_preds = []
-    wf_true = []
-    
-    print(f"\n--- Starting Walk-Forward Validation ({N_SPLITS} Splits) ---")
-    
-    fold = 1
-    for train_index, test_index in tscv.split(X):
-        print(f"Fold {fold}/{N_SPLITS} | Train Size: {len(train_index)} | Test Size: {len(test_index)}")
-        
-        X_train, X_test = X[train_index], X[test_index]
-        y_train, y_test = y[train_index], y[test_index]
-        dates_test = dates[test_index]
-        
-        # Calculate weights for this specific fold
-        classes = np.unique(y_train)
-        if len(classes) > 1:
-            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
-            class_weight_dict = dict(enumerate(weights))
-        else:
-            class_weight_dict = None
-
-        # Build fresh model for each fold to avoid leakage
-        model = build_model((X.shape[1], X.shape[2]))
-        
-        # Train
-        model.fit(
-            X_train, y_train, 
-            epochs=EPOCHS, 
-            batch_size=BATCH_SIZE, 
-            class_weight=class_weight_dict,
-            verbose=0  # Silent training
-        )
-        
-        # Predict on unseen test data
-        preds = model.predict(X_test, verbose=0)
-        
-        # Store results
-        wf_dates.extend(dates_test)
-        wf_preds.extend(preds.flatten())
-        wf_true.extend(y_test)
-        
-        fold += 1
-        
-    return np.array(wf_dates), np.array(wf_preds), np.array(wf_true)
-
-def create_plot(df, pred_dates, y_true, y_pred_prob):
-    print("Generating simulation and plot...")
-    
-    # Subset DF to only the Walk-Forward Validation period
-    plot_df = df.loc[pred_dates].copy()
+    # Align mock_df to prediction dates
+    plot_df = mock_df.loc[pred_dates].copy()
     plot_df['prediction_prob'] = y_pred_prob
     plot_df['is_profitable'] = y_true
     plot_df['pred_signal'] = (plot_df['prediction_prob'] > 0.5).astype(int)
     
+    # Get Real prices for comparison background
+    real_prices = real_df.loc[pred_dates]['close']
+
+    # Strategy Calculation on MOCK data
     plot_df['prev_close'] = plot_df['close'].shift(1)
     plot_df['prev_sma365'] = plot_df['sma365'].shift(1)
     
@@ -198,7 +185,6 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
     plot_df.loc[long_condition, 'strategy_ret'] = plot_df.loc[long_condition, 'pct_change']
     plot_df.loc[short_condition, 'strategy_ret'] = -plot_df.loc[short_condition, 'pct_change']
     
-    # Re-calc Cumulative Returns for just this period
     plot_df['cum_strategy'] = (1 + plot_df['strategy_ret']).cumprod()
     plot_df['cum_bnh'] = (1 + plot_df['pct_change']).cumprod()
 
@@ -208,12 +194,15 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
         shared_xaxes=True, 
         vertical_spacing=0.05,
         row_heights=[0.5, 0.25, 0.25],
-        subplot_titles=(f"BTC/USDT Price (Walk-Forward Period)", "OOS LSTM Signal", "OOS Equity Curve")
+        subplot_titles=(f"Mock vs Real Price (Noise: {NOISE_LEVEL*100}%)", "Model Confidence on Mock Data", "Equity Curve (Mock Data)")
     )
 
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
+    # Panel 1: Mock Price vs Real Price
+    fig.add_trace(go.Scatter(x=plot_df.index, y=real_prices, name='Original Price', line=dict(color='rgba(255,255,255,0.2)', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Distorted Price', line=dict(color='cyan', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='Mock SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
     
+    # Highlight Target Periods
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
         y=plot_df['is_profitable'] * plot_df['close'].max(), 
@@ -224,32 +213,34 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
         hoverinfo='skip'
     ), row=1, col=1)
 
+    # Panel 2: Predictions
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
         y=plot_df['prediction_prob'], 
-        name='AI Confidence (OOS)',
+        name='AI Confidence',
         fill='tozeroy',
         line=dict(color='#00ff00', width=1)
     ), row=2, col=1)
     fig.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1)
 
+    # Panel 3: Equity Curve
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
         y=plot_df['cum_strategy'], 
-        name='Strategy Return',
+        name='Strategy (Mock)',
         line=dict(color='#00ffff', width=2)
     ), row=3, col=1)
     
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
         y=plot_df['cum_bnh'], 
-        name='Buy & Hold',
+        name='Buy & Hold (Mock)',
         line=dict(color='gray', width=1, dash='dot')
     ), row=3, col=1)
 
     fig.update_layout(
         template='plotly_dark',
-        title="Walk-Forward Validation Results (Out-of-Sample Only)",
+        title="Stress Test: Model Robustness on Distorted Data",
         hovermode='x unified',
         height=1000,
         margin=dict(l=10, r=10, t=50, b=10),
@@ -280,17 +271,40 @@ def run_server():
         httpd.serve_forever()
 
 def main():
-    df = fetch_data()
-    df = add_features(df)
-    X, y, dates, full_df, indices = prepare_data(df)
+    # 1. Fetch & Prepare ORIGINAL Training Data
+    print("--- Training Phase (Original Data) ---")
+    raw_df = fetch_data()
+    train_df = add_features(raw_df.copy()) # Feature engineering on original
+    X_train, y_train, _, _ = prepare_data(train_df)
     
-    print(f"Total Data shape: {X.shape}")
+    # 2. Class Weights
+    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+    class_weight_dict = dict(enumerate(weights))
     
-    # Perform Walk-Forward Validation
-    wf_dates, wf_preds, wf_true = walk_forward_validation(X, y, dates, indices)
+    # 3. Train Model on Original Data
+    model = build_model((X_train.shape[1], X_train.shape[2]))
+    model.fit(
+        X_train, y_train, 
+        epochs=EPOCHS, 
+        batch_size=BATCH_SIZE, 
+        class_weight=class_weight_dict,
+        verbose=1
+    )
     
-    # Plot results using ONLY the validation data
-    create_plot(full_df, wf_dates, wf_true, wf_preds)
+    # 4. Generate MOCK Test Data
+    print("\n--- Testing Phase (Mock/Distorted Data) ---")
+    mock_raw_df = generate_mock_data(raw_df, noise_std=NOISE_LEVEL)
+    mock_featured_df = add_features(mock_raw_df) # Recalculate indicators on distorted price!
+    
+    # 5. Predict on Mock Data
+    X_mock, y_mock, dates_mock, full_mock_df = prepare_data(mock_featured_df)
+    
+    print(f"Predicting on {len(X_mock)} distorted samples...")
+    y_pred_prob = model.predict(X_mock)
+    
+    # 6. Plot Results
+    # We pass 'raw_df' just to plot the faint original line for visual comparison
+    create_comparison_plot(add_features(raw_df.copy()), full_mock_df, dates_mock, y_mock, y_pred_prob.flatten())
     
     run_server()
 
