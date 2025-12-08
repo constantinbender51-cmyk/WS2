@@ -190,11 +190,11 @@ def create_comparison_plot(real_df, mock_df, pred_dates, y_true, y_pred_prob):
     real_prices = real_df.loc[pred_dates]['close']
 
     # Strategy Calculation on MOCK data
-    plot_df['avg_7day'] = plot_df['close'].rolling(window=7).mean()
-    plot_df['prev_sma365'] = plot_df['sma365'].shift(1)
+    plot_df['avg_7day_close'] = plot_df['close'].rolling(window=7).mean()
+    plot_df['avg_7day_sma365'] = plot_df['sma365'].rolling(window=7).mean()
     
-    long_condition = (plot_df['pred_signal'] == 1) & (plot_df['avg_7day'] > plot_df['prev_sma365'])
-    short_condition = (plot_df['pred_signal'] == 1) & (plot_df['avg_7day'] < plot_df['prev_sma365'])
+    long_condition = (plot_df['pred_signal'] == 1) & (plot_df['avg_7day_close'] > plot_df['avg_7day_sma365'])
+    short_condition = (plot_df['pred_signal'] == 1) & (plot_df['avg_7day_close'] < plot_df['avg_7day_sma365'])
     
     plot_df['strategy_ret'] = 0.0
     plot_df.loc[long_condition, 'strategy_ret'] = plot_df.loc[long_condition, 'pct_change']
