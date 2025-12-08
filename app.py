@@ -17,7 +17,8 @@ import time
 from datetime import datetime
 
 # --- Configuration ---
-SYMBOL = 'BTC/USDT'
+TRAIN_SYMBOL = 'BTC/USDT'
+TEST_SYMBOL = 'ETH/USDT'  # Asset to test performance on
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 PORT = 8080
@@ -30,7 +31,7 @@ EPOCHS = 50
 UNITS_1 = 32
 UNITS_2 = 16
 
-# Profitable Periods (Start, End) - Inclusive
+# Profitable Periods (Visual Reference - based on BTC cycles)
 PROFITABLE_PERIODS = [
     ('2020-09-06', '2021-02-15'),
     ('2021-07-12', '2021-10-11'),
@@ -40,15 +41,15 @@ PROFITABLE_PERIODS = [
     ('2025-03-31', '2025-07-07')
 ]
 
-def fetch_data():
-    print(f"Fetching {SYMBOL} data from Binance starting {START_DATE}...")
+def fetch_data(symbol):
+    print(f"Fetching {symbol} data from Binance starting {START_DATE}...")
     exchange = ccxt.binance()
     since = exchange.parse8601(START_DATE)
     all_ohlcv = []
     
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since)
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=since)
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
@@ -57,7 +58,7 @@ def fetch_data():
                 break
             time.sleep(0.1) 
         except Exception as e:
-            print(f"Error fetching data: {e}")
+            print(f"Error fetching data for {symbol}: {e}")
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -81,21 +82,19 @@ def add_features(df):
     # Log Return in Percent
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1)) * 100
     
-    # Simple % Change for Backtesting (Shifted later)
+    # Simple % Change for Backtesting
     df['pct_change'] = df['close'].pct_change()
     
     # Drop NaNs
     df.dropna(inplace=True)
     return df
 
-def prepare_data(df):
+def prepare_data(df, fit_scaler=True, scaler=None):
     print("Preparing LSTM sequences...")
     
-    # Target Labeling: Periods
+    # Target Labeling (Used for training BTC, kept for visual ref on ETH)
     df['target'] = 0
-    
     for start_date, end_date in PROFITABLE_PERIODS:
-        # Create a mask for the date range
         mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
         df.loc[mask, 'target'] = 1
 
@@ -106,12 +105,16 @@ def prepare_data(df):
     dates = df.index
     
     # Scaling
-    scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(data)
-    
+    # We fit a NEW scaler for every asset to normalize its specific volatility/beta
+    if fit_scaler:
+        scaler = StandardScaler()
+        data_scaled = scaler.fit_transform(data)
+    else:
+        # If we wanted to use the exact same scaler (not recommended for different assets)
+        data_scaled = scaler.transform(data)
+        
     X, y, prediction_dates = [], [], []
     
-    # Create sequences
     for i in range(SEQ_LENGTH, len(data)):
         x_seq = data_scaled[i-SEQ_LENGTH:i]
         X.append(x_seq)
@@ -136,8 +139,8 @@ def build_model(input_shape):
     model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
     return model
 
-def create_plot(df, pred_dates, y_true, y_pred_prob):
-    print("Generating simulation and plot...")
+def create_plot(df, pred_dates, y_true, y_pred_prob, asset_name):
+    print(f"Generating simulation and plot for {asset_name}...")
     
     plot_df = df.loc[pred_dates].copy()
     plot_df['prediction_prob'] = y_pred_prob
@@ -145,31 +148,15 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
     plot_df['pred_signal'] = (plot_df['prediction_prob'] > 0.5).astype(int)
     
     # --- Backtest Simulation ---
-    # Logic:
-    # 1. Prediction determines if we play.
-    # 2. Relation to SMA365 determines Direction (Long/Short).
-    # IMPORTANT: We must use Yesterday's data to decide for Today to avoid look-ahead.
-    # The LSTM prediction at index `t` is based on data up to `t-1`.
-    # So we can use `pred_signal` at `t` to trade day `t`.
-    # However, comparison to SMA must also be based on known data (t-1).
-    
     plot_df['prev_close'] = plot_df['close'].shift(1)
     plot_df['prev_sma365'] = plot_df['sma365'].shift(1)
     
-    # Conditions
-    # Long: Signal=1 AND PrevClose > PrevSMA
+    # Conditions (Strategy logic)
     long_condition = (plot_df['pred_signal'] == 1) & (plot_df['prev_close'] > plot_df['prev_sma365'])
-    
-    # Short: Signal=1 AND PrevClose < PrevSMA
     short_condition = (plot_df['pred_signal'] == 1) & (plot_df['prev_close'] < plot_df['prev_sma365'])
     
-    # Calculate Strategy Returns
     plot_df['strategy_ret'] = 0.0
-    
-    # Apply Long returns
     plot_df.loc[long_condition, 'strategy_ret'] = plot_df.loc[long_condition, 'pct_change']
-    
-    # Apply Short returns (inverse of pct_change)
     plot_df.loc[short_condition, 'strategy_ret'] = -plot_df.loc[short_condition, 'pct_change']
     
     # Cumulative Returns
@@ -182,18 +169,18 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
         shared_xaxes=True, 
         vertical_spacing=0.05,
         row_heights=[0.5, 0.25, 0.25],
-        subplot_titles=(f"BTC/USDT Price", "LSTM Signal", "Strategy Equity Curve")
+        subplot_titles=(f"{asset_name} Price", "Model Confidence (Trained on BTC)", "Strategy Equity Curve")
     )
 
     # Panel 1: Price & SMAs
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Price', line=dict(color='white', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
     
-    # Highlight Target Periods
+    # Highlight Target Periods (Visual Ref from BTC cycles)
     fig.add_trace(go.Scatter(
         x=plot_df.index, 
         y=plot_df['is_profitable'] * plot_df['close'].max(), 
-        name='Target Period',
+        name='BTC Bull Cycles (Ref)',
         fill='tozeroy',
         mode='none',
         fillcolor='rgba(0, 255, 0, 0.1)',
@@ -227,14 +214,13 @@ def create_plot(df, pred_dates, y_true, y_pred_prob):
 
     fig.update_layout(
         template='plotly_dark',
-        title="LSTM Strategy Backtest (Long > SMA, Short < SMA)",
+        title=f"Strategy Transfer Test: {asset_name} (Trained on {TRAIN_SYMBOL})",
         hovermode='x unified',
         height=1000,
         margin=dict(l=10, r=10, t=50, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     
-    # Mobile Fullscreen CSS
     custom_style = """
     <style>
         body { margin: 0; padding: 0; background-color: #111; }
@@ -259,41 +245,44 @@ def run_server():
         httpd.serve_forever()
 
 def main():
-    # 1. Fetch
-    df = fetch_data()
+    # --- PHASE 1: TRAIN ON BTC ---
+    print(f"\n=== PHASE 1: Training on {TRAIN_SYMBOL} ===")
+    df_train = fetch_data(TRAIN_SYMBOL)
+    df_train = add_features(df_train)
+    X_train, y_train, dates_train, _ = prepare_data(df_train, fit_scaler=True)
     
-    # 2. Features
-    df = add_features(df)
+    print(f"Training Data shape: {X_train.shape}")
     
-    # 3. Prepare
-    X, y, dates, full_df = prepare_data(df)
-    
-    print(f"Data shape: {X.shape}")
-    print(f"Profitable days (Target=1): {np.sum(y)}")
-    
-    # 4. Class Weights
-    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+    # Weights
+    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(enumerate(weights))
-    print(f"Class weights: {class_weight_dict}")
     
-    # 5. Build & Train
-    model = build_model((X.shape[1], X.shape[2]))
-    
+    # Build & Train
+    model = build_model((X_train.shape[1], X_train.shape[2]))
     model.fit(
-        X, y, 
+        X_train, y_train, 
         epochs=EPOCHS, 
         batch_size=BATCH_SIZE, 
         class_weight=class_weight_dict,
         verbose=1
     )
 
-    # 6. Predict
-    y_pred_prob = model.predict(X)
+    # --- PHASE 2: TEST ON ETH ---
+    print(f"\n=== PHASE 2: Testing on {TEST_SYMBOL} ===")
+    df_test = fetch_data(TEST_SYMBOL)
+    df_test = add_features(df_test)
     
-    # 7. Plot & Simulate
-    create_plot(full_df, dates, y, y_pred_prob.flatten())
+    # Important: We fit a NEW scaler for ETH. 
+    # This normalizes ETH's volatility to be relative, similar to how BTC's was seen by the model.
+    X_test, y_test_dummy, dates_test, df_test_full = prepare_data(df_test, fit_scaler=True)
     
-    # 8. Server
+    # Predict using the BTC-trained model
+    y_pred_prob = model.predict(X_test)
+    
+    # Plot Results for ETH
+    create_plot(df_test_full, dates_test, y_test_dummy, y_pred_prob.flatten(), TEST_SYMBOL)
+    
+    # Server
     run_server()
 
 if __name__ == "__main__":
