@@ -25,11 +25,8 @@ SEQ_LENGTH = 30  # 30 lag features
 
 # Explicit Retest Dates (Ground Truth)
 RETEST_DATES = [
-    '2019-12-16',
-    '2020-03-15',
     '2020-09-06',
     '2021-07-12',
-    '2022-03-28',
     '2023-09-04',
     '2024-09-02',
     '2025-03-31'
