@@ -20,7 +20,7 @@ PORT = 8080
 # Optimization Settings
 # Increased generations and mutation to force exploration
 GA_SETTINGS = {
-    'POPULATION_SIZE': 40,
+    'POPULATION_SIZE': 80,
     'GENERATIONS': 10,
     'CROSSOVER_PROB': 0.7,
     'MUTATION_PROB': 0.4
