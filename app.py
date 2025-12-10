@@ -293,6 +293,32 @@ def dashboard():
     
     json_equity = json.dumps(fig_equity, cls=plotly.utils.PlotlyJSONEncoder)
 
+    # 2. Daily Returns Plot (Actual Results)
+    fig_daily = go.Figure()
+    
+    # Train Daily Returns
+    fig_daily.add_trace(go.Scatter(
+        x=train_metrics.index, 
+        y=train_metrics['final_daily_ret'],
+        mode='lines',
+        name='Training Daily Returns',
+        line=dict(color='blue')
+    ))
+    
+    # Test Daily Returns
+    fig_daily.add_trace(go.Scatter(
+        x=test_metrics.index, 
+        y=test_metrics['final_daily_ret'],
+        mode='lines',
+        name='Test Daily Returns',
+        line=dict(color='green')
+    ))
+
+    fig_daily.update_layout(title='Strategy Daily Returns (Train vs Test)',
+                            xaxis_title='Date', yaxis_title='Daily Return')
+    
+    json_daily = json.dumps(fig_daily, cls=plotly.utils.PlotlyJSONEncoder)
+
     # 2. Monthly Stats Table
     # Combine for table view
     full_metrics = pd.concat([train_metrics, test_metrics])
@@ -341,7 +367,10 @@ def dashboard():
                 </ul>
             </div>
 
-            <div id="chart"></div>
+            <div class="grid">
+                <div id="chart_equity"></div>
+                <div id="chart_daily"></div>
+            </div>
             
             <h2>Monthly Returns</h2>
             <div style="height: 400px; overflow-y: scroll;">
@@ -357,8 +386,11 @@ def dashboard():
         </div>
         
         <script>
-            var graphs = {json_equity};
-            Plotly.newPlot('chart', graphs.data, graphs.layout);
+            var graphs_equity = {json_equity};
+            Plotly.newPlot('chart_equity', graphs_equity.data, graphs_equity.layout);
+            
+            var graphs_daily = {json_daily};
+            Plotly.newPlot('chart_daily', graphs_daily.data, graphs_daily.layout);
         </script>
     </body>
     </html>
