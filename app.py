@@ -267,24 +267,16 @@ def dashboard():
     test_metrics = results_store['test_metrics']
     params = results_store['params']
     
-    # 1. Equity Curve Plot - Ensure data is valid and not constant
+    # 1. Equity Curve Plot - Plot actual daily returns instead of cumulative to show variable data
     fig_equity = go.Figure()
     
-    # Train Line - Check if cum_ret has variation
-    train_cum_ret = train_metrics['cum_ret']
-    if train_cum_ret.nunique() <= 1:
-        logging.warning("Train cumulative returns are constant, plotting raw daily returns instead.")
-        train_cum_ret = train_metrics['final_daily_ret']
-    
-    # Test Line - Check if cum_ret has variation
-    test_cum_ret = test_metrics['cum_ret']
-    if test_cum_ret.nunique() <= 1:
-        logging.warning("Test cumulative returns are constant, plotting raw daily returns instead.")
-        test_cum_ret = test_metrics['final_daily_ret']
+    # Use final_daily_ret directly for both train and test
+    train_returns = train_metrics['final_daily_ret']
+    test_returns = test_metrics['final_daily_ret']
     
     fig_equity.add_trace(go.Scatter(
         x=train_metrics.index, 
-        y=train_cum_ret,
+        y=train_returns,
         mode='lines',
         name='Training Data (50%)',
         line=dict(color='blue')
@@ -292,42 +284,46 @@ def dashboard():
     
     fig_equity.add_trace(go.Scatter(
         x=test_metrics.index, 
-        y=test_cum_ret,
+        y=test_returns,
         mode='lines',
         name='Test Data (50%)',
         line=dict(color='green')
     ))
 
-    fig_equity.update_layout(title='Strategy Equity Curve (Train vs Test)',
-                             xaxis_title='Date', yaxis_title='Cumulative Return Multiplier')
+    fig_equity.update_layout(title='Strategy Daily Returns (Train vs Test)',
+                             xaxis_title='Date', yaxis_title='Daily Return')
     
     json_equity = json.dumps(fig_equity, cls=plotly.utils.PlotlyJSONEncoder)
 
-    # 2. Daily Returns Plot (Actual Results)
-    fig_daily = go.Figure()
+    # 2. Cumulative Returns Plot (Optional, but kept for reference)
+    fig_cumulative = go.Figure()
     
-    # Train Daily Returns
-    fig_daily.add_trace(go.Scatter(
+    # Calculate cumulative returns from final_daily_ret for both train and test
+    train_cum_ret = (1 + train_metrics['final_daily_ret']).cumprod()
+    # For test, start from last train value for continuity
+    last_train_val = train_cum_ret.iloc[-1] if not train_cum_ret.empty else 1
+    test_cum_ret = (1 + test_metrics['final_daily_ret']).cumprod() * last_train_val
+    
+    fig_cumulative.add_trace(go.Scatter(
         x=train_metrics.index, 
-        y=train_metrics['final_daily_ret'],
+        y=train_cum_ret,
         mode='lines',
-        name='Training Daily Returns',
+        name='Training Cumulative Returns',
         line=dict(color='blue')
     ))
     
-    # Test Daily Returns
-    fig_daily.add_trace(go.Scatter(
+    fig_cumulative.add_trace(go.Scatter(
         x=test_metrics.index, 
-        y=test_metrics['final_daily_ret'],
+        y=test_cum_ret,
         mode='lines',
-        name='Test Daily Returns',
+        name='Test Cumulative Returns',
         line=dict(color='green')
     ))
 
-    fig_daily.update_layout(title='Strategy Daily Returns (Train vs Test)',
-                            xaxis_title='Date', yaxis_title='Daily Return')
+    fig_cumulative.update_layout(title='Strategy Cumulative Returns (Train vs Test)',
+                                 xaxis_title='Date', yaxis_title='Cumulative Return Multiplier')
     
-    json_daily = json.dumps(fig_daily, cls=plotly.utils.PlotlyJSONEncoder)
+    json_cumulative = json.dumps(fig_cumulative, cls=plotly.utils.PlotlyJSONEncoder)
 
     # 2. Monthly Stats Table
     # Combine for table view
@@ -399,8 +395,8 @@ def dashboard():
             var graphs_equity = {json_equity};
             Plotly.newPlot('chart_equity', graphs_equity.data, graphs_equity.layout);
             
-            var graphs_daily = {json_daily};
-            Plotly.newPlot('chart_daily', graphs_daily.data, graphs_daily.layout);
+            var graphs_cumulative = {json_cumulative};
+            Plotly.newPlot('chart_daily', graphs_cumulative.data, graphs_cumulative.layout);
         </script>
     </body>
     </html>
