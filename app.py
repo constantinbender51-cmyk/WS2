@@ -1,366 +1,409 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-from sklearn.preprocessing import StandardScaler
-from sklearn.utils.class_weight import compute_class_weight
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import http.server
-import socketserver
 import time
+from datetime import datetime
+import random
+from deap import base, creator, tools, algorithms
+from flask import Flask, render_template_string
+import plotly.graph_objects as go
+import plotly.utils
+import json
+import logging
 
-# --- Configuration ---
+# --- CONFIGURATION ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
-START_DATE = '2018-01-01 00:00:00'
+START_DATE_STR = '2018-01-01 00:00:00'
 PORT = 8080
-SEQ_LENGTH = 30
-NOISE_LEVEL = 0.002  # 0.2% Standard Deviation noise added to returns
 
-# Hyperparameters
-BATCH_SIZE = 64
-DROPOUT_RATE = 0.4
-EPOCHS = 50
-UNITS_1 = 32
-UNITS_2 = 16
+# GA Settings (Adjust for deeper optimization)
+GA_SETTINGS = {
+    'POPULATION_SIZE': 24,
+    'GENERATIONS': 5,
+    'CROSSOVER_PROB': 0.5,
+    'MUTATION_PROB': 0.2
+}
 
-# Profitable Periods
-PROFITABLE_PERIODS = [
-    ('2020-09-06', '2021-02-15'),
-    ('2021-07-12', '2021-10-11'),
-    ('2022-03-28', '2023-01-02'),
-    ('2023-09-04', '2024-03-04'),
-    ('2024-09-02', '2025-02-03'),
-    ('2025-03-31', '2025-07-07')
-]
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def fetch_data():
-    print(f"Fetching {SYMBOL} data from Binance starting {START_DATE}...")
+# --- 1. DATA FETCHING ---
+def fetch_binance_data(symbol, timeframe, start_str):
     exchange = ccxt.binance()
-    since = exchange.parse8601(START_DATE)
-    all_ohlcv = []
+    start_ts = exchange.parse8601(start_str)
     
-    while True:
+    logging.info(f"Fetching {symbol} data starting from {start_str}...")
+    
+    ohlcv_list = []
+    current_ts = start_ts
+    now_ts = exchange.milliseconds()
+    
+    while current_ts < now_ts:
         try:
-            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since)
+            # Fetch limit=1000 candles
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
             if not ohlcv:
                 break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1 
-            if len(ohlcv) < 500: 
-                break
-            time.sleep(0.1) 
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            break
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df = df[~df.index.duplicated(keep='first')].sort_index()
+            start_ts_batch = ohlcv[0][0]
+            end_ts_batch = ohlcv[-1][0]
+            
+            # If we didn't advance, break to prevent infinite loop
+            if current_ts == end_ts_batch:
+                break
+                
+            current_ts = end_ts_batch + 1 # Move to next ms
+            ohlcv_list.extend(ohlcv)
+            
+            # Simple rate limit handling
+            time.sleep(exchange.rateLimit / 1000)
+            
+        except Exception as e:
+            logging.error(f"Error fetching data: {e}")
+            break
+
+    df = pd.DataFrame(ohlcv_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('date', inplace=True)
+    df = df[~df.index.duplicated(keep='first')] # Remove duplicates if any
+    logging.info(f"Fetched {len(df)} rows of data.")
     return df
 
-def generate_mock_data(original_df, noise_std=0.02):
+# --- 2. TRADING STRATEGY CORE ---
+def calculate_metrics_vectorized(df, a, b, c, d, e, f):
     """
-    Generates a synthetic price history by adding Gaussian noise to daily returns
-    and applying a noisy sine wave oscillator between 0.1 and 10.
-    Distorts time by selecting OHLCV data points based on cumulative rounding of the oscillator,
-    creating compression/expansion of time intervals.
-    Preserves general trend but changes specific price action and time spacing.
+    a: Band % (0.01 - 0.20)
+    b: SMA Period (10 - 200)
+    c: Stop Loss % (0.01 - 0.10)
+    d: III Threshold (0.1 - 0.9)
+    e: High Leverage (1.0 - 5.0)
+    f: Low Leverage (0.1 - 1.0)
     """
-    print(f"Generating Mock Data with {noise_std*100}% return noise and time-distorting oscillator...")
-    df = original_df.copy()
+    data = df.copy()
     
-    # 1. Calculate original returns
-    df['pct_change'] = df['close'].pct_change()
-    df['pct_change'].fillna(0, inplace=True)
+    # 1. Indicators
+    # SMA
+    data['sma'] = data['close'].rolling(window=int(b)).mean()
     
-    # 2. Add Noise to returns
-    noise = np.random.normal(0, noise_std, size=len(df))
-    df['distorted_returns'] = df['pct_change'] + noise
+    # Return (log returns for III calculation)
+    data['log_ret'] = np.log(data['close'] / data['close'].shift(1))
     
-    # 3. Create noisy oscillator: sine wave between 0.1 and 10
-    days = np.arange(len(df))
-    frequency = 2 * np.pi / 100  # 100-day period
-    sine_wave = np.sin(frequency * days)
-    # Add noise to the sine wave
-    sine_noise = np.random.normal(0, 0.5, size=len(df))  # Increased noise for more variation
-    noisy_sine = sine_wave + sine_noise
-    # Scale to 0.1-10 range: (noisy_sine + 1) * 4.95 + 0.1, clamp to avoid extreme values
-    oscillator = (noisy_sine + 1) * 4.95 + 0.1
-    oscillator = np.clip(oscillator, 0.1, 10.0)
+    # III (Efficiency Ratio) - using period b for simplicity
+    roll_abs_sum = data['log_ret'].abs().rolling(window=int(b)).sum()
+    roll_sum_abs_diff = data['log_ret'].rolling(window=int(b)).sum().abs() # Numerator usually displacement
     
-    # 4. Apply oscillator to distorted returns to distort faster/slower
-    df['oscillated_returns'] = df['distorted_returns'] * oscillator
-    # Clip oscillated_returns to prevent extreme values that could cause overflow
-    df['oscillated_returns'] = np.clip(df['oscillated_returns'], -0.5, 0.5)  # Limit to ±50% daily change
-    
-    # 5. Reconstruct Price Path
-    start_price = df['close'].iloc[0]
-    price_path = start_price * (1 + df['oscillated_returns']).cumprod()
-    # Ensure no infinite or NaN values in price_path
-    price_path = np.nan_to_num(price_path, nan=start_price, posinf=start_price, neginf=start_price)
-    
-    # 6. Reconstruct OHLC roughly to maintain candle structure relative to Close
-    # Avoid division by zero by replacing zero close with a small epsilon
-    epsilon = 1e-10
-    close_nonzero = df['close'].replace(0, epsilon)
-    df['high_ratio'] = df['high'] / close_nonzero
-    df['low_ratio'] = df['low'] / close_nonzero
-    df['open_ratio'] = df['open'] / close_nonzero
-    
-    df['mock_close'] = price_path
-    df['mock_high'] = df['mock_close'] * df['high_ratio']
-    df['mock_low'] = df['mock_close'] * df['low_ratio']
-    df['mock_open'] = df['mock_close'] * df['open_ratio']
-    
-    # Ensure all mock OHLC values are finite and positive
-    for col in ['mock_close', 'mock_high', 'mock_low', 'mock_open']:
-        df[col] = np.nan_to_num(df[col], nan=start_price, posinf=start_price, neginf=start_price)
-        df[col] = np.clip(df[col], 1e-10, None)  # Ensure positive values
-    
-    # 7. Time distortion: select OHLCV data points based on cumulative rounding of oscillator
-    # Generate cumulative oscillator values rounded to integers to determine index jumps
-    cum_oscillator = np.cumsum(oscillator)
-    cum_rounded = np.round(cum_oscillator).astype(int)
-    
-    # Ensure we stay within bounds of the original data
-    max_index = len(df) - 1
-    selected_indices = []
-    
-    for i in range(len(df)):
-        # Find the next index based on cumulative rounded value
-        target_index = min(cum_rounded[i], max_index)
-        selected_indices.append(target_index)
-    
-    # Use selected indices to pick data from the mock OHLCV columns
-    mock_close = df['mock_close'].iloc[selected_indices].values
-    mock_high = df['mock_high'].iloc[selected_indices].values
-    mock_low = df['mock_low'].iloc[selected_indices].values
-    mock_open = df['mock_open'].iloc[selected_indices].values
-    mock_volume = df['volume'].iloc[selected_indices].values
-    
-    # Create mock DataFrame with original timestamps to maintain alignment for downstream functions
-    mock_df = pd.DataFrame({
-        'open': mock_open,
-        'high': mock_high,
-        'low': mock_low,
-        'close': mock_close,
-        'volume': mock_volume
-    }, index=df.index)  # Use original timestamps to keep same length and alignment
-    mock_df.index.name = 'timestamp'
-    
-    # Final check: ensure no infinite or NaN values in the mock DataFrame
-    mock_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    mock_df.fillna(method='ffill', inplace=True)
-    mock_df.fillna(method='bfill', inplace=True)
-    
-    return mock_df
+    # Correction: The prompt says "abs sum log returns / sum abs log returns"
+    # Numerator: abs(sum(log_ret)) -> Absolute displacement
+    # Denominator: sum(abs(log_ret)) -> Sum of volatility
+    data['iii'] = data['log_ret'].rolling(window=int(b)).sum().abs() / \
+                  (data['log_ret'].abs().rolling(window=int(b)).sum() + 1e-9)
 
-def add_features(df):
-    # Recalculate features on the passed dataframe (Real or Mock)
-    df['sma365'] = df['close'].rolling(window=365).mean()
-    df['sma120'] = df['close'].rolling(window=120).mean()
-    df['sma40'] = df['close'].rolling(window=40).mean()
+    # Yesterday's Return (Direction)
+    data['prev_ret'] = data['close'].shift(1) - data['open'].shift(1)
+    data['direction'] = np.where(data['prev_ret'] > 0, 1, -1)
     
-    df['dist_365'] = (df['close'] - df['sma365']) / df['sma365']
-    df['dist_120'] = (df['close'] - df['sma120']) / df['sma120']
-    df['dist_40'] = (df['close'] - df['sma40']) / df['sma40']
-    
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1)) * 100
-    df['pct_change'] = df['close'].pct_change()
-    
-    df.dropna(inplace=True)
-    return df
+    # 2. Entry Condition: Price leaves a% band of SMA b
+    # Assuming standard envelope logic: |Close - SMA| > SMA * a
+    data['dist_sma'] = abs(data['close'].shift(1) - data['sma'].shift(1))
+    data['sma_threshold'] = data['sma'].shift(1) * a
+    data['signal_active'] = data['dist_sma'] > data['sma_threshold']
 
-def prepare_data(df):
-    df['target'] = 0
-    for start_date, end_date in PROFITABLE_PERIODS:
-        mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
-        df.loc[mask, 'target'] = 1
+    # 3. Leverage logic
+    data['leverage'] = np.where(data['iii'].shift(1) > d, e, f)
+    
+    # 4. Trade Execution (Vectorized simulation)
+    # We trade Open to Close
+    # Direction is determined by yesterday. 
+    # Long if prev_ret > 0, Short if prev_ret < 0
+    
+    # Base Returns without SL
+    # Long: (Close - Open) / Open
+    # Short: (Open - Close) / Open
+    # We can simplify: Direction * (Close - Open) / Open
+    
+    data['daily_raw_ret'] = (data['close'] - data['open']) / data['open']
+    data['strategy_raw_ret'] = data['direction'] * data['daily_raw_ret']
+    
+    # 5. Stop Loss Logic (Intraday)
+    # Long SL: Low < Open * (1 - c)
+    # Short SL: High > Open * (1 + c)
+    
+    # Calculate SL Prices
+    data['long_sl_price'] = data['open'] * (1 - c)
+    data['short_sl_price'] = data['open'] * (1 + c)
+    
+    # Check hits
+    # If Long and Low < SL
+    data['long_sl_hit'] = (data['direction'] == 1) & (data['low'] < data['long_sl_price'])
+    # If Short and High > SL
+    data['short_sl_hit'] = (data['direction'] == -1) & (data['high'] > data['short_sl_price'])
+    
+    # Calculate SL Returns
+    # Long SL Ret: (SL_Price - Open) / Open = -c
+    # Short SL Ret: (Open - SL_Price) / Open = -c
+    # It is always -c loss if hit
+    
+    # Apply SL
+    # If signal is not active, return is 0 (no trade)
+    # If SL hit, return is -c * leverage
+    # Else return is strategy_raw_ret * leverage
+    
+    # Conditions
+    conditions = [
+        ~data['signal_active'],           # No Trade
+        data['long_sl_hit'],              # Long SL Hit
+        data['short_sl_hit']              # Short SL Hit
+    ]
+    
+    choices = [
+        0.0,
+        -c,
+        -c
+    ]
+    
+    # Base return with SL applied (unleveraged)
+    data['final_daily_ret_no_lev'] = np.select(conditions, choices, default=data['strategy_raw_ret'])
+    
+    # Apply Leverage
+    data['final_daily_ret'] = data['final_daily_ret_no_lev'] * data['leverage']
+    
+    # Fill NaN (start of data)
+    data['final_daily_ret'].fillna(0, inplace=True)
+    
+    return data
 
-    feature_cols = ['dist_365', 'dist_120', 'dist_40', 'log_ret']
+def evaluate_strategy(individual, data):
+    a, b, c, d, e, f = individual
     
-    data = df[feature_cols].values
-    targets = df['target'].values
-    dates = df.index
+    res = calculate_metrics_vectorized(data, a, b, c, d, e, f)
     
-    scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(data)
+    # Criterion: Stable Monthly Sharpe
+    res['year_month'] = res.index.to_period('M')
     
-    X, y, prediction_dates = [], [], []
+    monthly_stats = res.groupby('year_month')['final_daily_ret'].agg(['mean', 'std', 'count'])
     
-    for i in range(SEQ_LENGTH, len(data)):
-        x_seq = data_scaled[i-SEQ_LENGTH:i]
-        X.append(x_seq)
-        y.append(targets[i])
-        prediction_dates.append(dates[i])
+    # Annualized Monthly Sharpe: (Mean / Std) * sqrt(count)
+    # Avoid div by zero
+    monthly_sharpes = (monthly_stats['mean'] / (monthly_stats['std'] + 1e-9)) * np.sqrt(monthly_stats['count'])
+    
+    # Stability Score: Mean of Monthly Sharpes / Std of Monthly Sharpes
+    # We want high average sharpe and low variance between months
+    
+    avg_sharpe = monthly_sharpes.mean()
+    std_sharpe = monthly_sharpes.std()
+    
+    if np.isnan(avg_sharpe): return -999,
+    
+    # If std is 0 (unlikely or 1 month), handle gracefully
+    stability_metric = avg_sharpe / (std_sharpe + 1e-9)
+    
+    # Penalties for losing money overall or negative sharpe
+    if avg_sharpe < 0:
+        return -100 + avg_sharpe, # Severe penalty
         
-    return np.array(X), np.array(y), prediction_dates, df
+    return stability_metric,
 
-def build_model(input_shape):
-    model = Sequential([
-        Input(shape=input_shape),
-        LSTM(UNITS_1, return_sequences=True),
-        Dropout(DROPOUT_RATE),
-        LSTM(UNITS_2),
-        Dropout(DROPOUT_RATE),
-        Dense(16, activation='relu'),
-        Dense(1, activation='sigmoid')
-    ])
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
-    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
-    return model
+# --- 3. GENETIC ALGORITHM ---
+def run_genetic_optimization(train_data):
+    logging.info("Starting Genetic Algorithm Optimization...")
+    
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
 
-def create_comparison_plot(real_df, mock_df, pred_dates, y_true, y_pred_prob):
-    print("Generating comparison plot...")
-    
-    # Align mock_df to prediction dates - ensure indices match
-    # Since mock_df now has the same timestamps as original, this should work
-    plot_df = mock_df.loc[pred_dates].copy()
-    plot_df['prediction_prob'] = y_pred_prob
-    plot_df['is_profitable'] = y_true
-    plot_df['pred_signal'] = (plot_df['prediction_prob'] > 0.5).astype(int)
-    
-    # Get Real prices for comparison background
-    real_prices = real_df.loc[pred_dates]['close']
+    toolbox = base.Toolbox()
 
-    # Strategy Calculation on MOCK data
-    plot_df['avg_7day_close'] = plot_df['close'].rolling(window=7).mean()
-    plot_df['avg_7day_sma365'] = plot_df['sma365'].rolling(window=7).mean()
-    
-    long_condition = (plot_df['pred_signal'] == 1) & (plot_df['avg_7day_close'] > plot_df['avg_7day_sma365'])
-    short_condition = (plot_df['pred_signal'] == 1) & (plot_df['avg_7day_close'] < plot_df['avg_7day_sma365'])
-    
-    plot_df['strategy_ret'] = 0.0
-    plot_df.loc[long_condition, 'strategy_ret'] = plot_df.loc[long_condition, 'pct_change']
-    plot_df.loc[short_condition, 'strategy_ret'] = -plot_df.loc[short_condition, 'pct_change']
-    
-    plot_df['cum_strategy'] = (1 + plot_df['strategy_ret']).cumprod()
-    plot_df['cum_bnh'] = (1 + plot_df['pct_change']).cumprod()
+    # Parameter Ranges
+    # a: Band % [0.005, 0.10]
+    # b: SMA [10, 200]
+    # c: SL % [0.01, 0.15]
+    # d: III Threshold [0.1, 0.9]
+    # e: Lev High [1.0, 4.0]
+    # f: Lev Low [0.1, 1.0]
 
-    # --- Plotting ---
-    fig = make_subplots(
-        rows=3, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.05,
-        row_heights=[0.5, 0.25, 0.25],
-        subplot_titles=(f"Mock vs Real Price (Noise: {NOISE_LEVEL*100}%)", "Model Confidence on Mock Data", "Equity Curve (Mock Data)")
-    )
+    toolbox.register("attr_a", random.uniform, 0.005, 0.10)
+    toolbox.register("attr_b", random.randint, 10, 200)
+    toolbox.register("attr_c", random.uniform, 0.01, 0.15)
+    toolbox.register("attr_d", random.uniform, 0.1, 0.9)
+    toolbox.register("attr_e", random.uniform, 1.0, 4.0)
+    toolbox.register("attr_f", random.uniform, 0.1, 1.0)
 
-    # Panel 1: Mock Price vs Real Price
-    fig.add_trace(go.Scatter(x=plot_df.index, y=real_prices, name='Original Price', line=dict(color='rgba(255,255,255,0.2)', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['close'], name='Distorted Price', line=dict(color='cyan', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['sma365'], name='Mock SMA 365', line=dict(color='orange', width=1.5)), row=1, col=1)
+    toolbox.register("individual", tools.initCycle, creator.Individual,
+                     (toolbox.attr_a, toolbox.attr_b, toolbox.attr_c, 
+                      toolbox.attr_d, toolbox.attr_e, toolbox.attr_f), n=1)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    toolbox.register("evaluate", evaluate_strategy, data=train_data)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=[0.01, 5, 0.01, 0.1, 0.5, 0.1], indpb=0.2)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    pop = toolbox.population(n=GA_SETTINGS['POPULATION_SIZE'])
+    hof = tools.HallOfFame(1)
     
-    # Highlight Target Periods
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['is_profitable'] * plot_df['close'].max(), 
-        name='Target Period',
-        fill='tozeroy',
-        mode='none',
-        fillcolor='rgba(0, 255, 0, 0.1)',
-        hoverinfo='skip'
-    ), row=1, col=1)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean)
+    stats.register("min", np.min)
+    stats.register("max", np.max)
 
-    # Panel 2: Predictions
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['prediction_prob'], 
-        name='AI Confidence',
-        fill='tozeroy',
-        line=dict(color='#00ff00', width=1)
-    ), row=2, col=1)
-    fig.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1)
+    algorithms.eaSimple(pop, toolbox, cxpb=GA_SETTINGS['CROSSOVER_PROB'], 
+                        mutpb=GA_SETTINGS['MUTATION_PROB'], 
+                        ngen=GA_SETTINGS['GENERATIONS'], 
+                        stats=stats, halloffame=hof, verbose=True)
 
-    # Panel 3: Equity Curve
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['cum_strategy'], 
-        name='Strategy (Mock)',
-        line=dict(color='#00ffff', width=2)
-    ), row=3, col=1)
+    best_ind = hof[0]
+    logging.info(f"Best Parameters Found: {best_ind}")
+    return best_ind
+
+# --- 4. FLASK SERVER & PLOTTING ---
+app = Flask(__name__)
+results_store = {}
+
+@app.route('/')
+def dashboard():
+    if not results_store:
+        return "Still optimizing... check console."
     
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, 
-        y=plot_df['cum_bnh'], 
-        name='Buy & Hold (Mock)',
-        line=dict(color='gray', width=1, dash='dot')
-    ), row=3, col=1)
-
-    fig.update_layout(
-        template='plotly_dark',
-        title="Stress Test: Model Robustness on Distorted Data",
-        hovermode='x unified',
-        height=1000,
-        margin=dict(l=10, r=10, t=50, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
+    train_metrics = results_store['train_metrics']
+    test_metrics = results_store['test_metrics']
+    params = results_store['params']
     
-    custom_style = """
-    <style>
-        body { margin: 0; padding: 0; background-color: #111; }
-        .plotly-graph-div { height: 100vh !important; }
-    </style>
+    # 1. Equity Curve Plot
+    fig_equity = go.Figure()
+    
+    # Train Line
+    fig_equity.add_trace(go.Scatter(
+        x=train_metrics.index, 
+        y=train_metrics['cum_ret'],
+        mode='lines',
+        name='Training Data (50%)',
+        line=dict(color='blue')
+    ))
+    
+    # Test Line
+    fig_equity.add_trace(go.Scatter(
+        x=test_metrics.index, 
+        y=test_metrics['cum_ret'],
+        mode='lines',
+        name='Test Data (50%)',
+        line=dict(color='green')
+    ))
+
+    fig_equity.update_layout(title='Strategy Equity Curve (Train vs Test)',
+                             xaxis_title='Date', yaxis_title='Cumulative Return Multiplier')
+    
+    json_equity = json.dumps(fig_equity, cls=plotly.utils.PlotlyJSONEncoder)
+
+    # 2. Monthly Stats Table
+    # Combine for table view
+    full_metrics = pd.concat([train_metrics, test_metrics])
+    full_metrics['year_month'] = full_metrics.index.to_period('M').astype(str)
+    
+    monthly_table = full_metrics.groupby('year_month')['final_daily_ret'].sum().reset_index()
+    monthly_table.columns = ['Month', 'Monthly Return']
+    monthly_table['Monthly Return'] = monthly_table['Monthly Return'].apply(lambda x: f"{x*100:.2f}%")
+    
+    # Generate HTML Table rows
+    table_rows = ""
+    for _, row in monthly_table.iterrows():
+        color = "red" if "-" in row['Monthly Return'] else "green"
+        table_rows += f"<tr><td>{row['Month']}</td><td style='color:{color}'>{row['Monthly Return']}</td></tr>"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Genetic Algo Trading Results</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body {{ font-family: sans-serif; margin: 20px; background: #f4f4f4; }}
+            .container {{ max_width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+            h1, h2 {{ color: #333; }}
+            .params-box {{ background: #e8f4f8; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            .grid {{ display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Genetic Optimization Results: {SYMBOL}</h1>
+            
+            <div class="params-box">
+                <h2>Optimized Parameters</h2>
+                <ul>
+                    <li><strong>a (Band %):</strong> {params[0]:.4f}</li>
+                    <li><strong>b (SMA Period):</strong> {int(params[1])}</li>
+                    <li><strong>c (Stop Loss %):</strong> {params[2]:.4f}</li>
+                    <li><strong>d (III Threshold):</strong> {params[3]:.4f}</li>
+                    <li><strong>e (High Lev):</strong> {params[4]:.2f}x</li>
+                    <li><strong>f (Low Lev):</strong> {params[5]:.2f}x</li>
+                </ul>
+            </div>
+
+            <div id="chart"></div>
+            
+            <h2>Monthly Returns</h2>
+            <div style="height: 400px; overflow-y: scroll;">
+                <table>
+                    <thead>
+                        <tr><th>Month</th><th>Return</th></tr>
+                    </thead>
+                    <tbody>
+                        {table_rows}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <script>
+            var graphs = {json_equity};
+            Plotly.newPlot('chart', graphs.data, graphs.layout);
+        </script>
+    </body>
+    </html>
     """
-    html_content = fig.to_html(full_html=True, include_plotlyjs='cdn')
-    html_content = html_content.replace('</head>', f'{custom_style}</head>')
-    
-    with open("index.html", "w") as f:
-        f.write(html_content)
-    print("index.html created.")
+    return html
 
-def run_server():
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass 
-
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"\nServing results at http://localhost:{PORT}")
-        print("Press Ctrl+C to stop.")
-        httpd.serve_forever()
-
-def main():
-    # 1. Fetch & Prepare ORIGINAL Training Data
-    print("--- Training Phase (Original Data) ---")
-    raw_df = fetch_data()
-    train_df = add_features(raw_df.copy()) # Feature engineering on original
-    X_train, y_train, _, _ = prepare_data(train_df)
-    
-    # 2. Class Weights
-    weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
-    class_weight_dict = dict(enumerate(weights))
-    
-    # 3. Train Model on Original Data
-    model = build_model((X_train.shape[1], X_train.shape[2]))
-    model.fit(
-        X_train, y_train, 
-        epochs=EPOCHS, 
-        batch_size=BATCH_SIZE, 
-        class_weight=class_weight_dict,
-        verbose=1
-    )
-    
-    # 4. Generate MOCK Test Data
-    print("\n--- Testing Phase (Mock/Distorted Data) ---")
-    mock_raw_df = generate_mock_data(raw_df, noise_std=NOISE_LEVEL)
-    mock_featured_df = add_features(mock_raw_df) # Recalculate indicators on distorted price!
-    
-    # 5. Predict on Mock Data
-    X_mock, y_mock, dates_mock, full_mock_df = prepare_data(mock_featured_df)
-    
-    print(f"Predicting on {len(X_mock)} distorted samples...")
-    y_pred_prob = model.predict(X_mock)
-    
-    # 6. Plot Results
-    # We pass 'raw_df' just to plot the faint original line for visual comparison
-    create_comparison_plot(add_features(raw_df.copy()), full_mock_df, dates_mock, y_mock, y_pred_prob.flatten())
-    
-    run_server()
-
+# --- 5. MAIN EXECUTION ---
 if __name__ == "__main__":
-    main()
+    # 1. Get Data
+    df = fetch_binance_data(SYMBOL, TIMEFRAME, START_DATE_STR)
+    
+    if len(df) < 200:
+        logging.error("Not enough data fetched. Exiting.")
+        exit()
+
+    # 2. Split Data 50/50
+    split_idx = int(len(df) * 0.5)
+    train_data = df.iloc[:split_idx].copy()
+    test_data = df.iloc[split_idx:].copy()
+    
+    logging.info(f"Training Data: {len(train_data)} records")
+    logging.info(f"Testing Data: {len(test_data)} records")
+
+    # 3. Optimize
+    best_ind = run_genetic_optimization(train_data)
+    
+    # 4. Process Results for Display
+    a, b, c, d, e, f = best_ind
+    
+    # Recalculate full series for storage
+    train_res = calculate_metrics_vectorized(train_data, a, b, c, d, e, f)
+    train_res['cum_ret'] = (1 + train_res['final_daily_ret']).cumprod()
+    
+    # For test data, we need to be careful with cumprod chaining or just start from 1
+    test_res = calculate_metrics_vectorized(test_data, a, b, c, d, e, f)
+    # Start test cum_ret from where train left off for visual continuity
+    last_train_val = train_res['cum_ret'].iloc[-1]
+    test_res['cum_ret'] = (1 + test_res['final_daily_ret']).cumprod() * last_train_val
+    
+    results_store['train_metrics'] = train_res
+    results_store['test_metrics'] = test_res
+    results_store['params'] = best_ind
+    
+    # 5. Start Server
+    print(f"\nOptimization Complete. Starting Web Server at http://localhost:{PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
+
+
