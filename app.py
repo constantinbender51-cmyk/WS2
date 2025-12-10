@@ -19,12 +19,12 @@ PORT = 8080
 
 # --- REALITY CONSTRAINTS ---
 # Taker Fee (0.05%) + Slippage (0.10%) = 0.15% per side
-COST_PER_SIDE = 0.000
+COST_PER_SIDE = 0.0015 
 # Daily cost of holding leverage (approx 10-20% APR annualized)
-FUNDING_RATE_DAILY = 0.0000
+FUNDING_RATE_DAILY = 0.0003 
 
 GA_SETTINGS = {
-    'POPULATION_SIZE': 100,
+    'POPULATION_SIZE': 80,
     'GENERATIONS': 10,
     'CROSSOVER_PROB': 0.7,
     'MUTATION_PROB': 0.3
@@ -234,12 +234,12 @@ def run_ga(train_df):
     toolbox = base.Toolbox()
     
     # Conservative Parameter Ranges
-    toolbox.register("attr_a", random.uniform, 0.01, 0.15)   # Band (2-15%)
-    toolbox.register("attr_b", random.randint, 10, 400)      # SMA
+    toolbox.register("attr_a", random.uniform, 0.02, 0.15)   # Band (2-15%)
+    toolbox.register("attr_b", random.randint, 10, 100)      # SMA
     toolbox.register("attr_c", random.uniform, 0.02, 0.10)   # SL (2-10%) - Minimum 2% to avoid noise
-    toolbox.register("attr_d", random.uniform, 0.01, 0.8)     # III
-    toolbox.register("attr_e", random.uniform, 0.1, 3.0)     # High Lev (Max 3x)
-    toolbox.register("attr_f", random.uniform, 0.1, 3.0)     # Low Lev
+    toolbox.register("attr_d", random.uniform, 0.2, 0.8)     # III
+    toolbox.register("attr_e", random.uniform, 1.0, 3.0)     # High Lev (Max 3x)
+    toolbox.register("attr_f", random.uniform, 0.1, 1.0)     # Low Lev
 
     toolbox.register("individual", tools.initCycle, creator.Individual,
                      (toolbox.attr_a, toolbox.attr_b, toolbox.attr_c, 
