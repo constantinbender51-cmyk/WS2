@@ -18,11 +18,12 @@ START_DATE_STR = '2018-01-01 00:00:00'
 PORT = 8080
 
 # Optimization Settings
+# Increased generations and mutation to force exploration
 GA_SETTINGS = {
-    'POPULATION_SIZE': 30,
-    'GENERATIONS': 8,
-    'CROSSOVER_PROB': 0.6,
-    'MUTATION_PROB': 0.3
+    'POPULATION_SIZE': 40,
+    'GENERATIONS': 10,
+    'CROSSOVER_PROB': 0.7,
+    'MUTATION_PROB': 0.4
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -40,12 +41,20 @@ def fetch_binance_data(symbol, timeframe, start_str):
     
     while current_ts < now_ts:
         try:
+            # Fetch batch
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
             if not ohlcv:
                 break
             
-            current_ts = ohlcv[-1][0] + 1
+            # Check progress
+            last_ts = ohlcv[-1][0]
+            if last_ts == current_ts:
+                break # Avoid infinite loop if exchange returns same data
+            
+            current_ts = last_ts + 1
             all_ohlcv.extend(ohlcv)
+            
+            # Respect rate limits
             time.sleep(exchange.rateLimit / 1000)
             
         except Exception as e:
@@ -53,10 +62,19 @@ def fetch_binance_data(symbol, timeframe, start_str):
             break
 
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # CRITICAL FIX: Ensure numeric types
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+    
     df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('date', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
-    logging.info(f"Fetched {len(df)} candles.")
+    
+    # Drop any rows with NaN in critical columns
+    df.dropna(subset=['close', 'open'], inplace=True)
+    
+    logging.info(f"Fetched {len(df)} valid candles.")
     return df
 
 # --- 2. CORE TRADING LOGIC ---
@@ -76,80 +94,81 @@ def calculate_metrics_vectorized(df, params):
     data['sma'] = data['close'].rolling(window=int(b)).mean()
     
     # 2. III (Intraday Intensity / Efficiency)
-    # Computed on Log Returns over period b
     data['log_ret'] = np.log(data['close'] / data['close'].shift(1))
     
-    roll_sum_abs_diff = data['log_ret'].rolling(window=int(b)).sum().abs() # |Sum|
-    roll_abs_sum_diff = data['log_ret'].abs().rolling(window=int(b)).sum() # Sum(|x|)
+    # Window for III same as SMA for simplicity, or hardcoded small window (e.g., 10)
+    iii_window = 14
+    roll_sum_abs_diff = data['log_ret'].rolling(window=iii_window).sum().abs() 
+    roll_abs_sum_diff = data['log_ret'].abs().rolling(window=iii_window).sum() 
     
-    # Avoid division by zero
     data['iii'] = roll_sum_abs_diff / (roll_abs_sum_diff + 1e-9)
 
     # 3. Signals (Shifted to prevent lookahead)
-    # We trade TODAY based on YESTERDAY's data
     prev_close = data['close'].shift(1)
     prev_open = data['open'].shift(1)
     prev_sma = data['sma'].shift(1)
     prev_iii = data['iii'].shift(1)
     
-    # Direction: Follow yesterday's move
-    # If yesterday Green (Close > Open) -> Long (1)
-    # If yesterday Red (Close < Open) -> Short (-1)
-    data['direction'] = np.where(prev_close > prev_open, 1, -1)
+    # Direction: 1 (Long) if yesterday Green, -1 (Short) if Red
+    data['direction'] = np.where(prev_close >= prev_open, 1, -1)
     
-    # Entry Condition: Price left a% band of SMA
-    # |PrevClose - PrevSMA| > PrevSMA * a
+    # Entry Condition: |PrevClose - PrevSMA| > PrevSMA * a
     dist_from_sma = (prev_close - prev_sma).abs()
     threshold = prev_sma * a
+    
+    # Signal is active if price is OUTSIDE the band
     data['signal_active'] = dist_from_sma > threshold
 
     # Leverage Determination
     data['leverage'] = np.where(prev_iii > d, e, f)
 
-    # --- Trade Simulation ---
+    # --- Trade Simulation (Intraday) ---
+    # Intraday SL Logic:
+    # We assume we enter at Open.
+    # Long SL Price = Open * (1 - c)
+    # Short SL Price = Open * (1 + c)
     
-    # Stop Loss Prices (Intraday)
-    # Long SL: Open * (1 - c)
-    # Short SL: Open * (1 + c)
-    data['sl_long_price'] = data['open'] * (1 - c)
-    data['sl_short_price'] = data['open'] * (1 + c)
+    sl_long_price = data['open'] * (1 - c)
+    sl_short_price = data['open'] * (1 + c)
     
-    # Check for SL Hits using Low/High of current day
-    # Long Hit: Low < SL
-    # Short Hit: High > SL
-    long_sl_hit = (data['direction'] == 1) & (data['low'] < data['sl_long_price'])
-    short_sl_hit = (data['direction'] == -1) & (data['high'] > data['sl_short_price'])
+    # Did we hit SL?
+    # Long: Low < SL
+    # Short: High > SL
+    long_sl_hit = (data['direction'] == 1) & (data['low'] < sl_long_price)
+    short_sl_hit = (data['direction'] == -1) & (data['high'] > sl_short_price)
     
-    # Calculate Raw Return (Unleveraged)
-    # Standard: Direction * (Close - Open) / Open
-    # SL Hit: -c (The loss is exactly c%)
+    # Daily Raw Return (Open to Close)
+    # Long: (Close - Open) / Open
+    # Short: (Open - Close) / Open  => -1 * (Close - Open) / Open
+    raw_ret = data['direction'] * (data['close'] - data['open']) / data['open']
     
-    raw_ret_daily = data['direction'] * (data['close'] - data['open']) / data['open']
+    # Logic Selector
+    # If !Signal -> 0
+    # If Signal & SL Hit -> -c (Loss limit)
+    # If Signal & No SL -> raw_ret
     
-    # Vectorized Selection of Return
-    # Priority: 
-    # 1. No Signal -> 0
-    # 2. SL Hit -> -c
-    # 3. Normal Close -> raw_ret_daily
+    # Construct condition masks
+    no_signal = ~data['signal_active']
+    sl_hit = long_sl_hit | short_sl_hit # Combined mask for simplicity since direction is mutual exclusive
     
+    # Priority: No Signal (0) > SL Hit (-c) > Normal (raw)
+    # Note: np.select checks strictly in order
     conditions = [
-        ~data['signal_active'],
-        long_sl_hit,
-        short_sl_hit
+        no_signal,
+        sl_hit
     ]
     
     choices = [
         0.0,
-        -c,
         -c
     ]
     
-    data['strat_ret_no_lev'] = np.select(conditions, choices, default=raw_ret_daily)
+    data['strat_ret_no_lev'] = np.select(conditions, choices, default=raw_ret)
     
     # Apply Leverage
     data['strat_ret'] = data['strat_ret_no_lev'] * data['leverage']
     
-    # Fill NaN at start
+    # Cleanup NaNs (start of data)
     data['strat_ret'].fillna(0, inplace=True)
     
     return data
@@ -160,39 +179,35 @@ def evaluate(individual, data):
     
     res = calculate_metrics_vectorized(data, individual)
     
-    # --- Fitness Logic ---
-    
-    # 1. Activity Check
-    # Count non-zero return days (trades)
+    # 1. Trade Count Check
     n_trades = (res['strat_ret'] != 0).sum()
     
-    # HEAVY PENALTY for not trading. 
-    # If the strategy doesn't trade, it produces a flat line.
-    if n_trades < 20: 
-        return -10.0, # Immediate failure
+    # If fewer than 10 trades in 2+ years, strategy is invalid/boring
+    if n_trades < 10: 
+        return -99.0, # Strong penalty
         
-    # 2. Monthly Stability
+    # 2. Stability Metric (Sharpe-like)
     res['ym'] = res.index.to_period('M')
-    monthly = res.groupby('ym')['strat_ret'].agg(['mean', 'std', 'count'])
+    monthly = res.groupby('ym')['strat_ret'].agg(['mean', 'std'])
     
-    # Annualized Sharpe per month approx
-    # (Mean daily ret * 30) / (Std daily * sqrt(30)) -> simplified to mean/std
-    # We use a simple Sharpe-like ratio: Mean / Std
+    # Handle months with 0 std (flat or single trade)
+    monthly_std = monthly['std'].replace(0, 1e-9)
     
-    sharpes = monthly['mean'] / (monthly['std'] + 1e-9)
+    # Monthly Sharpe approximation
+    sharpes = monthly['mean'] / monthly_std
     
     avg_sharpe = sharpes.mean()
     std_sharpe = sharpes.std()
     
-    # 3. Stability Metric
-    # We want High Avg Sharpe, Low Std of Sharpe
-    metric = avg_sharpe / (std_sharpe + 1e-9)
-    
-    # Penalty for negative expectancy
+    # If avg sharpe is negative, heavy penalty
     if avg_sharpe < 0:
-        return -5.0 + avg_sharpe,
-
-    return metric,
+        return -10.0 + avg_sharpe,
+        
+    # Stability = Mean / Std
+    # We want high mean sharpe, low variance in sharpe
+    stability = avg_sharpe / (std_sharpe + 1e-9)
+    
+    return stability,
 
 # --- 3. GENETIC ALGORITHM SETUP ---
 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -201,13 +216,13 @@ creator.create("Individual", list, fitness=creator.FitnessMax)
 def run_ga(train_df):
     toolbox = base.Toolbox()
     
-    # Gene Definitions
-    toolbox.register("attr_a", random.uniform, 0.005, 0.15)  # Band %
-    toolbox.register("attr_b", random.randint, 10, 100)      # SMA Period
-    toolbox.register("attr_c", random.uniform, 0.01, 0.10)   # SL %
+    # Tweaked ranges to encourage more trading
+    toolbox.register("attr_a", random.uniform, 0.001, 0.08)  # Band % (Lower min to trigger more trades)
+    toolbox.register("attr_b", random.randint, 5, 50)        # SMA Period (Shorter period = more responsive)
+    toolbox.register("attr_c", random.uniform, 0.01, 0.05)   # SL % (Tight SL)
     toolbox.register("attr_d", random.uniform, 0.2, 0.8)     # III Thresh
     toolbox.register("attr_e", random.uniform, 1.0, 3.0)     # High Lev
-    toolbox.register("attr_f", random.uniform, 0.1, 0.9)     # Low Lev
+    toolbox.register("attr_f", random.uniform, 0.5, 1.0)     # Low Lev
 
     toolbox.register("individual", tools.initCycle, creator.Individual,
                      (toolbox.attr_a, toolbox.attr_b, toolbox.attr_c, 
@@ -216,7 +231,7 @@ def run_ga(train_df):
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register("evaluate", evaluate, data=train_df)
     toolbox.register("mate", tools.cxTwoPoint)
-    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=[0.01, 5, 0.01, 0.05, 0.2, 0.05], indpb=0.2)
+    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=[0.005, 5, 0.01, 0.05, 0.2, 0.05], indpb=0.2)
     toolbox.register("select", tools.selTournament, tournsize=3)
 
     pop = toolbox.population(n=GA_SETTINGS['POPULATION_SIZE'])
@@ -236,52 +251,53 @@ def run_ga(train_df):
 
 # --- 4. WEB SERVER ---
 app = Flask(__name__)
-# Global store for results
 store = {}
 
 @app.route('/')
 def report():
     if not store:
-        return "Calculation pending..."
+        return "Calculation pending... check terminal."
         
     # Prepare Data
     train_df = store['train']
     test_df = store['test']
     params = store['params']
     
-    # --- PLOTLY CHART ---
-    # Concatenate for continuous timeline view, but color code
+    # Prepare Plotly Data (Explicit List Conversion)
+    train_x = train_df.index.astype(str).tolist()
+    train_y = train_df['cum_ret'].tolist()
+    
+    # Bridge the gap for visual continuity
+    last_train_val = train_y[-1]
+    
+    test_x = test_df.index.astype(str).tolist()
+    # Prepend last train point to test to connect lines
+    test_x_plot = [train_x[-1]] + test_x
+    test_y_plot = [last_train_val] + test_df['cum_ret'].tolist()
     
     fig = go.Figure()
     
     # Train Trace
     fig.add_trace(go.Scatter(
-        x=train_df.index.astype(str),
-        y=train_df['cum_ret'],
+        x=train_x,
+        y=train_y,
         mode='lines',
-        name='Training Phase',
+        name='Training',
         line=dict(color='#1f77b4', width=2)
     ))
     
     # Test Trace
-    # To make it look connected, we add the last point of train to test
-    test_x = [train_df.index[-1]] + list(test_df.index)
-    test_y = [train_df['cum_ret'].iloc[-1]] + list(test_df['cum_ret'])
-    
-    # Convert timestamps to str for JSON serialization safety
-    test_x_str = [str(x) for x in test_x]
-    
     fig.add_trace(go.Scatter(
-        x=test_x_str,
-        y=test_y,
+        x=test_x_plot,
+        y=test_y_plot,
         mode='lines',
-        name='Validation Phase',
+        name='Validation',
         line=dict(color='#2ca02c', width=2)
     ))
 
     fig.update_layout(
-        title=f'Strategy Performance: {SYMBOL}',
-        yaxis_title='Equity Multiplier (Start = 1.0)',
+        title=f'Optimization Result: {SYMBOL} (Starting Capital: 1.0)',
+        yaxis_title='Equity Multiplier',
         template='plotly_white',
         height=600,
         hovermode="x unified"
@@ -289,32 +305,28 @@ def report():
     
     graphJSON = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
     
-    # --- METRICS TABLE ---
+    # Metrics Table
     full_df = pd.concat([train_df, test_df])
     full_df['ym'] = full_df.index.to_period('M')
-    
-    # Group by Month
     m_grouped = full_df.groupby('ym')['strat_ret'].sum()
     
     table_html = ""
-    # Reverse order for newest first
     for period in sorted(m_grouped.index, reverse=True):
         val = m_grouped[period]
-        color = "#ffcccc" if val < 0 else "#ccffcc"
-        text_color = "#b30000" if val < 0 else "#006600"
+        bg = "#e6ffe6" if val > 0 else "#ffe6e6"
+        color = "#006600" if val > 0 else "#cc0000"
         table_html += f"""
-        <tr style="background-color: {color}; color: {text_color};">
+        <tr style="background-color: {bg}; color: {color};">
             <td>{period}</td>
             <td style="text-align: right; font-weight: bold;">{val*100:.2f}%</td>
         </tr>
         """
 
-    # Parameters List
     param_html = f"""
     <ul class="params-list">
-        <li><strong>Band (a):</strong> {params[0]*100:.2f}%</li>
-        <li><strong>SMA Period (b):</strong> {int(params[1])}</li>
-        <li><strong>Stop Loss (c):</strong> {params[2]*100:.2f}%</li>
+        <li><strong>Band (a):</strong> {params[0]*100:.3f}%</li>
+        <li><strong>SMA (b):</strong> {int(params[1])}</li>
+        <li><strong>SL (c):</strong> {params[2]*100:.2f}%</li>
         <li><strong>III Thresh (d):</strong> {params[3]:.2f}</li>
         <li><strong>High Lev (e):</strong> {params[4]:.2f}x</li>
         <li><strong>Low Lev (f):</strong> {params[5]:.2f}x</li>
@@ -325,31 +337,33 @@ def report():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Crypto GA Strategy</title>
+        <title>Genetic Strategy Results</title>
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: #f0f2f5; }}
-            .container {{ max_width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 3fr 1fr; gap: 20px; }}
-            .card {{ background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
-            h1 {{ grid-column: 1 / -1; text-align: center; color: #333; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #f7f9fc; }}
+            .container {{ max_width: 1400px; margin: 0 auto; display: grid; grid-template-columns: 3fr 1fr; gap: 20px; }}
+            .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+            h1 {{ grid-column: 1 / -1; text-align: center; color: #2c3e50; margin-bottom: 30px; }}
             .params-list {{ list-style: none; padding: 0; }}
-            .params-list li {{ padding: 8px 0; border-bottom: 1px solid #eee; }}
+            .params-list li {{ padding: 10px 0; border-bottom: 1px solid #edf2f7; font-size: 0.95em; }}
             table {{ width: 100%; border-collapse: collapse; }}
-            td, th {{ padding: 10px; border: 1px solid #ddd; }}
+            td, th {{ padding: 12px; border-bottom: 1px solid #edf2f7; }}
             .scroll-table {{ height: 600px; overflow-y: auto; }}
         </style>
     </head>
     <body>
-        <h1>Genetic Algorithm Optimization Results</h1>
+        <h1>Genetic Algorithm Results: {SYMBOL}</h1>
         <div class="container">
             <div class="card">
                 <div id="chart"></div>
-                <div style="margin-top: 20px;">
-                    <h3>Logic Summary</h3>
-                    <p>When price leaves <strong>{params[0]*100:.1f}%</strong> band of <strong>SMA {int(params[1])}</strong>, 
-                    trade in direction of yesterday's momentum. 
-                    Leverage is <strong>{params[4]:.2f}x</strong> if III > {params[3]:.2f}, else <strong>{params[5]:.2f}x</strong>.
-                    Intraday Stop Loss at <strong>{params[2]*100:.1f}%</strong>.</p>
+                <div style="margin-top:20px; padding:15px; background:#f8f9fa; border-radius:8px;">
+                    <h3>Strategy Logic</h3>
+                    <p style="color:#555; line-height:1.6;">
+                        1. <strong>Entry:</strong> If price deviates more than <strong>{params[0]*100:.2f}%</strong> from the <strong>{int(params[1])}-day SMA</strong>.<br>
+                        2. <strong>Direction:</strong> Follow yesterday's move (Momentum).<br>
+                        3. <strong>Risk:</strong> Hard Intraday Stop Loss at <strong>{params[2]*100:.2f}%</strong> from Open.<br>
+                        4. <strong>Sizing:</strong> Leverage <strong>{params[4]:.1f}x</strong> if volatility quality (III) > {params[3]:.2f}, else <strong>{params[5]:.1f}x</strong>.
+                    </p>
                 </div>
             </div>
             
@@ -357,7 +371,7 @@ def report():
                 <h3>Parameters</h3>
                 {param_html}
                 
-                <h3>Monthly Returns</h3>
+                <h3 style="margin-top:30px">Monthly PnL</h3>
                 <div class="scroll-table">
                     <table>
                         {table_html}
@@ -378,7 +392,7 @@ if __name__ == "__main__":
     # A. Fetch
     df = fetch_binance_data(SYMBOL, TIMEFRAME, START_DATE_STR)
     if df.empty:
-        print("No data fetched.")
+        print("Error: No data fetched.")
         exit()
         
     # B. Split
@@ -388,21 +402,34 @@ if __name__ == "__main__":
     
     # C. Optimize
     best_ind = run_ga(train_data)
+    logging.info(f"Optimization Complete. Best Params: {best_ind}")
     
-    # D. Final Calculation
+    # D. Final Calculation & Stats
     train_res = calculate_metrics_vectorized(train_data, best_ind)
+    # Start equity at 1.0
     train_res['cum_ret'] = (1 + train_res['strat_ret']).cumprod()
     
+    train_trades = (train_res['strat_ret'] != 0).sum()
+    final_train_equity = train_res['cum_ret'].iloc[-1]
+    print(f"\n--- TRAIN RESULTS ---")
+    print(f"Trades: {train_trades}")
+    print(f"Final Equity: {final_train_equity:.2f}x")
+    
     test_res = calculate_metrics_vectorized(test_data, best_ind)
+    test_trades = (test_res['strat_ret'] != 0).sum()
     
-    # Link test cumulative return to end of train
-    last_val = train_res['cum_ret'].iloc[-1]
-    test_res['cum_ret'] = (1 + test_res['strat_ret']).cumprod() * last_val
+    # Link test equity to end of train equity
+    test_res['cum_ret'] = (1 + test_res['strat_ret']).cumprod() * final_train_equity
+    final_test_equity = test_res['cum_ret'].iloc[-1]
     
+    print(f"\n--- TEST RESULTS ---")
+    print(f"Trades: {test_trades}")
+    print(f"Final Equity: {final_test_equity:.2f}x")
+
     # E. Store & Serve
     store['train'] = train_res
     store['test'] = test_res
     store['params'] = best_ind
     
-    print(f"\n Server running at http://localhost:{PORT}")
+    print(f"\nSTARTING SERVER: http://localhost:{PORT}")
     app.run(host='0.0.0.0', port=PORT)
