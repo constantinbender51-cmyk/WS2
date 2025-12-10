@@ -237,9 +237,9 @@ def run_ga(train_df):
     toolbox.register("attr_a", random.uniform, 0.01, 0.15)   # Band (2-15%)
     toolbox.register("attr_b", random.randint, 10, 400)      # SMA
     toolbox.register("attr_c", random.uniform, 0.02, 0.10)   # SL (2-10%) - Minimum 2% to avoid noise
-    toolbox.register("attr_d", random.uniform, 0.0, 0.8)     # III
-    toolbox.register("attr_e", random.uniform, 0, 3.0)     # High Lev (Max 3x)
-    toolbox.register("attr_f", random.uniform, 0, 3.0)     # Low Lev
+    toolbox.register("attr_d", random.uniform, 0.01, 0.8)     # III
+    toolbox.register("attr_e", random.uniform, 0.1, 3.0)     # High Lev (Max 3x)
+    toolbox.register("attr_f", random.uniform, 0.1, 3.0)     # Low Lev
 
     toolbox.register("individual", tools.initCycle, creator.Individual,
                      (toolbox.attr_a, toolbox.attr_b, toolbox.attr_c, 
