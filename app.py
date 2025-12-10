@@ -19,12 +19,12 @@ PORT = 8080
 
 # --- REALITY CONSTRAINTS ---
 # Taker Fee (0.05%) + Slippage (0.10%) = 0.15% per side
-COST_PER_SIDE = 0.0015 
+COST_PER_SIDE = 0.0002
 # Daily cost of holding leverage (approx 10-20% APR annualized)
 FUNDING_RATE_DAILY = 0.0003 
 
 GA_SETTINGS = {
-    'POPULATION_SIZE': 80,
+    'POPULATION_SIZE': 100,
     'GENERATIONS': 10,
     'CROSSOVER_PROB': 0.7,
     'MUTATION_PROB': 0.3
