@@ -267,22 +267,32 @@ def dashboard():
     test_metrics = results_store['test_metrics']
     params = results_store['params']
     
-    # 1. Equity Curve Plot
+    # 1. Equity Curve Plot - Ensure data is valid and not constant
     fig_equity = go.Figure()
     
-    # Train Line
+    # Train Line - Check if cum_ret has variation
+    train_cum_ret = train_metrics['cum_ret']
+    if train_cum_ret.nunique() <= 1:
+        logging.warning("Train cumulative returns are constant, plotting raw daily returns instead.")
+        train_cum_ret = train_metrics['final_daily_ret']
+    
+    # Test Line - Check if cum_ret has variation
+    test_cum_ret = test_metrics['cum_ret']
+    if test_cum_ret.nunique() <= 1:
+        logging.warning("Test cumulative returns are constant, plotting raw daily returns instead.")
+        test_cum_ret = test_metrics['final_daily_ret']
+    
     fig_equity.add_trace(go.Scatter(
         x=train_metrics.index, 
-        y=train_metrics['cum_ret'],
+        y=train_cum_ret,
         mode='lines',
         name='Training Data (50%)',
         line=dict(color='blue')
     ))
     
-    # Test Line
     fig_equity.add_trace(go.Scatter(
         x=test_metrics.index, 
-        y=test_metrics['cum_ret'],
+        y=test_cum_ret,
         mode='lines',
         name='Test Data (50%)',
         line=dict(color='green')
@@ -422,10 +432,15 @@ if __name__ == "__main__":
     
     # Recalculate full series for storage
     train_res = calculate_metrics_vectorized(train_data, a, b, c, d, e, f)
+    # Ensure final_daily_ret is not all zeros or constant
+    if train_res['final_daily_ret'].nunique() <= 1:
+        logging.warning("Train daily returns are constant or nearly constant, check strategy logic.")
     train_res['cum_ret'] = (1 + train_res['final_daily_ret']).cumprod()
     
     # For test data, we need to be careful with cumprod chaining or just start from 1
     test_res = calculate_metrics_vectorized(test_data, a, b, c, d, e, f)
+    if test_res['final_daily_ret'].nunique() <= 1:
+        logging.warning("Test daily returns are constant or nearly constant, check strategy logic.")
     # Start test cum_ret from where train left off for visual continuity
     last_train_val = train_res['cum_ret'].iloc[-1]
     test_res['cum_ret'] = (1 + test_res['final_daily_ret']).cumprod() * last_train_val
