@@ -1,6 +1,7 @@
-ccxt
+ccxt>=4.0.0
 pandas>=2.0.0
-numpy
-deap
-flask
-plotly
+numpy>=1.24.0
+deap>=1.4.1
+flask>=3.0.0
+plotly>=5.18.0
+gunicorn>=21.0.0
