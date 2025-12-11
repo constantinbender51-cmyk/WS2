@@ -18,7 +18,7 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 
-# GA Settings (High count for broad search)
+# GA Settings
 POPULATION_SIZE = 300   
 GENERATIONS = 50        
 MUTATION_RATE = 0.2    
@@ -27,7 +27,12 @@ ELITISM_COUNT = 10
 
 # Ensemble Settings
 ANCHOR_STEP = 400 
-TOP_N_STRATEGIES = 50   # Broad field to find matches across iterations
+TOP_N_STRATEGIES = 50   
+
+# Diversity Settings
+# A score < 0.3 means strategies are extremely similar (e.g. SMA 100 vs SMA 105)
+# We reject strategies that are this close to existing picks to force diversity.
+DIVERSITY_THRESHOLD = 0.3 
 
 # Parameter Constraints
 GENE_SPACE = {
@@ -156,6 +161,71 @@ def crossover(p1, p2):
         child[k] = p1[k] if random.random() > 0.5 else p2[k]
     return child
 
+def calculate_strategy_similarity(strat1, strat2):
+    """
+    Calculates similarity score based on sum of absolute percentage differences.
+    Lower score = More similar.
+    """
+    score = 0
+    params = ['sma_fast', 'sma_slow', 'sl_pct', 'tp_pct', 'iii_window', 't_low', 't_high', 'lev_1', 'lev_2', 'lev_3']
+    
+    for p in params:
+        val1 = strat1[p]
+        val2 = strat2[p]
+        # Avoid division by zero
+        denom = val1 if val1 != 0 else 1e-9
+        diff = abs((val2 - val1) / denom)
+        score += diff
+        
+    return score
+
+def select_diverse_strategies(scored_population, n, threshold):
+    """
+    Selects top N strategies, skipping those that are too similar 
+    to ones already selected.
+    scored_population: list of (individual, fitness), sorted desc.
+    """
+    selected = []
+    
+    # 1. Always take the absolute best
+    if not scored_population:
+        return []
+        
+    selected.append(scored_population[0])
+    
+    # 2. Try to fill with distinct strategies
+    # Scan through the rest of the population
+    for i in range(1, len(scored_population)):
+        candidate = scored_population[i]
+        is_distinct = True
+        
+        # Check against ALL currently selected strategies
+        for picked in selected:
+            sim_score = calculate_strategy_similarity(candidate[0], picked[0])
+            if sim_score < threshold: # If too similar to ANY picked strategy
+                is_distinct = False
+                break
+        
+        if is_distinct:
+            selected.append(candidate)
+        
+        if len(selected) >= n:
+            break
+            
+    # 3. Fallback: If we filtered too aggressively and don't have N, fill with next best
+    if len(selected) < n:
+        # Create set of string representations for fast lookup of what we already have
+        selected_strs = {str(s[0]) for s in selected}
+        
+        for item in scored_population:
+            if str(item[0]) not in selected_strs:
+                selected.append(item)
+                selected_strs.add(str(item[0]))
+                if len(selected) >= n:
+                    break
+                    
+    return selected
+
 def run_ga_for_window(evaluator, window_df):
     population = [create_individual() for _ in range(POPULATION_SIZE)]
     
@@ -184,7 +254,7 @@ def run_ga_for_window(evaluator, window_df):
             next_gen.append(child)
         population = next_gen
 
-    # Final Evaluation
+    # Final Evaluation & Diversity Selection
     final_scored = []
     for ind in population:
         if ind['sma_slow'] <= ind['sma_fast'] or ind['t_high'] <= ind['t_low']:
@@ -194,7 +264,11 @@ def run_ga_for_window(evaluator, window_df):
         final_scored.append((ind, fitness))
     
     final_scored.sort(key=lambda x: x[1], reverse=True)
-    return final_scored[:TOP_N_STRATEGIES]
+    
+    # Use the Diversity Filter
+    diverse_top_n = select_diverse_strategies(final_scored, TOP_N_STRATEGIES, DIVERSITY_THRESHOLD)
+    
+    return diverse_top_n
 
 # --- MAIN EXECUTION ---
 
@@ -216,24 +290,6 @@ def run_anchored_analysis(df):
         
     return results
 
-def calculate_strategy_similarity(strat1, strat2):
-    """
-    Calculates similarity score based on sum of absolute percentage differences.
-    Lower score = More similar.
-    """
-    score = 0
-    params = ['sma_fast', 'sma_slow', 'sl_pct', 'tp_pct', 'iii_window', 't_low', 't_high', 'lev_1', 'lev_2', 'lev_3']
-    
-    for p in params:
-        val1 = strat1[p]
-        val2 = strat2[p]
-        # Avoid division by zero
-        denom = val1 if val1 != 0 else 1e-9
-        diff = abs((val2 - val1) / denom)
-        score += diff
-        
-    return score
-
 def process_results_for_display(results):
     """
     Augments results with GLOBAL CONSISTENCY scores.
@@ -241,32 +297,26 @@ def process_results_for_display(results):
     """
     sorted_days = sorted(results.keys())
     
-    # List to hold all scores for ranking: (day_index, strategy_index, score)
     all_scores = []
-    
-    # Structure to hold augmented strategies
     augmented_results = {} 
     for day in sorted_days:
         augmented_results[day] = []
     
-    # Iterate over every window (Current Window)
     for current_day in sorted_days:
         current_strategies = results[current_day]
         
-        # Iterate over every strategy in the current window
         for idx, (strat, fitness) in enumerate(current_strategies):
             
             total_similarity_diff = 0.0
             comparison_count = 0
             
-            # Compare against EVERY OTHER window
             for other_day in sorted_days:
                 if other_day == current_day:
                     continue
                 
                 other_strategies = results[other_day]
                 
-                # Find the single closest strategy in the OTHER window
+                # Find best match in OTHER window
                 best_match_diff = float('inf')
                 for other_strat, _ in other_strategies:
                     diff = calculate_strategy_similarity(strat, other_strat)
@@ -276,13 +326,11 @@ def process_results_for_display(results):
                 total_similarity_diff += best_match_diff
                 comparison_count += 1
             
-            # Average consistency score (lower is better)
             if comparison_count > 0:
                 avg_consistency = total_similarity_diff / comparison_count
             else:
                 avg_consistency = 999.0
             
-            # Store augmented data
             augmented_results[current_day].append({
                 'strat': strat,
                 'fitness': fitness,
@@ -292,12 +340,10 @@ def process_results_for_display(results):
             
             all_scores.append((current_day, idx, avg_consistency))
         
-    # Find Global Top 10 Lowest Scores (Most Consistent Across All Timeframes)
     if all_scores:
-        all_scores.sort(key=lambda x: x[2]) # Sort by score ascending (lower is better)
+        all_scores.sort(key=lambda x: x[2]) 
         top_10_stable = all_scores[:10]
         
-        # Mark them in the augmented results
         for day, idx, score in top_10_stable:
             augmented_results[day][idx]['is_stable'] = True
         
@@ -306,7 +352,6 @@ def process_results_for_display(results):
 def generate_ensemble_plot(results):
     fig, axes = plt.subplots(4, 1, figsize=(14, 20), sharex=True)
     
-    # Extract data for plotting
     x_vals = []
     sma_fast_vals = []
     sma_slow_vals = []
@@ -324,29 +369,25 @@ def generate_ensemble_plot(results):
             lev_avg_vals.append(avg_lev)
             sharpe_vals.append(fitness)
 
-    # 1. SMA Stability
-    axes[0].scatter(x_vals, sma_slow_vals, c='blue', alpha=0.3, label='SMA Slow', s=20)
-    axes[0].scatter(x_vals, sma_fast_vals, c='cyan', alpha=0.3, label='SMA Fast', s=20)
-    axes[0].set_title(f'Parameter Stability: Trend Definition (Top {TOP_N_STRATEGIES} per Window)', fontsize=14)
+    axes[0].scatter(x_vals, sma_slow_vals, c='blue', alpha=0.5, label='SMA Slow', s=25)
+    axes[0].scatter(x_vals, sma_fast_vals, c='cyan', alpha=0.5, label='SMA Fast', s=25)
+    axes[0].set_title(f'Parameter Stability: Trend Definition (Top {TOP_N_STRATEGIES} Diverse)', fontsize=14)
     axes[0].set_ylabel('Period Length')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # 2. III Window Stability
-    axes[1].scatter(x_vals, iii_vals, c='magenta', alpha=0.3, s=20)
+    axes[1].scatter(x_vals, iii_vals, c='magenta', alpha=0.5, s=25)
     axes[1].set_title('Parameter Stability: Efficiency Window (III)', fontsize=14)
     axes[1].set_ylabel('Lookback Period')
     axes[1].grid(True, alpha=0.3)
     
-    # 3. Leverage Aggressiveness
-    axes[2].scatter(x_vals, lev_avg_vals, c='green', alpha=0.3, s=20)
+    axes[2].scatter(x_vals, lev_avg_vals, c='green', alpha=0.5, s=25)
     axes[2].set_title('Strategy Aggressiveness (Avg Leverage Setting)', fontsize=14)
     axes[2].set_ylabel('Avg Leverage (0-5x)')
     axes[2].grid(True, alpha=0.3)
 
-    # 4. Performance Degradation/Improvement
-    axes[3].scatter(x_vals, sharpe_vals, c='gold', edgecolors='black', alpha=0.6, s=30)
-    axes[3].set_title('In-Sample Performance (Sharpe) of Top Strategies', fontsize=14)
+    axes[3].scatter(x_vals, sharpe_vals, c='gold', edgecolors='black', alpha=0.7, s=40)
+    axes[3].set_title('In-Sample Performance (Sharpe) of Diverse Strategies', fontsize=14)
     axes[3].set_ylabel('Sharpe Ratio')
     axes[3].set_xlabel('Training Window Size (Days)')
     axes[3].grid(True, alpha=0.3)
@@ -366,7 +407,6 @@ def index():
     plot_data = generate_ensemble_plot(results)
     processed_results = process_results_for_display(results)
     
-    # Generate HTML Report
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -382,7 +422,6 @@ def index():
             th {{ background-color: #f8f9fa; font-weight: 600; color: #555; }}
             tr:nth-child(even) {{ background-color: #fafafa; }}
             
-            /* Green Highlight for Stable Strategies */
             tr.stable-green td {{ background-color: #d4edda !important; color: #155724; border-color: #c3e6cb; }}
             tr.stable-green:hover td {{ background-color: #c3e6cb !important; }}
 
@@ -395,6 +434,7 @@ def index():
             <h1>Anchored Ensemble GA Analysis</h1>
             <p>Analysis of top {TOP_N_STRATEGIES} strategies evolved over growing time windows.</p>
             <p><strong>Config:</strong> Pop={POPULATION_SIZE}, Gens={GENERATIONS}, Step={ANCHOR_STEP}d</p>
+            <p><strong>Diversity Check:</strong> Rejects strategies with similarity score < {DIVERSITY_THRESHOLD}</p>
             
             <h2>Parameter Stability Visualization</h2>
             <img src="data:image/png;base64,{plot_data}" alt="Ensemble Plot">
@@ -402,13 +442,11 @@ def index():
             <h2>Detailed Strategy Parameters</h2>
             <p class="similarity-note">
                 <strong>Consistency Score:</strong> Measures how often a strategy's parameters reappear in OTHER training windows. 
-                Calculated by comparing a strategy against the best match in every other window (400d, 800d, 1200d, etc.) and averaging the difference.
-                <br>Lower score = More Universal. 
+                Lower score = More Universal. 
                 Rows highlighted in <strong>GREEN</strong> represent the top 10 most universally consistent strategies.
             </p>
     """
     
-    # Iterate through results to build tables
     for days in sorted(processed_results.keys()):
         strategies = processed_results[days]
         html_content += f"""
