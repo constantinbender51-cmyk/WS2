@@ -18,7 +18,7 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 
-# GA Settings (Doubled)
+# GA Settings
 POPULATION_SIZE = 100  
 GENERATIONS = 30       
 MUTATION_RATE = 0.2    
@@ -27,9 +27,9 @@ ELITISM_COUNT = 5
 
 # Ensemble Settings
 ANCHOR_STEP = 400 # Days to add in each training iteration
-TOP_N_STRATEGIES = 10 # Strategies to keep per window
+TOP_N_STRATEGIES = 15 # Increased to 15 to ensure we list >100 strategies total
 
-# Parameter Constraints (Expanded Leverage)
+# Parameter Constraints
 GENE_SPACE = {
     'sma_fast':   (10, 200, int),
     'sma_slow':   (50, 400, int),  
@@ -38,7 +38,7 @@ GENE_SPACE = {
     'iii_window': (10, 90, int),
     't_low':      (0.05, 0.30, float),
     't_high':     (0.20, 0.60, float), 
-    'lev_1':      (0.0, 5.0, float),   # Expanded 0-5
+    'lev_1':      (0.0, 5.0, float),   
     'lev_2':      (0.0, 5.0, float),   
     'lev_3':      (0.0, 5.0, float)    
 }
@@ -112,7 +112,6 @@ class StrategyEvaluator:
         market_ret = np.diff(np.log(closes), prepend=0)
         
         # Position Vector (Shifted by 1 to avoid lookahead)
-        # Position today is determined by signal yesterday
         pos_vector = np.zeros(len(df))
         pos_vector[long_signal] = 1
         pos_vector[short_signal] = -1
@@ -126,12 +125,8 @@ class StrategyEvaluator:
         # Final Returns
         strategy_ret = pos_vector * lev_vector * market_ret
         
-        # Simple Equity (for fitness check, we use Log Returns sum)
-        # We ignore SL/TP in the GA search for pure speed, 
-        # relying on the volatility (Sharpe) to naturally penalize bad entries.
-        total_log_ret = np.sum(strategy_ret)
+        # Fitness: Sharpe
         std_dev = np.std(strategy_ret)
-        
         if std_dev == 0: return -10.0
         sharpe = np.sqrt(365) * (np.mean(strategy_ret) / std_dev)
         
@@ -221,6 +216,78 @@ def run_anchored_analysis(df):
         
     return results
 
+def calculate_strategy_similarity(strat1, strat2):
+    """
+    Calculates similarity score based on sum of absolute percentage differences.
+    Lower score = More similar.
+    """
+    score = 0
+    params = ['sma_fast', 'sma_slow', 'sl_pct', 'tp_pct', 'iii_window', 't_low', 't_high', 'lev_1', 'lev_2', 'lev_3']
+    
+    for p in params:
+        val1 = strat1[p]
+        val2 = strat2[p]
+        # Avoid division by zero
+        denom = val1 if val1 != 0 else 1e-9
+        diff = abs((val2 - val1) / denom)
+        score += diff
+        
+    return score
+
+def process_results_for_display(results):
+    """
+    Augments results with similarity scores.
+    Identifies the global top 10 most stable strategies (lowest similarity scores).
+    """
+    sorted_days = sorted(results.keys())
+    
+    # List to hold all scores for ranking: (day_index, strategy_index, score)
+    all_scores = []
+    
+    # Structure to hold augmented strategies
+    augmented_results = {} # {day: [{strat, fitness, similarity_score, is_stable}]}
+    
+    for i, day in enumerate(sorted_days):
+        current_strategies = results[day]
+        augmented_list = []
+        
+        for j, (strat, fitness) in enumerate(current_strategies):
+            similarity_score = 999.0 # Default for first window
+            
+            # Compare with previous window (if exists)
+            if i > 0:
+                prev_day = sorted_days[i-1]
+                prev_strategies = results[prev_day]
+                
+                # Find best match (lowest difference) in previous window
+                best_match_score = 999.0
+                for prev_strat, _ in prev_strategies:
+                    score = calculate_strategy_similarity(prev_strat, strat)
+                    if score < best_match_score:
+                        best_match_score = score
+                
+                similarity_score = best_match_score
+                all_scores.append((day, j, similarity_score))
+                
+            augmented_list.append({
+                'strat': strat,
+                'fitness': fitness,
+                'similarity': similarity_score,
+                'is_stable': False
+            })
+            
+        augmented_results[day] = augmented_list
+        
+    # Find Top 10 Lowest Scores (Most Stable)
+    all_scores.sort(key=lambda x: x[2]) # Sort by score ascending
+    top_10_stable = all_scores[:10]
+    
+    # Mark them in the augmented results
+    for day, idx, score in top_10_stable:
+        augmented_results[day][idx]['is_stable'] = True
+        
+    return augmented_results
+
 def generate_ensemble_plot(results):
     fig, axes = plt.subplots(4, 1, figsize=(14, 20), sharex=True)
     
@@ -238,7 +305,6 @@ def generate_ensemble_plot(results):
             sma_fast_vals.append(strat['sma_fast'])
             sma_slow_vals.append(strat['sma_slow'])
             iii_vals.append(strat['iii_window'])
-            # Average leverage aggressiveness
             avg_lev = (strat['lev_1'] + strat['lev_2'] + strat['lev_3']) / 3
             lev_avg_vals.append(avg_lev)
             sharpe_vals.append(fitness)
@@ -265,7 +331,7 @@ def generate_ensemble_plot(results):
 
     # 4. Performance Degradation/Improvement
     axes[3].scatter(x_vals, sharpe_vals, c='gold', edgecolors='black', alpha=0.8, s=40)
-    axes[3].set_title('In-Sample Performance (Sharpe) of Top 10 Strategies', fontsize=14)
+    axes[3].set_title('In-Sample Performance (Sharpe) of Top Strategies', fontsize=14)
     axes[3].set_ylabel('Sharpe Ratio')
     axes[3].set_xlabel('Training Window Size (Days)')
     axes[3].grid(True, alpha=0.3)
@@ -283,6 +349,7 @@ def index():
     df = fetch_data()
     results = run_anchored_analysis(df)
     plot_data = generate_ensemble_plot(results)
+    processed_results = process_results_for_display(results)
     
     # Generate HTML Report
     html_content = f"""
@@ -291,15 +358,21 @@ def index():
     <head>
         <title>Ensemble GA Strategy Report</title>
         <style>
-            body {{ font-family: sans-serif; margin: 20px; background-color: #f4f4f4; }}
-            .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-            h1, h2 {{ color: #333; }}
-            img {{ max-width: 100%; height: auto; border: 1px solid #ddd; margin-bottom: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 0.9em; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
-            th {{ background-color: #f2f2f2; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            .window-header {{ background-color: #333; color: white; padding: 10px; margin-top: 30px; border-radius: 5px; }}
+            body {{ font-family: 'Segoe UI', sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }}
+            .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); border-radius: 8px; }}
+            h1, h2 {{ color: #2c3e50; }}
+            img {{ max-width: 100%; height: auto; border: 1px solid #ddd; margin-bottom: 30px; border-radius: 4px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 0.85em; }}
+            th, td {{ border: 1px solid #e0e0e0; padding: 10px; text-align: center; }}
+            th {{ background-color: #f8f9fa; font-weight: 600; color: #555; }}
+            tr:nth-child(even) {{ background-color: #fafafa; }}
+            
+            /* Green Highlight for Stable Strategies */
+            tr.stable-green td {{ background-color: #d4edda !important; color: #155724; border-color: #c3e6cb; }}
+            tr.stable-green:hover td {{ background-color: #c3e6cb !important; }}
+
+            .window-header {{ background-color: #34495e; color: white; padding: 12px; margin-top: 40px; border-radius: 5px 5px 0 0; font-weight: bold; }}
+            .similarity-note {{ font-size: 0.8em; color: #777; margin-bottom: 10px; }}
         </style>
     </head>
     <body>
@@ -311,10 +384,12 @@ def index():
             <img src="data:image/png;base64,{plot_data}" alt="Ensemble Plot">
             
             <h2>Detailed Strategy Parameters</h2>
+            <p class="similarity-note">Rows highlighted in <strong>GREEN</strong> represent the top 10 most stable strategies (lowest mutation relative to the best match in the previous window).</p>
     """
     
     # Iterate through results to build tables
-    for days, strategies in results.items():
+    for days in sorted(processed_results.keys()):
+        strategies = processed_results[days]
         html_content += f"""
         <div class="window-header">Training Window: First {days} Days</div>
         <table>
@@ -322,6 +397,7 @@ def index():
                 <tr>
                     <th>Rank</th>
                     <th>Sharpe</th>
+                    <th>Stability Score</th>
                     <th>SMA Fast</th>
                     <th>SMA Slow</th>
                     <th>III Window</th>
@@ -330,16 +406,27 @@ def index():
                     <th>Lev 1 (Low)</th>
                     <th>Lev 2 (Mid)</th>
                     <th>Lev 3 (High)</th>
+                    <th>SL %</th>
+                    <th>TP %</th>
                 </tr>
             </thead>
             <tbody>
         """
         
-        for i, (strat, fitness) in enumerate(strategies):
+        for i, item in enumerate(strategies):
+            strat = item['strat']
+            fitness = item['fitness']
+            sim_score = item['similarity']
+            is_stable = item['is_stable']
+            
+            row_class = "stable-green" if is_stable else ""
+            sim_display = f"{sim_score:.2f}" if sim_score < 900 else "N/A"
+            
             html_content += f"""
-                <tr>
+                <tr class="{row_class}">
                     <td>{i+1}</td>
                     <td>{fitness:.4f}</td>
+                    <td>{sim_display}</td>
                     <td>{strat['sma_fast']}</td>
                     <td>{strat['sma_slow']}</td>
                     <td>{strat['iii_window']}</td>
@@ -348,6 +435,8 @@ def index():
                     <td>{strat['lev_1']:.1f}</td>
                     <td>{strat['lev_2']:.1f}</td>
                     <td>{strat['lev_3']:.1f}</td>
+                    <td>{strat['sl_pct']:.2f}</td>
+                    <td>{strat['tp_pct']:.2f}</td>
                 </tr>
             """
             
