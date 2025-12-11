@@ -10,6 +10,8 @@ import io
 import base64
 import copy
 from collections import Counter
+import threading
+import time
 
 app = Flask(__name__)
 
@@ -30,8 +32,6 @@ ANCHOR_STEP = 400
 TOP_N_STRATEGIES = 50   
 
 # Diversity Settings
-# A score < 0.3 means strategies are extremely similar (e.g. SMA 100 vs SMA 105)
-# We reject strategies that are this close to existing picks to force diversity.
 DIVERSITY_THRESHOLD = 0.3 
 
 # Parameter Constraints
@@ -47,6 +47,12 @@ GENE_SPACE = {
     'lev_2':      (0.0, 5.0, float),   
     'lev_3':      (0.0, 5.0, float)    
 }
+
+# --- GLOBAL STATE ---
+# Stores the results to be accessed by the web server
+GLOBAL_RESULTS = None
+# Stores the current status string for display
+ANALYSIS_STATUS = "Initializing..."
 
 def fetch_data():
     """Fetches OHLCV data from Binance"""
@@ -270,30 +276,58 @@ def run_ga_for_window(evaluator, window_df):
     
     return diverse_top_n
 
-# --- MAIN EXECUTION ---
+# --- BACKGROUND WORKER ---
 
-def run_anchored_analysis(df):
-    evaluator = StrategyEvaluator(df)
-    results = {}
+def background_ga_worker():
+    """Runs independently of the web server"""
+    global GLOBAL_RESULTS, ANALYSIS_STATUS
     
-    # Loop from 400 days to end of data
-    max_days = len(df)
+    print("GA WORKER: Starting...")
+    ANALYSIS_STATUS = "Fetching Data..."
     
-    print(f"Starting Anchored Ensemble Analysis on {max_days} days of data...")
-    
-    for end_day in range(ANCHOR_STEP, max_days + 1, ANCHOR_STEP):
-        window_df = df.iloc[:end_day]
-        print(f"Training on first {end_day} days...")
+    try:
+        df = fetch_data()
         
-        top_strategies = run_ga_for_window(evaluator, window_df)
-        results[end_day] = top_strategies
+        ANALYSIS_STATUS = "Running Anchored GA Analysis (This takes time)..."
+        evaluator = StrategyEvaluator(df)
+        results = {}
         
-    return results
+        max_days = len(df)
+        total_steps = len(range(ANCHOR_STEP, max_days + 1, ANCHOR_STEP))
+        current_step = 0
+        
+        for end_day in range(ANCHOR_STEP, max_days + 1, ANCHOR_STEP):
+            current_step += 1
+            ANALYSIS_STATUS = f"Processing Window {current_step}/{total_steps}: First {end_day} days..."
+            print(f"GA WORKER: {ANALYSIS_STATUS}")
+            
+            window_df = df.iloc[:end_day]
+            top_strategies = run_ga_for_window(evaluator, window_df)
+            results[end_day] = top_strategies
+            
+        ANALYSIS_STATUS = "Generating Plots & Consistency Scores..."
+        print("GA WORKER: Finalizing results...")
+        
+        processed_results = process_results_for_display(results)
+        plot_data = generate_ensemble_plot(results)
+        
+        GLOBAL_RESULTS = {
+            'processed_results': processed_results,
+            'plot_data': plot_data
+        }
+        
+        ANALYSIS_STATUS = "Complete"
+        print("GA WORKER: Analysis Complete.")
+        
+    except Exception as e:
+        ANALYSIS_STATUS = f"Error: {str(e)}"
+        print(f"GA WORKER ERROR: {e}")
+        import traceback
+        traceback.print_exc()
 
 def process_results_for_display(results):
     """
     Augments results with GLOBAL CONSISTENCY scores.
-    Compares Strategy in Window(X) vs Best Matches in ALL OTHER Windows (Y, Z, ...).
     """
     sorted_days = sorted(results.keys())
     
@@ -402,10 +436,31 @@ def generate_ensemble_plot(results):
 
 @app.route('/')
 def index():
-    df = fetch_data()
-    results = run_anchored_analysis(df)
-    plot_data = generate_ensemble_plot(results)
-    processed_results = process_results_for_display(results)
+    if GLOBAL_RESULTS is None:
+        return render_template_string(f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Analysis Running</title>
+            <meta http-equiv="refresh" content="5">
+            <style>
+                body {{ font-family: 'Segoe UI', sans-serif; text-align: center; padding-top: 50px; background: #f4f4f4; }}
+                .loader {{ border: 16px solid #f3f3f3; border-top: 16px solid #3498db; border-radius: 50%; width: 120px; height: 120px; animation: spin 2s linear infinite; margin: 0 auto; }}
+                @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+            </style>
+        </head>
+        <body>
+            <h1>Genetic Algorithm Running</h1>
+            <div class="loader"></div>
+            <p><strong>Status:</strong> {ANALYSIS_STATUS}</p>
+            <p>Population: {POPULATION_SIZE} | Generations: {GENERATIONS}</p>
+            <p>The page will reload automatically when results are ready.</p>
+        </body>
+        </html>
+        """)
+
+    processed_results = GLOBAL_RESULTS['processed_results']
+    plot_data = GLOBAL_RESULTS['plot_data']
     
     html_content = f"""
     <!DOCTYPE html>
@@ -513,5 +568,10 @@ def index():
     return render_template_string(html_content)
 
 if __name__ == '__main__':
-    print("Starting Ensemble GA Server...")
+    # Start GA in background thread
+    t = threading.Thread(target=background_ga_worker)
+    t.daemon = True
+    t.start()
+    
+    print("Starting Web Server (Analysis running in background)...")
     app.run(host='0.0.0.0', port=8080)
