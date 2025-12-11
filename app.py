@@ -18,16 +18,16 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 
-# GA Settings (Dramatically Increased)
-POPULATION_SIZE = 300   # Was 100
-GENERATIONS = 50        # Was 30
+# GA Settings (High count for broad search)
+POPULATION_SIZE = 300   
+GENERATIONS = 50        
 MUTATION_RATE = 0.2    
-TOURNAMENT_SIZE = 5     # Increased pressure
-ELITISM_COUNT = 10      # Keep top 10
+TOURNAMENT_SIZE = 5     
+ELITISM_COUNT = 10      
 
 # Ensemble Settings
 ANCHOR_STEP = 400 
-TOP_N_STRATEGIES = 50   # Keep top 50 per window to see a broad field
+TOP_N_STRATEGIES = 50   # Broad field to find matches across iterations
 
 # Parameter Constraints
 GENE_SPACE = {
@@ -236,8 +236,8 @@ def calculate_strategy_similarity(strat1, strat2):
 
 def process_results_for_display(results):
     """
-    Augments results with CROSS-ITERATION similarity scores.
-    Compares Strategies in Window(T) vs Strategies in Window(T-1).
+    Augments results with GLOBAL CONSISTENCY scores.
+    Compares Strategy in Window(X) vs Best Matches in ALL OTHER Windows (Y, Z, ...).
     """
     sorted_days = sorted(results.keys())
     
@@ -246,41 +246,53 @@ def process_results_for_display(results):
     
     # Structure to hold augmented strategies
     augmented_results = {} 
+    for day in sorted_days:
+        augmented_results[day] = []
     
-    for i, day in enumerate(sorted_days):
-        current_strategies = results[day]
-        augmented_list = []
+    # Iterate over every window (Current Window)
+    for current_day in sorted_days:
+        current_strategies = results[current_day]
         
-        for j, (strat, fitness) in enumerate(current_strategies):
-            similarity_score = 999.0 # Default for first window
+        # Iterate over every strategy in the current window
+        for idx, (strat, fitness) in enumerate(current_strategies):
             
-            # Compare with PREVIOUS window (T-1) only
-            if i > 0:
-                prev_day = sorted_days[i-1]
-                prev_strategies = results[prev_day]
+            total_similarity_diff = 0.0
+            comparison_count = 0
+            
+            # Compare against EVERY OTHER window
+            for other_day in sorted_days:
+                if other_day == current_day:
+                    continue
                 
-                # Compare THIS strategy (j) against ALL strategies in T-1
-                # We want to find its closest "ancestor" to measure stability
-                best_match_score = 999.0
-                for prev_strat, _ in prev_strategies:
-                    score = calculate_strategy_similarity(prev_strat, strat)
-                    if score < best_match_score:
-                        best_match_score = score
+                other_strategies = results[other_day]
                 
-                similarity_score = best_match_score
-                # We only rank based on similarity if we have a previous window to compare to
-                all_scores.append((day, j, similarity_score))
+                # Find the single closest strategy in the OTHER window
+                best_match_diff = float('inf')
+                for other_strat, _ in other_strategies:
+                    diff = calculate_strategy_similarity(strat, other_strat)
+                    if diff < best_match_diff:
+                        best_match_diff = diff
                 
-            augmented_list.append({
+                total_similarity_diff += best_match_diff
+                comparison_count += 1
+            
+            # Average consistency score (lower is better)
+            if comparison_count > 0:
+                avg_consistency = total_similarity_diff / comparison_count
+            else:
+                avg_consistency = 999.0
+            
+            # Store augmented data
+            augmented_results[current_day].append({
                 'strat': strat,
                 'fitness': fitness,
-                'similarity': similarity_score,
+                'similarity': avg_consistency,
                 'is_stable': False
             })
             
-        augmented_results[day] = augmented_list
+            all_scores.append((current_day, idx, avg_consistency))
         
-    # Find Global Top 10 Lowest Scores (Most Stable Transitions)
+    # Find Global Top 10 Lowest Scores (Most Consistent Across All Timeframes)
     if all_scores:
         all_scores.sort(key=lambda x: x[2]) # Sort by score ascending (lower is better)
         top_10_stable = all_scores[:10]
@@ -389,9 +401,10 @@ def index():
             
             <h2>Detailed Strategy Parameters</h2>
             <p class="similarity-note">
-                <strong>Stability Score:</strong> Calculates how much a strategy differs from its closest match in the <em>previous</em> training window. 
-                Lower score = Higher stability. 
-                Rows highlighted in <strong>GREEN</strong> represent the top 10 most stable transitions across the entire history.
+                <strong>Consistency Score:</strong> Measures how often a strategy's parameters reappear in OTHER training windows. 
+                Calculated by comparing a strategy against the best match in every other window (400d, 800d, 1200d, etc.) and averaging the difference.
+                <br>Lower score = More Universal. 
+                Rows highlighted in <strong>GREEN</strong> represent the top 10 most universally consistent strategies.
             </p>
     """
     
@@ -405,7 +418,7 @@ def index():
                 <tr>
                     <th>Rank</th>
                     <th>Sharpe</th>
-                    <th>Stability Score</th>
+                    <th>Consistency Score</th>
                     <th>SMA Fast</th>
                     <th>SMA Slow</th>
                     <th>III Window</th>
