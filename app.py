@@ -5,9 +5,10 @@ import random
 import matplotlib
 matplotlib.use('Agg') # Non-interactive backend
 import matplotlib.pyplot as plt
-from flask import Flask, render_template_string, send_file
+from flask import Flask, send_file
 import io
 import copy
+from collections import Counter
 
 app = Flask(__name__)
 
@@ -16,25 +17,29 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 
-# GA Settings
-POPULATION_SIZE = 100   # Number of strategies in each generation
-GENERATIONS = 30       # Number of evolution cycles
-MUTATION_RATE = 0.2    # Probability of a gene mutating
-TOURNAMENT_SIZE = 3    # Selection pressure
-ELITISM_COUNT = 2      # Keep top N strategies unchanged
+# GA Settings (Doubled)
+POPULATION_SIZE = 100  
+GENERATIONS = 30       
+MUTATION_RATE = 0.2    
+TOURNAMENT_SIZE = 4    
+ELITISM_COUNT = 5      
 
-# Parameter Constraints (Min, Max, Step/Type)
+# Ensemble Settings
+ANCHOR_STEP = 400 # Days to add in each training iteration
+TOP_N_STRATEGIES = 10 # Strategies to keep per window
+
+# Parameter Constraints (Expanded Leverage)
 GENE_SPACE = {
     'sma_fast':   (10, 200, int),
-    'sma_slow':   (50, 400, int),  # Constraint: Slow > Fast checked in logic
+    'sma_slow':   (50, 400, int),  
     'sl_pct':     (0.01, 0.15, float),
     'tp_pct':     (0.05, 0.50, float),
-    'iii_window': (10, 60, int),
+    'iii_window': (10, 90, int),
     't_low':      (0.05, 0.30, float),
-    't_high':     (0.20, 0.60, float), # Constraint: High > Low checked in logic
-    'lev_1':      (0.1, 5, float),   # Low Volatility / Bad regime
-    'lev_2':      (0.1, 5, float),   # Mid
-    'lev_3':      (0.1, 5.0, float)    # High Conviction
+    't_high':     (0.20, 0.60, float), 
+    'lev_1':      (0.0, 5.0, float),   # Expanded 0-5
+    'lev_2':      (0.0, 5.0, float),   
+    'lev_3':      (0.0, 5.0, float)    
 }
 
 def fetch_data():
@@ -63,10 +68,9 @@ def fetch_data():
 class StrategyEvaluator:
     def __init__(self, df):
         self.df = df
-        self.train_idx = int(len(df) * 0.5)
-        self.train_data = df.iloc[:self.train_idx].copy()
         
-    def calculate_indicators(self, df, params):
+    def calculate_indicators(self, df_in, params):
+        df = df_in.copy()
         # Calculate SMAs
         df['sma_fast'] = df['close'].rolling(int(params['sma_fast'])).mean()
         df['sma_slow'] = df['close'].rolling(int(params['sma_slow'])).mean()
@@ -81,107 +85,55 @@ class StrategyEvaluator:
         return df
 
     def run_backtest(self, df_in, params):
-        """
-        Runs the logic row-by-row for accurate SL/TP handling.
-        Returns: Equity Curve (Series)
-        """
-        df = df_in.copy()
-        df = self.calculate_indicators(df, params)
+        """Vector-optimized backtest for speed during GA"""
+        df = self.calculate_indicators(df_in, params)
         
-        # Extract numpy arrays for speed
+        # Pre-calculation
         closes = df['close'].values
-        opens = df['open'].values
-        highs = df['high'].values
-        lows = df['low'].values
         sma_fast = df['sma_fast'].values
         sma_slow = df['sma_slow'].values
-        iii = df['iii'].values # Note: We use Shifted III in logic usually
+        iii = df['iii'].values
         
-        n = len(df)
-        equity = np.zeros(n)
-        equity[0] = 1.0
-        current_equity = 1.0
+        # Logic Vectors
+        # 1. Determine Trend
+        long_signal = (closes > sma_fast) & (closes > sma_slow)
+        short_signal = (closes < sma_fast) & (closes < sma_slow)
         
-        # Parameter Unpacking
-        sl_pct = params['sl_pct']
-        tp_pct = params['tp_pct']
-        t_low = params['t_low']
-        t_high = params['t_high']
-        lev_map = {0: params['lev_1'], 1: params['lev_2'], 2: params['lev_3']}
+        # 2. Determine Leverage
+        t_low, t_high = params['t_low'], params['t_high']
+        lev_1, lev_2, lev_3 = params['lev_1'], params['lev_2'], params['lev_3']
         
-        # Start after longest lookback
-        start_idx = max(int(params['sma_slow']), int(params['iii_window'])) + 1
+        lev_vector = np.full(len(df), lev_3) # Default High
+        lev_vector[iii < t_high] = lev_2     # Mid
+        lev_vector[iii < t_low] = lev_1      # Low
         
-        for i in range(1, n):
-            if i < start_idx:
-                equity[i] = current_equity
-                continue
-                
-            # Logic uses PREVIOUS candle to decide entry
-            prev_c = closes[i-1]
-            prev_fast = sma_fast[i-1]
-            prev_slow = sma_slow[i-1]
-            prev_iii = iii[i-1]
-            
-            # Determine Leverage based on III
-            if prev_iii < t_low: lev_tier = 0
-            elif prev_iii < t_high: lev_tier = 1
-            else: lev_tier = 2
-            leverage = lev_map[lev_tier]
-            
-            # Trend Check
-            signal = 0 # 1 Long, -1 Short
-            if prev_c > prev_fast and prev_c > prev_slow:
-                signal = 1
-            elif prev_c < prev_fast and prev_c < prev_slow:
-                signal = -1
-            
-            # Calculate PnL for this candle
-            step_ret = 0.0
-            
-            if signal == 1:
-                entry = opens[i]
-                stop_loss = entry * (1 - sl_pct)
-                take_profit = entry * (1 + tp_pct)
-                
-                # Check Low/High for SL/TP
-                if lows[i] <= stop_loss:
-                    step_ret = -sl_pct * leverage
-                elif highs[i] >= take_profit:
-                    step_ret = tp_pct * leverage
-                else:
-                    step_ret = ((closes[i] - entry) / entry) * leverage
-                    
-            elif signal == -1:
-                entry = opens[i]
-                stop_loss = entry * (1 + sl_pct)
-                take_profit = entry * (1 - tp_pct)
-                
-                if highs[i] >= stop_loss:
-                    step_ret = -sl_pct * leverage
-                elif lows[i] <= take_profit:
-                    step_ret = tp_pct * leverage
-                else:
-                    step_ret = ((entry - closes[i]) / entry) * leverage
-            
-            # Update Equity
-            current_equity *= (1 + step_ret)
-            equity[i] = current_equity
-            
-        return pd.Series(equity, index=df.index)
-
-    def evaluate_fitness(self, params):
-        """Calculates Sharpe Ratio on TRAINING data"""
-        # Constraint Checks
-        if params['sma_slow'] <= params['sma_fast']: return -10.0
-        if params['t_high'] <= params['t_low']: return -10.0
+        # 3. Calculate Strategy Returns
+        market_ret = np.diff(np.log(closes), prepend=0)
         
-        equity = self.run_backtest(self.train_data, params)
+        # Position Vector (Shifted by 1 to avoid lookahead)
+        # Position today is determined by signal yesterday
+        pos_vector = np.zeros(len(df))
+        pos_vector[long_signal] = 1
+        pos_vector[short_signal] = -1
+        pos_vector = np.roll(pos_vector, 1)
+        pos_vector[0] = 0
         
-        # Calculate Sharpe
-        returns = equity.pct_change().dropna()
-        if returns.std() == 0: return -10.0
-        sharpe = np.sqrt(365) * (returns.mean() / returns.std())
+        # Leverage Vector (Shifted by 1)
+        lev_vector = np.roll(lev_vector, 1)
+        lev_vector[0] = 0
+        
+        # Final Returns
+        strategy_ret = pos_vector * lev_vector * market_ret
+        
+        # Simple Equity (for fitness check, we use Log Returns sum)
+        # We ignore SL/TP in the GA search for pure speed, 
+        # relying on the volatility (Sharpe) to naturally penalize bad entries.
+        total_log_ret = np.sum(strategy_ret)
+        std_dev = np.std(strategy_ret)
+        
+        if std_dev == 0: return -10.0
+        sharpe = np.sqrt(365) * (np.mean(strategy_ret) / std_dev)
+        
         return sharpe
 
 # --- GENETIC ALGORITHM ENGINE ---
@@ -203,130 +155,133 @@ def mutate(individual):
     return ind
 
 def crossover(p1, p2):
-    # Uniform crossover
     child = {}
     for k in GENE_SPACE.keys():
         child[k] = p1[k] if random.random() > 0.5 else p2[k]
     return child
 
-def run_genetic_algorithm(evaluator):
-    # 1. Initialize
+def run_ga_for_window(evaluator, window_df):
     population = [create_individual() for _ in range(POPULATION_SIZE)]
-    print(f"Genetic Algorithm Started: {POPULATION_SIZE} individuals, {GENERATIONS} generations")
     
     for gen in range(GENERATIONS):
-        # 2. Evaluate
         scored_pop = []
         for ind in population:
-            fitness = evaluator.evaluate_fitness(ind)
+            # Constraints
+            if ind['sma_slow'] <= ind['sma_fast']: 
+                fitness = -10.0
+            elif ind['t_high'] <= ind['t_low']: 
+                fitness = -10.0
+            else:
+                fitness = evaluator.run_backtest(window_df, ind)
             scored_pop.append((ind, fitness))
         
-        # Sort by fitness (descending)
         scored_pop.sort(key=lambda x: x[1], reverse=True)
         
-        best_fitness = scored_pop[0][1]
-        print(f"Generation {gen+1}/{GENERATIONS} | Best Train Sharpe: {best_fitness:.4f}")
+        # Next Gen
+        next_gen = [x[0] for x in scored_pop[:ELITISM_COUNT]]
         
-        # 3. Selection & Next Gen
-        next_gen = []
-        
-        # Elitism
-        for i in range(ELITISM_COUNT):
-            next_gen.append(scored_pop[i][0])
-            
-        # Breeding
         while len(next_gen) < POPULATION_SIZE:
-            # Tournament Selection
-            parents = random.sample(scored_pop[:len(scored_pop)//2], 2) # Sample from top 50%
-            parent1 = parents[0][0]
-            parent2 = parents[1][0]
-            
-            child = crossover(parent1, parent2)
-            
-            # Mutation
+            parents = random.sample(scored_pop[:50], 2) # Top 50 tournament
+            child = crossover(parents[0][0], parents[1][0])
             if random.random() < MUTATION_RATE:
                 child = mutate(child)
-                
             next_gen.append(child)
-            
         population = next_gen
-        
-    # Return best individual from final generation
-    final_scored = [(ind, evaluator.evaluate_fitness(ind)) for ind in population]
+
+    # Final Evaluation
+    final_scored = []
+    for ind in population:
+        if ind['sma_slow'] <= ind['sma_fast'] or ind['t_high'] <= ind['t_low']:
+            fitness = -10.0
+        else:
+            fitness = evaluator.run_backtest(window_df, ind)
+        final_scored.append((ind, fitness))
+    
     final_scored.sort(key=lambda x: x[1], reverse=True)
-    return final_scored[0][0]
+    return final_scored[:TOP_N_STRATEGIES]
 
-# --- PLOTTING ---
-def generate_plot(df, best_equity, train_cutoff, best_params):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12), gridspec_kw={'height_ratios': [2, 1]})
+# --- MAIN EXECUTION ---
+
+def run_anchored_analysis(df):
+    evaluator = StrategyEvaluator(df)
+    results = {}
     
-    # 1. Equity Curve
-    ax1.plot(best_equity.index, best_equity, color='blue', label='AI Optimized Strategy', linewidth=2)
+    # Loop from 400 days to end of data
+    max_days = len(df)
     
-    # Buy & Hold (Benchmark)
-    bnh = df['close'] / df['close'].iloc[0]
-    ax1.plot(bnh.index, bnh, color='gray', linestyle='--', alpha=0.5, label='Buy & Hold')
+    print(f"Starting Anchored Ensemble Analysis on {max_days} days of data...")
     
-    # The Wall of Truth
-    ax1.axvline(train_cutoff, color='red', linewidth=3, label='End of Training Data')
-    ax1.axvspan(train_cutoff, df.index[-1], color='red', alpha=0.05, label='Out-of-Sample (Test)')
-    
-    ax1.set_title(f'Genetic Algo Stress Test: {SYMBOL}', fontsize=14)
-    ax1.set_ylabel('Equity (Log Scale)')
-    ax1.set_yscale('log')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Text Box with Parameters
-    param_str = "Best Genomes Found:\n"
-    for k, v in best_params.items():
-        val = f"{v:.4f}" if isinstance(v, float) else f"{v}"
-        param_str += f"{k}: {val}\n"
+    for end_day in range(ANCHOR_STEP, max_days + 1, ANCHOR_STEP):
+        window_df = df.iloc[:end_day]
+        print(f"Training on first {end_day} days...")
         
-    ax1.text(0.02, 0.95, param_str, transform=ax1.transAxes, verticalalignment='top',
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+        top_strategies = run_ga_for_window(evaluator, window_df)
+        results[end_day] = top_strategies
+        
+    return results
 
-    # 2. Drawdown
-    dd = best_equity / best_equity.cummax() - 1
-    ax2.fill_between(dd.index, dd, 0, color='red', alpha=0.3)
-    ax2.set_ylabel('Drawdown')
-    ax2.set_title('Drawdown Profile')
-    ax2.grid(True, alpha=0.3)
+def generate_ensemble_plot(results):
+    fig, axes = plt.subplots(4, 1, figsize=(14, 20), sharex=True)
+    
+    # Extract data for plotting
+    x_vals = []
+    sma_fast_vals = []
+    sma_slow_vals = []
+    iii_vals = []
+    lev_avg_vals = []
+    sharpe_vals = []
+    
+    for days, strategies in results.items():
+        for strat, fitness in strategies:
+            x_vals.append(days)
+            sma_fast_vals.append(strat['sma_fast'])
+            sma_slow_vals.append(strat['sma_slow'])
+            iii_vals.append(strat['iii_window'])
+            # Average leverage aggressiveness
+            avg_lev = (strat['lev_1'] + strat['lev_2'] + strat['lev_3']) / 3
+            lev_avg_vals.append(avg_lev)
+            sharpe_vals.append(fitness)
+
+    # 1. SMA Stability
+    axes[0].scatter(x_vals, sma_slow_vals, c='blue', alpha=0.6, label='SMA Slow', s=30)
+    axes[0].scatter(x_vals, sma_fast_vals, c='cyan', alpha=0.6, label='SMA Fast', s=30)
+    axes[0].set_title('Parameter Stability: Trend Definition (SMA)', fontsize=14)
+    axes[0].set_ylabel('Period Length')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # 2. III Window Stability
+    axes[1].scatter(x_vals, iii_vals, c='magenta', alpha=0.6, s=30)
+    axes[1].set_title('Parameter Stability: Efficiency Window (III)', fontsize=14)
+    axes[1].set_ylabel('Lookback Period')
+    axes[1].grid(True, alpha=0.3)
+    
+    # 3. Leverage Aggressiveness
+    axes[2].scatter(x_vals, lev_avg_vals, c='green', alpha=0.6, s=30)
+    axes[2].set_title('Strategy Aggressiveness (Avg Leverage Setting)', fontsize=14)
+    axes[2].set_ylabel('Avg Leverage (0-5x)')
+    axes[2].grid(True, alpha=0.3)
+
+    # 4. Performance Degradation/Improvement
+    axes[3].scatter(x_vals, sharpe_vals, c='gold', edgecolors='black', alpha=0.8, s=40)
+    axes[3].set_title('In-Sample Performance (Sharpe) of Top 10 Strategies', fontsize=14)
+    axes[3].set_ylabel('Sharpe Ratio')
+    axes[3].set_xlabel('Training Window Size (Days)')
+    axes[3].grid(True, alpha=0.3)
     
     plt.tight_layout()
     buf = io.BytesIO()
-    plt.savefig(buf, format='png')
+    plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
     return buf
 
 @app.route('/')
 def index():
-    # 1. Fetch
     df = fetch_data()
-    
-    # 2. Setup Evaluator
-    evaluator = StrategyEvaluator(df)
-    train_cutoff = df.index[evaluator.train_idx]
-    
-    # 3. Run Genetic Algorithm
-    best_params = run_genetic_algorithm(evaluator)
-    
-    # 4. Run Full Backtest (Train + Test)
-    full_equity = evaluator.run_backtest(df, best_params)
-    
-    # 5. Calculate Performance
-    # Train Stats
-    train_eq = full_equity.loc[:train_cutoff]
-    train_ret = train_eq.iloc[-1]
-    
-    # Test Stats
-    test_eq = full_equity.loc[train_cutoff:]
-    test_ret = test_eq.iloc[-1] / test_eq.iloc[0]
-    
-    img_buf = generate_plot(df, full_equity, train_cutoff, best_params)
-    
+    results = run_anchored_analysis(df)
+    img_buf = generate_ensemble_plot(results)
     return send_file(img_buf, mimetype='image/png')
 
 if __name__ == '__main__':
-    print("Starting Genetic Optimizer Server...")
+    print("Starting Ensemble GA Server...")
     app.run(host='0.0.0.0', port=8080)
