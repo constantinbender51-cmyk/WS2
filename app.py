@@ -17,7 +17,7 @@ TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 
 # GA Settings
-POPULATION_SIZE = 50   # Number of strategies in each generation
+POPULATION_SIZE = 100   # Number of strategies in each generation
 GENERATIONS = 15       # Number of evolution cycles
 MUTATION_RATE = 0.2    # Probability of a gene mutating
 TOURNAMENT_SIZE = 3    # Selection pressure
