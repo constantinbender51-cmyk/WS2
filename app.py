@@ -32,7 +32,9 @@ ANCHOR_STEP = 400
 TOP_N_STRATEGIES = 50   
 
 # Diversity Settings
-DIVERSITY_THRESHOLD = 0.3 
+# Strategies must have distinct iii_windows.
+# Since iii_window is int, any diff < 1 means they are identical.
+DIVERSITY_THRESHOLD = 0.5 
 
 # Parameter Constraints
 GENE_SPACE = {
@@ -169,27 +171,17 @@ def crossover(p1, p2):
 
 def calculate_strategy_similarity(strat1, strat2):
     """
-    Calculates similarity score based on sum of absolute percentage differences.
-    Lower score = More similar.
+    STRICT SIMILARITY: Calculates difference in iii_window ONLY.
     """
-    score = 0
-    params = ['sma_fast', 'sma_slow', 'sl_pct', 'tp_pct', 'iii_window', 't_low', 't_high', 'lev_1', 'lev_2', 'lev_3']
-    
-    for p in params:
-        val1 = strat1[p]
-        val2 = strat2[p]
-        # Avoid division by zero
-        denom = val1 if val1 != 0 else 1e-9
-        diff = abs((val2 - val1) / denom)
-        score += diff
-        
-    return score
+    # Simply return the absolute difference in window size.
+    # 0 means identical window.
+    return abs(strat1['iii_window'] - strat2['iii_window'])
 
 def select_diverse_strategies(scored_population, n, threshold):
     """
-    Selects top N strategies, skipping those that are too similar 
-    to ones already selected.
-    scored_population: list of (individual, fitness), sorted desc.
+    Selects top N strategies.
+    Rejects any strategy whose iii_window is the same as (or within threshold of)
+    any already selected strategy.
     """
     selected = []
     
@@ -199,16 +191,15 @@ def select_diverse_strategies(scored_population, n, threshold):
         
     selected.append(scored_population[0])
     
-    # 2. Try to fill with distinct strategies
-    # Scan through the rest of the population
+    # 2. Try to fill with distinct iii_windows
     for i in range(1, len(scored_population)):
         candidate = scored_population[i]
         is_distinct = True
         
-        # Check against ALL currently selected strategies
         for picked in selected:
-            sim_score = calculate_strategy_similarity(candidate[0], picked[0])
-            if sim_score < threshold: # If too similar to ANY picked strategy
+            # Check similarity (difference in iii_window)
+            diff = calculate_strategy_similarity(candidate[0], picked[0])
+            if diff < threshold: # If identical iii_window
                 is_distinct = False
                 break
         
@@ -218,11 +209,11 @@ def select_diverse_strategies(scored_population, n, threshold):
         if len(selected) >= n:
             break
             
-    # 3. Fallback: If we filtered too aggressively and don't have N, fill with next best
+    # 3. Fallback: If we filtered too aggressively (ran out of unique windows)
+    # Fill with next best unique strategies even if windows duplicate (unlikely given range)
     if len(selected) < n:
-        # Create set of string representations for fast lookup of what we already have
+        # Just grab unique param sets to fill quota
         selected_strs = {str(s[0]) for s in selected}
-        
         for item in scored_population:
             if str(item[0]) not in selected_strs:
                 selected.append(item)
@@ -271,7 +262,7 @@ def run_ga_for_window(evaluator, window_df):
     
     final_scored.sort(key=lambda x: x[1], reverse=True)
     
-    # Use the Diversity Filter
+    # Use the III-Based Diversity Filter
     diverse_top_n = select_diverse_strategies(final_scored, TOP_N_STRATEGIES, DIVERSITY_THRESHOLD)
     
     return diverse_top_n
@@ -327,7 +318,7 @@ def background_ga_worker():
 
 def process_results_for_display(results):
     """
-    Augments results with GLOBAL CONSISTENCY scores.
+    Augments results with GLOBAL CONSISTENCY scores based on III Window stability.
     """
     sorted_days = sorted(results.keys())
     
@@ -350,9 +341,10 @@ def process_results_for_display(results):
                 
                 other_strategies = results[other_day]
                 
-                # Find best match in OTHER window
+                # Find best match in OTHER window (Closest III Window)
                 best_match_diff = float('inf')
                 for other_strat, _ in other_strategies:
+                    # diff is now just the integer difference in iii_window
                     diff = calculate_strategy_similarity(strat, other_strat)
                     if diff < best_match_diff:
                         best_match_diff = diff
@@ -411,7 +403,7 @@ def generate_ensemble_plot(results):
     axes[0].grid(True, alpha=0.3)
 
     axes[1].scatter(x_vals, iii_vals, c='magenta', alpha=0.5, s=25)
-    axes[1].set_title('Parameter Stability: Efficiency Window (III)', fontsize=14)
+    axes[1].set_title('III Window Diversity (Strict Separation Enforced)', fontsize=14)
     axes[1].set_ylabel('Lookback Period')
     axes[1].grid(True, alpha=0.3)
     
@@ -489,16 +481,17 @@ def index():
             <h1>Anchored Ensemble GA Analysis</h1>
             <p>Analysis of top {TOP_N_STRATEGIES} strategies evolved over growing time windows.</p>
             <p><strong>Config:</strong> Pop={POPULATION_SIZE}, Gens={GENERATIONS}, Step={ANCHOR_STEP}d</p>
-            <p><strong>Diversity Check:</strong> Rejects strategies with similarity score < {DIVERSITY_THRESHOLD}</p>
+            <p><strong>Diversity Rule:</strong> Strategies must have EXACTLY distinct III Windows.</p>
             
             <h2>Parameter Stability Visualization</h2>
             <img src="data:image/png;base64,{plot_data}" alt="Ensemble Plot">
             
             <h2>Detailed Strategy Parameters</h2>
             <p class="similarity-note">
-                <strong>Consistency Score:</strong> Measures how often a strategy's parameters reappear in OTHER training windows. 
-                Lower score = More Universal. 
-                Rows highlighted in <strong>GREEN</strong> represent the top 10 most universally consistent strategies.
+                <strong>III Consistency Score:</strong> Measures how consistently this specific III Window appeared in top strategies across OTHER historical eras.
+                <br>Score is the average difference in III Window size compared to best matches in other eras. 
+                <br>Lower score = This window size is a "Universal Performer".
+                Rows highlighted in <strong>GREEN</strong> are the most historically stable window sizes.
             </p>
     """
     
@@ -511,10 +504,10 @@ def index():
                 <tr>
                     <th>Rank</th>
                     <th>Sharpe</th>
-                    <th>Consistency Score</th>
+                    <th>III Consistency</th>
+                    <th>III Window</th>
                     <th>SMA Fast</th>
                     <th>SMA Slow</th>
-                    <th>III Window</th>
                     <th>T Low</th>
                     <th>T High</th>
                     <th>Lev 1 (Low)</th>
@@ -541,9 +534,9 @@ def index():
                     <td>{i+1}</td>
                     <td>{fitness:.4f}</td>
                     <td>{sim_display}</td>
+                    <td>{strat['iii_window']}</td>
                     <td>{strat['sma_fast']}</td>
                     <td>{strat['sma_slow']}</td>
-                    <td>{strat['iii_window']}</td>
                     <td>{strat['t_low']:.2f}</td>
                     <td>{strat['t_high']:.2f}</td>
                     <td>{strat['lev_1']:.1f}</td>
