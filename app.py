@@ -32,9 +32,9 @@ GENE_SPACE = {
     'iii_window': (10, 60, int),
     't_low':      (0.05, 0.30, float),
     't_high':     (0.20, 0.60, float), # Constraint: High > Low checked in logic
-    'lev_1':      (0.5, 1.0, float),   # Low Volatility / Bad regime
-    'lev_2':      (1.0, 2.5, float),   # Mid
-    'lev_3':      (2.0, 5.0, float)    # High Conviction
+    'lev_1':      (0.1, 5, float),   # Low Volatility / Bad regime
+    'lev_2':      (0.1, 5, float),   # Mid
+    'lev_3':      (0.1, 5.0, float)    # High Conviction
 }
 
 def fetch_data():
