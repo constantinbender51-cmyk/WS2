@@ -18,16 +18,16 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
 START_DATE = '2018-01-01 00:00:00'
 
-# GA Settings
-POPULATION_SIZE = 100  
-GENERATIONS = 30       
+# GA Settings (Dramatically Increased)
+POPULATION_SIZE = 300   # Was 100
+GENERATIONS = 50        # Was 30
 MUTATION_RATE = 0.2    
-TOURNAMENT_SIZE = 4    
-ELITISM_COUNT = 5      
+TOURNAMENT_SIZE = 5     # Increased pressure
+ELITISM_COUNT = 10      # Keep top 10
 
 # Ensemble Settings
-ANCHOR_STEP = 400 # Days to add in each training iteration
-TOP_N_STRATEGIES = 15 # Increased to 15 to ensure we list >100 strategies total
+ANCHOR_STEP = 400 
+TOP_N_STRATEGIES = 50   # Keep top 50 per window to see a broad field
 
 # Parameter Constraints
 GENE_SPACE = {
@@ -236,8 +236,8 @@ def calculate_strategy_similarity(strat1, strat2):
 
 def process_results_for_display(results):
     """
-    Augments results with similarity scores.
-    Identifies the global top 10 most stable strategies (lowest similarity scores).
+    Augments results with CROSS-ITERATION similarity scores.
+    Compares Strategies in Window(T) vs Strategies in Window(T-1).
     """
     sorted_days = sorted(results.keys())
     
@@ -245,7 +245,7 @@ def process_results_for_display(results):
     all_scores = []
     
     # Structure to hold augmented strategies
-    augmented_results = {} # {day: [{strat, fitness, similarity_score, is_stable}]}
+    augmented_results = {} 
     
     for i, day in enumerate(sorted_days):
         current_strategies = results[day]
@@ -254,12 +254,13 @@ def process_results_for_display(results):
         for j, (strat, fitness) in enumerate(current_strategies):
             similarity_score = 999.0 # Default for first window
             
-            # Compare with previous window (if exists)
+            # Compare with PREVIOUS window (T-1) only
             if i > 0:
                 prev_day = sorted_days[i-1]
                 prev_strategies = results[prev_day]
                 
-                # Find best match (lowest difference) in previous window
+                # Compare THIS strategy (j) against ALL strategies in T-1
+                # We want to find its closest "ancestor" to measure stability
                 best_match_score = 999.0
                 for prev_strat, _ in prev_strategies:
                     score = calculate_strategy_similarity(prev_strat, strat)
@@ -267,6 +268,7 @@ def process_results_for_display(results):
                         best_match_score = score
                 
                 similarity_score = best_match_score
+                # We only rank based on similarity if we have a previous window to compare to
                 all_scores.append((day, j, similarity_score))
                 
             augmented_list.append({
@@ -278,13 +280,14 @@ def process_results_for_display(results):
             
         augmented_results[day] = augmented_list
         
-    # Find Top 10 Lowest Scores (Most Stable)
-    all_scores.sort(key=lambda x: x[2]) # Sort by score ascending
-    top_10_stable = all_scores[:10]
-    
-    # Mark them in the augmented results
-    for day, idx, score in top_10_stable:
-        augmented_results[day][idx]['is_stable'] = True
+    # Find Global Top 10 Lowest Scores (Most Stable Transitions)
+    if all_scores:
+        all_scores.sort(key=lambda x: x[2]) # Sort by score ascending (lower is better)
+        top_10_stable = all_scores[:10]
+        
+        # Mark them in the augmented results
+        for day, idx, score in top_10_stable:
+            augmented_results[day][idx]['is_stable'] = True
         
     return augmented_results
 
@@ -310,27 +313,27 @@ def generate_ensemble_plot(results):
             sharpe_vals.append(fitness)
 
     # 1. SMA Stability
-    axes[0].scatter(x_vals, sma_slow_vals, c='blue', alpha=0.6, label='SMA Slow', s=30)
-    axes[0].scatter(x_vals, sma_fast_vals, c='cyan', alpha=0.6, label='SMA Fast', s=30)
-    axes[0].set_title('Parameter Stability: Trend Definition (SMA)', fontsize=14)
+    axes[0].scatter(x_vals, sma_slow_vals, c='blue', alpha=0.3, label='SMA Slow', s=20)
+    axes[0].scatter(x_vals, sma_fast_vals, c='cyan', alpha=0.3, label='SMA Fast', s=20)
+    axes[0].set_title(f'Parameter Stability: Trend Definition (Top {TOP_N_STRATEGIES} per Window)', fontsize=14)
     axes[0].set_ylabel('Period Length')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
     # 2. III Window Stability
-    axes[1].scatter(x_vals, iii_vals, c='magenta', alpha=0.6, s=30)
+    axes[1].scatter(x_vals, iii_vals, c='magenta', alpha=0.3, s=20)
     axes[1].set_title('Parameter Stability: Efficiency Window (III)', fontsize=14)
     axes[1].set_ylabel('Lookback Period')
     axes[1].grid(True, alpha=0.3)
     
     # 3. Leverage Aggressiveness
-    axes[2].scatter(x_vals, lev_avg_vals, c='green', alpha=0.6, s=30)
+    axes[2].scatter(x_vals, lev_avg_vals, c='green', alpha=0.3, s=20)
     axes[2].set_title('Strategy Aggressiveness (Avg Leverage Setting)', fontsize=14)
     axes[2].set_ylabel('Avg Leverage (0-5x)')
     axes[2].grid(True, alpha=0.3)
 
     # 4. Performance Degradation/Improvement
-    axes[3].scatter(x_vals, sharpe_vals, c='gold', edgecolors='black', alpha=0.8, s=40)
+    axes[3].scatter(x_vals, sharpe_vals, c='gold', edgecolors='black', alpha=0.6, s=30)
     axes[3].set_title('In-Sample Performance (Sharpe) of Top Strategies', fontsize=14)
     axes[3].set_ylabel('Sharpe Ratio')
     axes[3].set_xlabel('Training Window Size (Days)')
@@ -379,12 +382,17 @@ def index():
         <div class="container">
             <h1>Anchored Ensemble GA Analysis</h1>
             <p>Analysis of top {TOP_N_STRATEGIES} strategies evolved over growing time windows.</p>
+            <p><strong>Config:</strong> Pop={POPULATION_SIZE}, Gens={GENERATIONS}, Step={ANCHOR_STEP}d</p>
             
             <h2>Parameter Stability Visualization</h2>
             <img src="data:image/png;base64,{plot_data}" alt="Ensemble Plot">
             
             <h2>Detailed Strategy Parameters</h2>
-            <p class="similarity-note">Rows highlighted in <strong>GREEN</strong> represent the top 10 most stable strategies (lowest mutation relative to the best match in the previous window).</p>
+            <p class="similarity-note">
+                <strong>Stability Score:</strong> Calculates how much a strategy differs from its closest match in the <em>previous</em> training window. 
+                Lower score = Higher stability. 
+                Rows highlighted in <strong>GREEN</strong> represent the top 10 most stable transitions across the entire history.
+            </p>
     """
     
     # Iterate through results to build tables
