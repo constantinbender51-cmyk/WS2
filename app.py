@@ -5,8 +5,9 @@ import random
 import matplotlib
 matplotlib.use('Agg') # Non-interactive backend
 import matplotlib.pyplot as plt
-from flask import Flask, send_file
+from flask import Flask, render_template_string
 import io
+import base64
 import copy
 from collections import Counter
 
@@ -273,14 +274,95 @@ def generate_ensemble_plot(results):
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
-    return buf
+    data = base64.b64encode(buf.getbuffer()).decode("ascii")
+    plt.close(fig)
+    return data
 
 @app.route('/')
 def index():
     df = fetch_data()
     results = run_anchored_analysis(df)
-    img_buf = generate_ensemble_plot(results)
-    return send_file(img_buf, mimetype='image/png')
+    plot_data = generate_ensemble_plot(results)
+    
+    # Generate HTML Report
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Ensemble GA Strategy Report</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 20px; background-color: #f4f4f4; }}
+            .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+            h1, h2 {{ color: #333; }}
+            img {{ max-width: 100%; height: auto; border: 1px solid #ddd; margin-bottom: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 0.9em; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+            th {{ background-color: #f2f2f2; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .window-header {{ background-color: #333; color: white; padding: 10px; margin-top: 30px; border-radius: 5px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Anchored Ensemble GA Analysis</h1>
+            <p>Analysis of top {TOP_N_STRATEGIES} strategies evolved over growing time windows.</p>
+            
+            <h2>Parameter Stability Visualization</h2>
+            <img src="data:image/png;base64,{plot_data}" alt="Ensemble Plot">
+            
+            <h2>Detailed Strategy Parameters</h2>
+    """
+    
+    # Iterate through results to build tables
+    for days, strategies in results.items():
+        html_content += f"""
+        <div class="window-header">Training Window: First {days} Days</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Sharpe</th>
+                    <th>SMA Fast</th>
+                    <th>SMA Slow</th>
+                    <th>III Window</th>
+                    <th>T Low</th>
+                    <th>T High</th>
+                    <th>Lev 1 (Low)</th>
+                    <th>Lev 2 (Mid)</th>
+                    <th>Lev 3 (High)</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        for i, (strat, fitness) in enumerate(strategies):
+            html_content += f"""
+                <tr>
+                    <td>{i+1}</td>
+                    <td>{fitness:.4f}</td>
+                    <td>{strat['sma_fast']}</td>
+                    <td>{strat['sma_slow']}</td>
+                    <td>{strat['iii_window']}</td>
+                    <td>{strat['t_low']:.2f}</td>
+                    <td>{strat['t_high']:.2f}</td>
+                    <td>{strat['lev_1']:.1f}</td>
+                    <td>{strat['lev_2']:.1f}</td>
+                    <td>{strat['lev_3']:.1f}</td>
+                </tr>
+            """
+            
+        html_content += """
+            </tbody>
+        </table>
+        """
+    
+    html_content += """
+        </div>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(html_content)
 
 if __name__ == '__main__':
     print("Starting Ensemble GA Server...")
