@@ -8,7 +8,7 @@ import os
 FILE_PATH = 'text.txt'
 BATCH_SIZE = 32
 BLOCK_SIZE = 64      # Context window size
-MAX_ITERS = 5000      # Training iterations
+MAX_ITERS = 500      # Training iterations
 LEARNING_RATE = 3e-4
 EMBED_DIM = 128
 NUM_HEADS = 4
