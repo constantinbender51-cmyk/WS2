@@ -201,5 +201,5 @@ def api_generate():
 
 if __name__ == '__main__':
     load_model()
-    print(f"\nServer ready at http://0.0.0.0:5000")
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    print(f"\nServer ready at http://0.0.0.0:")
+    app.run(debug=False, host='0.0.0.0', port=8080)
