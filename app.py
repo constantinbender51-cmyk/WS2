@@ -3,14 +3,14 @@ import torch.nn as nn
 import torch.optim as optim
 import math
 import os
-import sys
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_file
 
 # --- Configuration ---
 FILE_PATH = 'text.txt'
+MODEL_PATH = 'financial_model.pth' # The weights file
 BATCH_SIZE = 32
-BLOCK_SIZE = 64      # Context window size
-MAX_ITERS = 5000     # Training iterations
+BLOCK_SIZE = 64
+MAX_ITERS = 500
 LEARNING_RATE = 3e-4
 EMBED_DIM = 128
 NUM_HEADS = 4
@@ -18,69 +18,37 @@ NUM_LAYERS = 4
 DROPOUT = 0.1
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Initialize Flask App
 app = Flask(__name__)
 
-# --- 1. Data Preparation ---
+# --- 1. Data & Tokenizer ---
 
 def ensure_file_exists():
-    """Creates a dummy dictionary file if it doesn't exist."""
     if not os.path.exists(FILE_PATH):
-        print(f"'{FILE_PATH}' not found. Creating a dummy dictionary...")
-        data = """
-Asset: A resource with economic value that an individual, corporation, or country owns or controls with the expectation that it will provide a future benefit.
-Bond: A fixed income instrument that represents a loan made by an investor to a borrower.
-Capital: Financial assets, such as funds held in deposit accounts and/or funds obtained from special financing sources.
-Debt: An amount of money borrowed by one party from another.
-Equity: The value of the shares issued by a company. It represents the ownership interest held by shareholders.
-Finance: The management of large amounts of money, especially by governments or large companies.
-Gold: A yellow precious metal, the chemical element of atomic number 79, used especially in jewelry and decoration and to guarantee the value of currencies.
-Hedge: An investment to reduce the risk of adverse price movements in an asset.
-Income: Money received, especially on a regular basis, for work or through investments.
-Liability: Something a person or company owes, usually a sum of money.
-Market: A composition of systems, institutions, procedures, social relations or infrastructures whereby parties engage in exchange.
-Profit: A financial gain, especially the difference between the amount earned and the amount spent in buying, operating, or producing something.
-Stock: The capital raised by a business or corporation through the issue and subscription of shares.
-Yield: The earnings generated and realized on an investment over a particular period of time.
-"""
+        data = "Asset: A resource... Bond: A loan... Equity: Ownership... Finance: Management..."
         with open(FILE_PATH, 'w', encoding='utf-8') as f:
-            f.write(data.strip())
+            f.write(data)
 
 ensure_file_exists()
-
-# Read the file
 with open(FILE_PATH, 'r', encoding='utf-8') as f:
     text = f.read()
 
-# Simple Character-level Tokenizer
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
 stoi = {ch: i for i, ch in enumerate(chars)}
 itos = {i: ch for i, ch in enumerate(chars)}
-
-encode = lambda s: [stoi[c] for c in s]
+encode = lambda s: [stoi[c] for c in s if c in stoi]
 decode = lambda l: ''.join([itos[i] for i in l])
 
-# Prepare Train/Validation sets
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9 * len(data))
-train_data = data[:n]
-val_data = data[n:]
+data_tensor = torch.tensor(encode(text), dtype=torch.long)
+train_data = data_tensor[:int(0.9 * len(data_tensor))]
 
-def get_batch(split):
-    data_src = train_data if split == 'train' else val_data
-    max_idx = len(data_src) - BLOCK_SIZE - 1
-    if max_idx <= 0:
-        ix = torch.randint(0, len(data_src) - 1, (BATCH_SIZE,))
-        x = torch.stack([data_src[i:i+1] for i in ix])
-        y = torch.stack([data_src[i+1:i+2] for i in ix])
-    else:
-        ix = torch.randint(len(data_src) - BLOCK_SIZE, (BATCH_SIZE,))
-        x = torch.stack([data_src[i:i+BLOCK_SIZE] for i in ix])
-        y = torch.stack([data_src[i+1:i+BLOCK_SIZE+1] for i in ix])
+def get_batch():
+    ix = torch.randint(len(train_data) - BLOCK_SIZE, (BATCH_SIZE,))
+    x = torch.stack([train_data[i:i+BLOCK_SIZE] for i in ix])
+    y = torch.stack([train_data[i+1:i+BLOCK_SIZE+1] for i in ix])
     return x.to(DEVICE), y.to(DEVICE)
 
-# --- 2. Model Definition ---
+# --- 2. Model Architecture ---
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -91,10 +59,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
-
     def forward(self, x):
-        # x: [Seq Len, Batch Size, Embed Dim]
-        # Crop pe to the current sequence length of x
         return x + self.pe[:x.size(0), :].unsqueeze(1)
 
 class TransformerModel(nn.Module):
@@ -102,147 +67,102 @@ class TransformerModel(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_encoder = PositionalEncoding(embed_dim, max_len=BLOCK_SIZE)
-        
         encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, dim_feedforward=embed_dim*4, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
-        
         self.decoder = nn.Linear(embed_dim, vocab_size)
         self.embed_dim = embed_dim
-
-    def forward(self, src, src_mask=None):
+    def forward(self, src):
         src = self.embedding(src) * math.sqrt(self.embed_dim)
         src = src.permute(1, 0, 2) 
         src = self.pos_encoder(src)
-        
-        if src_mask is None:
-            sz = src.size(0)
-            src_mask = nn.Transformer.generate_square_subsequent_mask(sz).to(DEVICE)
+        sz = src.size(0)
+        mask = nn.Transformer.generate_square_subsequent_mask(sz).to(DEVICE)
+        output = self.transformer_encoder(src, mask=mask)
+        return self.decoder(output.permute(1, 0, 2))
 
-        output = self.transformer_encoder(src, mask=src_mask)
-        output = output.permute(1, 0, 2)
-        output = self.decoder(output)
-        return output
-
-# --- 3. Training & Core Logic ---
-
-# Initialize model globally so Flask can access it
+# Initialize model
 model = TransformerModel(vocab_size, EMBED_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT).to(DEVICE)
 
-def train_model():
-    print(f"Starting training on {DEVICE} for {MAX_ITERS} iterations...")
+# --- 3. Persistence Logic ---
+
+def train_and_save():
+    print(f"Starting training...")
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     model.train()
-
     for iter in range(MAX_ITERS):
-        xb, yb = get_batch('train')
+        xb, yb = get_batch()
         logits = model(xb)
-        
-        B, T, C = logits.shape
-        logits = logits.view(B*T, C)
-        targets = yb.view(B*T)
-        
-        loss = criterion(logits, targets)
-
+        loss = criterion(logits.view(-1, vocab_size), yb.view(-1))
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-
-        if iter % 500 == 0:
-            print(f"Iter {iter}: Loss {loss.item():.4f}")
-            
-    print("Training complete!")
-
-def generate_text(model, start_str, max_new_tokens=100, temperature=0.8):
-    model.eval()
+        if iter % 500 == 0: print(f"Iter {iter}: Loss {loss.item():.4f}")
     
-    # Handle characters not in training data
-    try:
-        start_tokens = encode(start_str)
-    except KeyError:
-        # Fallback for unknown chars: strip them or use a default
-        valid_chars = [c for c in start_str if c in stoi]
-        if not valid_chars: return "Error: Prompt contains unknown characters."
-        start_tokens = encode("".join(valid_chars))
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"Model saved to {MODEL_PATH}")
 
-    context = torch.tensor(start_tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
-    generated_text = start_str
+def load_model():
+    if os.path.exists(MODEL_PATH):
+        print(f"Loading existing model...")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        model.eval()
+    else:
+        train_and_save()
+        model.eval()
 
-    for _ in range(max_new_tokens):
-        context_cond = context[:, -BLOCK_SIZE:]
-        
-        with torch.no_grad():
-            logits = model(context_cond)
-        
-        logits = logits[:, -1, :]
-        
-        # Apply temperature
-        if temperature > 0:
-            logits = logits / temperature
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-        else:
-            # Greedy decoding if temp is 0
-            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-        
-        context = torch.cat((context, idx_next), dim=1)
-        generated_text += decode([idx_next.item()])
-    
-    return generated_text
+# --- 4. Web Interface & Routes ---
 
-# --- 4. Web Server (Flask) ---
-
-# Simple HTML Interface
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Financial AI Model</title>
+    <title>AI Control Center</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }
-        h1 { color: #333; }
-        textarea { width: 100%; height: 100px; padding: 10px; border-radius: 5px; border: 1px solid #ccc; font-size: 16px; }
-        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-        button:hover { background: #0056b3; }
-        #output { margin-top: 20px; padding: 20px; background: #f4f4f4; border-radius: 5px; white-space: pre-wrap; min-height: 100px; border: 1px solid #ddd; }
-        .loading { color: #666; font-style: italic; }
+        body { font-family: 'Inter', system-ui, sans-serif; background: #f8fafc; display: flex; justify-content: center; padding: 40px 20px; color: #1e293b; }
+        .card { background: white; padding: 32px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); width: 100%; max-width: 550px; border: 1px solid #e2e8f0; }
+        h2 { margin-top: 0; font-weight: 700; color: #0f172a; }
+        label { display: block; margin-bottom: 8px; font-weight: 500; font-size: 14px; color: #64748b; }
+        textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box; font-size: 16px; margin-bottom: 16px; outline: none; transition: border 0.2s; }
+        textarea:focus { border-color: #3b82f6; }
+        .btn-group { display: flex; gap: 10px; flex-direction: column; }
+        .primary-btn { background: #2563eb; color: white; border: none; padding: 14px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        .primary-btn:hover { background: #1d4ed8; }
+        .secondary-btn { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; padding: 10px; border-radius: 8px; font-weight: 500; cursor: pointer; text-decoration: none; text-align: center; font-size: 14px; }
+        .secondary-btn:hover { background: #e2e8f0; }
+        #output { margin-top: 24px; background: #f1f5f9; padding: 16px; border-radius: 10px; min-height: 80px; white-space: pre-wrap; font-size: 15px; border: 1px dashed #cbd5e1; color: #334155; }
+        .status { font-size: 12px; margin-top: 20px; color: #94a3b8; text-align: center; }
     </style>
 </head>
 <body>
-    <h1>Financial Text Generator</h1>
-    <p>Model trained on {iters} iterations. Enter a prompt below:</p>
-    
-    <textarea id="prompt" placeholder="Type something like 'Market' or 'Equity'...">Equity</textarea>
-    <br>
-    <label>Temperature (Creativity): <input type="range" id="temp" min="0.1" max="1.5" step="0.1" value="0.8"></label>
-    <span id="temp-val">0.8</span>
-    <br><br>
-    <button onclick="generate()">Generate</button>
-    
-    <div id="output"></div>
+    <div class="card">
+        <h2>Financial AI Interface</h2>
+        <label for="prompt">Starting Text (Prompt)</label>
+        <textarea id="prompt">Equity</textarea>
+        
+        <div class="btn-group">
+            <button class="primary-btn" onclick="generate()">Generate Prediction</button>
+            <a href="/download" class="secondary-btn">💾 Download Model Weights (.pth)</a>
+        </div>
 
+        <div id="output">Prediction will appear here...</div>
+        <div class="status">Running on {{ device }}</div>
+    </div>
     <script>
-        document.getElementById('temp').oninput = function() {
-            document.getElementById('temp-val').innerHTML = this.value;
-        }
-
         async function generate() {
             const prompt = document.getElementById('prompt').value;
-            const temp = parseFloat(document.getElementById('temp').value);
-            const outputDiv = document.getElementById('output');
-            
-            outputDiv.innerHTML = '<span class="loading">Generating...</span>';
-            
+            const output = document.getElementById('output');
+            output.innerText = "Processing...";
             try {
-                const response = await fetch('/generate', {
+                const res = await fetch('/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: prompt, temperature: temp })
+                    body: JSON.stringify({ prompt })
                 });
-                const data = await response.json();
-                outputDiv.innerText = data.text;
+                const data = await res.json();
+                output.innerText = data.text;
             } catch (e) {
-                outputDiv.innerText = "Error: " + e;
+                output.innerText = "Error communicating with server.";
             }
         }
     </script>
@@ -251,23 +171,35 @@ HTML_TEMPLATE = """
 """
 
 @app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE, iters=MAX_ITERS)
+def home(): 
+    return render_template_string(HTML_TEMPLATE, device=DEVICE)
+
+@app.route('/download')
+def download_file():
+    if os.path.exists(MODEL_PATH):
+        return send_file(MODEL_PATH, as_attachment=True)
+    return "Model file not found. Please wait for training to complete.", 404
 
 @app.route('/generate', methods=['POST'])
 def api_generate():
-    data = request.json
-    start_str = data.get('prompt', 'Equity')
-    temperature = data.get('temperature', 0.8)
-    
-    # Generate text using the global model
-    result = generate_text(model, start_str, max_new_tokens=200, temperature=temperature)
-    return jsonify({'text': result})
+    prompt = request.json.get('prompt', 'Equity')
+    try:
+        context = torch.tensor(encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
+    except KeyError:
+        return jsonify({'text': 'Error: Prompt contains characters not seen in training.'})
+        
+    generated = prompt
+    model.eval()
+    for _ in range(150):
+        with torch.no_grad():
+            logits = model(context[:, -BLOCK_SIZE:])[:, -1, :]
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            next_char = torch.multinomial(probs, num_samples=1)
+            context = torch.cat((context, next_char), dim=1)
+            generated += decode([next_char.item()])
+    return jsonify({'text': generated})
 
 if __name__ == '__main__':
-    # 1. Run training
-    train_model()
-    
-    # 2. Start Web Server
-    print("\nStarting Web Server at http://127.0.0.1:5000")
+    load_model()
+    print(f"\nServer ready at http://0.0.0.0:5000")
     app.run(debug=False, host='0.0.0.0', port=5000)
