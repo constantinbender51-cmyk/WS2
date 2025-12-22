@@ -3,18 +3,23 @@ import torch.nn as nn
 import torch.optim as optim
 import math
 import os
+import sys
+from flask import Flask, request, jsonify, render_template_string
 
 # --- Configuration ---
 FILE_PATH = 'text.txt'
 BATCH_SIZE = 32
 BLOCK_SIZE = 64      # Context window size
-MAX_ITERS = 5000      # Training iterations
+MAX_ITERS = 5000     # Training iterations
 LEARNING_RATE = 3e-4
 EMBED_DIM = 128
 NUM_HEADS = 4
 NUM_LAYERS = 4
 DROPOUT = 0.1
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Initialize Flask App
+app = Flask(__name__)
 
 # --- 1. Data Preparation ---
 
@@ -64,12 +69,10 @@ val_data = data[n:]
 
 def get_batch(split):
     data_src = train_data if split == 'train' else val_data
-    # Ensure we don't go out of bounds
     max_idx = len(data_src) - BLOCK_SIZE - 1
     if max_idx <= 0:
-        # Fallback for very short text files
         ix = torch.randint(0, len(data_src) - 1, (BATCH_SIZE,))
-        x = torch.stack([data_src[i:i+1] for i in ix]) # Context of 1
+        x = torch.stack([data_src[i:i+1] for i in ix])
         y = torch.stack([data_src[i+1:i+2] for i in ix])
     else:
         ix = torch.randint(len(data_src) - BLOCK_SIZE, (BATCH_SIZE,))
@@ -91,6 +94,7 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x):
         # x: [Seq Len, Batch Size, Embed Dim]
+        # Crop pe to the current sequence length of x
         return x + self.pe[:x.size(0), :].unsqueeze(1)
 
 class TransformerModel(nn.Module):
@@ -99,7 +103,6 @@ class TransformerModel(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_encoder = PositionalEncoding(embed_dim, max_len=BLOCK_SIZE)
         
-        # Using TransformerEncoder with causal mask acts as a Decoder for GPT-style generation
         encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, dim_feedforward=embed_dim*4, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
         
@@ -107,88 +110,164 @@ class TransformerModel(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, src, src_mask=None):
-        # src shape: [Batch, Seq] -> Transpose for nn.Transformer [Seq, Batch, Embed]
         src = self.embedding(src) * math.sqrt(self.embed_dim)
         src = src.permute(1, 0, 2) 
         src = self.pos_encoder(src)
         
         if src_mask is None:
-            # Generate causal mask
             sz = src.size(0)
             src_mask = nn.Transformer.generate_square_subsequent_mask(sz).to(DEVICE)
 
         output = self.transformer_encoder(src, mask=src_mask)
-        # Transpose back to [Batch, Seq, Embed] for Linear layer
         output = output.permute(1, 0, 2)
         output = self.decoder(output)
         return output
 
-# --- 3. Training ---
+# --- 3. Training & Core Logic ---
 
+# Initialize model globally so Flask can access it
 model = TransformerModel(vocab_size, EMBED_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT).to(DEVICE)
-optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-criterion = nn.CrossEntropyLoss()
 
-print(f"Training on {DEVICE} for {MAX_ITERS} iterations...")
-model.train()
+def train_model():
+    print(f"Starting training on {DEVICE} for {MAX_ITERS} iterations...")
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    criterion = nn.CrossEntropyLoss()
+    model.train()
 
-for iter in range(MAX_ITERS):
-    xb, yb = get_batch('train')
+    for iter in range(MAX_ITERS):
+        xb, yb = get_batch('train')
+        logits = model(xb)
+        
+        B, T, C = logits.shape
+        logits = logits.view(B*T, C)
+        targets = yb.view(B*T)
+        
+        loss = criterion(logits, targets)
 
-    # Forward pass
-    logits = model(xb)
-    
-    # Reshape for loss calculation: [Batch * Seq, Vocab]
-    B, T, C = logits.shape
-    logits = logits.view(B*T, C)
-    targets = yb.view(B*T)
-    
-    loss = criterion(logits, targets)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
-    # Backward pass
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+        if iter % 500 == 0:
+            print(f"Iter {iter}: Loss {loss.item():.4f}")
+            
+    print("Training complete!")
 
-    if iter % 100 == 0:
-        print(f"Iter {iter}: Loss {loss.item():.4f}")
-
-print("Training complete.")
-
-# --- 4. Generation ---
-
-def generate(model, start_str, max_new_tokens=100):
+def generate_text(model, start_str, max_new_tokens=100, temperature=0.8):
     model.eval()
-    # Encode start string
-    context = torch.tensor(encode(start_str), dtype=torch.long, device=DEVICE).unsqueeze(0) # [1, Seq]
     
-    print(f"\nPrompt: '{start_str}'")
-    print("-" * 40)
-    print(start_str, end='', flush=True)
+    # Handle characters not in training data
+    try:
+        start_tokens = encode(start_str)
+    except KeyError:
+        # Fallback for unknown chars: strip them or use a default
+        valid_chars = [c for c in start_str if c in stoi]
+        if not valid_chars: return "Error: Prompt contains unknown characters."
+        start_tokens = encode("".join(valid_chars))
+
+    context = torch.tensor(start_tokens, dtype=torch.long, device=DEVICE).unsqueeze(0)
+    generated_text = start_str
 
     for _ in range(max_new_tokens):
-        # Crop context to block size if it gets too long
         context_cond = context[:, -BLOCK_SIZE:]
         
         with torch.no_grad():
             logits = model(context_cond)
         
-        # Focus only on the last time step
-        logits = logits[:, -1, :] # [Batch, Vocab]
+        logits = logits[:, -1, :]
         
-        # Apply softmax to get probabilities
-        probs = torch.nn.functional.softmax(logits, dim=-1)
+        # Apply temperature
+        if temperature > 0:
+            logits = logits / temperature
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+        else:
+            # Greedy decoding if temp is 0
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
         
-        # Sample from the distribution
-        idx_next = torch.multinomial(probs, num_samples=1)
-        
-        # Append to current sequence
         context = torch.cat((context, idx_next), dim=1)
-        
-        # Print the new character
-        print(decode([idx_next.item()]), end='', flush=True)
+        generated_text += decode([idx_next.item()])
     
-    print("\n" + "-" * 40)
+    return generated_text
 
-# Run the prompt
-generate(model, "Equity")
+# --- 4. Web Server (Flask) ---
+
+# Simple HTML Interface
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Financial AI Model</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+        h1 { color: #333; }
+        textarea { width: 100%; height: 100px; padding: 10px; border-radius: 5px; border: 1px solid #ccc; font-size: 16px; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
+        button:hover { background: #0056b3; }
+        #output { margin-top: 20px; padding: 20px; background: #f4f4f4; border-radius: 5px; white-space: pre-wrap; min-height: 100px; border: 1px solid #ddd; }
+        .loading { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>Financial Text Generator</h1>
+    <p>Model trained on {iters} iterations. Enter a prompt below:</p>
+    
+    <textarea id="prompt" placeholder="Type something like 'Market' or 'Equity'...">Equity</textarea>
+    <br>
+    <label>Temperature (Creativity): <input type="range" id="temp" min="0.1" max="1.5" step="0.1" value="0.8"></label>
+    <span id="temp-val">0.8</span>
+    <br><br>
+    <button onclick="generate()">Generate</button>
+    
+    <div id="output"></div>
+
+    <script>
+        document.getElementById('temp').oninput = function() {
+            document.getElementById('temp-val').innerHTML = this.value;
+        }
+
+        async function generate() {
+            const prompt = document.getElementById('prompt').value;
+            const temp = parseFloat(document.getElementById('temp').value);
+            const outputDiv = document.getElementById('output');
+            
+            outputDiv.innerHTML = '<span class="loading">Generating...</span>';
+            
+            try {
+                const response = await fetch('/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: prompt, temperature: temp })
+                });
+                const data = await response.json();
+                outputDiv.innerText = data.text;
+            } catch (e) {
+                outputDiv.innerText = "Error: " + e;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE, iters=MAX_ITERS)
+
+@app.route('/generate', methods=['POST'])
+def api_generate():
+    data = request.json
+    start_str = data.get('prompt', 'Equity')
+    temperature = data.get('temperature', 0.8)
+    
+    # Generate text using the global model
+    result = generate_text(model, start_str, max_new_tokens=200, temperature=temperature)
+    return jsonify({'text': result})
+
+if __name__ == '__main__':
+    # 1. Run training
+    train_model()
+    
+    # 2. Start Web Server
+    print("\nStarting Web Server at http://127.0.0.1:5000")
+    app.run(debug=False, host='0.0.0.0', port=5000)
