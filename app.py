@@ -10,18 +10,17 @@ import json
 import sys
 from flask import Flask, request, jsonify, render_template_string, send_file
 
-# --- 1. Custom Delayed Logging Handler ---
+# --- 1. Custom Delayed Logging Handler for Railway ---
 class DelayedStreamHandler(logging.StreamHandler):
     """
-    Custom handler that adds a small delay after every log emission.
-    This prevents log messages from racing each other in cloud consoles,
-    ensuring strictly ordered display.
+    Railway captures stdout. Rapid logs can arrive out of order in the UI.
+    This handler adds a 0.1s delay to ensure display sequence accuracy.
     """
     def emit(self, record):
         try:
             super().emit(record)
-            self.flush() # Force flush to stdout
-            time.sleep(0.1) # The requested 0.1s delay
+            self.flush()
+            time.sleep(0.1) 
         except Exception:
             self.handleError(record)
 
@@ -29,16 +28,11 @@ class DelayedStreamHandler(logging.StreamHandler):
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        DelayedStreamHandler(sys.stdout)
-    ]
+    handlers=[DelayedStreamHandler(sys.stdout)]
 )
 
 app = Flask(__name__)
-
-# Reduce noise from internal Flask logger to keep our custom logs clear
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
-
 
 # --- Configuration ---
 FILE_PATH = 'text.txt'
@@ -53,12 +47,12 @@ NUM_LAYERS = 4
 DROPOUT = 0.1
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-
 # --- 3. Data & Tokenizer ---
 
 def ensure_file_exists():
     if not os.path.exists(FILE_PATH):
-        data = "Asset: A resource... Bond: A loan... Equity: Ownership... Finance: Management..."
+        # Sample data for financial context
+        data = "Asset: A resource... Bond: A loan... Equity: Ownership... Finance: Management... " * 100
         with open(FILE_PATH, 'w', encoding='utf-8') as f:
             f.write(data)
 
@@ -74,14 +68,21 @@ encode = lambda s: [stoi[c] for c in s if c in stoi]
 decode = lambda l: ''.join([itos[i] for i in l])
 
 data_tensor = torch.tensor(encode(text), dtype=torch.long)
-train_data = data_tensor[:int(0.9 * len(data_tensor))]
+# Split for Train/Val loss logging
+n = int(0.9 * len(data_tensor))
+train_data = data_tensor[:n]
+val_data = data_tensor[n:]
 
-def get_batch():
-    ix = torch.randint(len(train_data) - BLOCK_SIZE, (BATCH_SIZE,))
-    x = torch.stack([train_data[i:i+BLOCK_SIZE] for i in ix])
-    y = torch.stack([train_data[i+1:i+BLOCK_SIZE+1] for i in ix])
+def get_batch(split='train'):
+    data = train_data if split == 'train' else val_data
+    # Ensure we don't go out of bounds
+    max_idx = len(data) - BLOCK_SIZE
+    if max_idx <= 0: return torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.long).to(DEVICE), torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.long).to(DEVICE)
+    
+    ix = torch.randint(max_idx, (BATCH_SIZE,))
+    x = torch.stack([data[i:i+BLOCK_SIZE] for i in ix])
+    y = torch.stack([data[i+1:i+BLOCK_SIZE+1] for i in ix])
     return x.to(DEVICE), y.to(DEVICE)
-
 
 # --- 4. Model Architecture ---
 
@@ -117,71 +118,75 @@ class TransformerModel(nn.Module):
 
 model = TransformerModel(vocab_size, EMBED_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT).to(DEVICE)
 
+# --- 5. Training & Loss Estimation ---
 
-# --- 5. Persistence Logic ---
+@torch.no_grad()
+def estimate_loss():
+    """ Helper to average losses across multiple batches for cleaner logging """
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(5)
+        for k in range(5):
+            X, Y = get_batch(split)
+            logits = model(X)
+            loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), Y.view(-1))
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
 
 def train_and_save():
     app.logger.info("Starting training sequence...")
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.CrossEntropyLoss()
     model.train()
-    for iter in range(MAX_ITERS):
-        xb, yb = get_batch()
+    
+    for iter in range(MAX_ITERS + 1):
+        # Every 20 iterations, log both training and validation loss
+        if iter % 20 == 0:
+            losses = estimate_loss()
+            app.logger.info(f"Iter {iter:04d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f}")
+
+        xb, yb = get_batch('train')
         logits = model(xb)
-        loss = criterion(logits.view(-1, vocab_size), yb.view(-1))
+        loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+        
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        if iter % 20 == 0: 
-            # Logs here will now automatically pause for 0.1s
-            app.logger.info(f"Training Progress | Iter {iter} | Loss {loss.item():.4f}")
     
     torch.save(model.state_dict(), MODEL_PATH)
     app.logger.info(f"Training Complete. Model saved to {MODEL_PATH}")
 
 def load_model():
     if os.path.exists(MODEL_PATH):
-        app.logger.info("Model file found. Loading weights...")
+        app.logger.info("Loading existing model weights...")
         model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
         model.eval()
-        app.logger.info("Model loaded successfully.")
     else:
-        app.logger.info("Model file missing. Initiating training...")
+        app.logger.info("Model weights not found. Running training...")
         train_and_save()
         model.eval()
 
+# --- 6. Interaction Logging ---
 
-# --- 6. Structured Logging Helper ---
-
-def log_interaction(req_id, prompt, generated_text, duration_ms):
-    """
-    Constructs a JSON audit log. 
-    The DelayedStreamHandler will ensure this prints cleanly.
-    """
+def log_api_call(req_id, prompt, generated, duration):
+    """ Structured JSON log for the generation event """
     try:
-        input_len = len(prompt)
-        output_len = len(generated_text) - input_len
-        
-        audit_entry = {
-            "event": "llm_generation",
-            "req_id": req_id,
-            "timestamp": time.time(),
-            "duration_ms": round(duration_ms, 2),
-            "input_chars": input_len,
-            "output_chars": output_len,
-            "prompt_snippet": prompt[:50] + "..." if len(prompt) > 50 else prompt,
-            "full_prompt": prompt,
-            "full_response": generated_text,
-            "model_device": DEVICE
+        log_data = {
+            "event": "prediction",
+            "id": req_id,
+            "duration_ms": round(duration, 2),
+            "chars_in": len(prompt),
+            "chars_out": len(generated) - len(prompt),
+            "prompt": prompt[:50] + "...",
+            "response": generated[-50:] if len(generated) > 50 else generated
         }
-        
-        app.logger.info(json.dumps(audit_entry))
-        
+        app.logger.info(json.dumps(log_data))
     except Exception as e:
-        app.logger.error(f"Logging Error: {e}")
+        app.logger.error(f"Logging failed: {e}")
 
-
-# --- 7. Web Interface & Routes ---
+# --- 7. Flask Routes ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -209,12 +214,10 @@ HTML_TEMPLATE = """
         <h2>Financial AI Interface</h2>
         <label for="prompt">Starting Text (Prompt)</label>
         <textarea id="prompt">Equity</textarea>
-        
         <div class="btn-group">
             <button class="primary-btn" onclick="generate()">Generate Prediction</button>
             <a href="/download" class="secondary-btn">💾 Download Model Weights (.pth)</a>
         </div>
-
         <div id="output">Prediction will appear here...</div>
         <div class="status">Running on {{ device }}</div>
     </div>
@@ -248,28 +251,23 @@ def home():
 def download_file():
     if os.path.exists(MODEL_PATH):
         return send_file(MODEL_PATH, as_attachment=True)
-    return "Model file not found. Please wait for training to complete.", 404
+    return "Model file not found.", 404
 
 @app.route('/generate', methods=['POST'])
 def api_generate():
     req_id = str(uuid.uuid4())[:8]
     start_time = time.time()
-    
     prompt = request.json.get('prompt', 'Equity')
     
-    # This log will pause execution for 0.1s
-    app.logger.info(f"Incoming Request {req_id} | Prompt: {prompt[:15]}...")
+    app.logger.info(f"API | Req: {req_id} | In: {prompt[:15]}...")
 
     try:
         context = torch.tensor(encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
     except KeyError:
-        err_msg = 'Error: Prompt contains characters not seen in training.'
-        app.logger.warning(f"Request {req_id} Failed: {err_msg}")
-        return jsonify({'text': err_msg})
+        return jsonify({'text': 'Error: Invalid characters in prompt.'})
         
     generated = prompt
     model.eval()
-    
     for _ in range(150):
         with torch.no_grad():
             logits = model(context[:, -BLOCK_SIZE:])[:, -1, :]
@@ -278,15 +276,12 @@ def api_generate():
             context = torch.cat((context, next_char), dim=1)
             generated += decode([next_char.item()])
     
-    duration_ms = (time.time() - start_time) * 1000
-    
-    # This log (which is large) will also pause for 0.1s
-    log_interaction(req_id, prompt, generated, duration_ms)
+    duration = (time.time() - start_time) * 1000
+    log_api_call(req_id, prompt, generated, duration)
 
     return jsonify({'text': generated})
 
 if __name__ == '__main__':
     load_model()
     port = int(os.environ.get('PORT', 8080))
-    print(f"\nServer ready at http://0.0.0.0:{port}")
     app.run(debug=False, host='0.0.0.0', port=port)
