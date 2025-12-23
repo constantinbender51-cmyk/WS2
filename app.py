@@ -8,31 +8,79 @@ import time
 import uuid
 import json
 import sys
-from flask import Flask, request, jsonify, render_template_string, send_file
+import threading
+import queue
+from flask import Flask, request, jsonify, render_template_string, send_file, Response, stream_with_context
 
-# --- 1. Custom Delayed Logging Handler for Railway ---
-class DelayedStreamHandler(logging.StreamHandler):
-    """
-    Railway captures stdout. Rapid logs can arrive out of order in the UI.
-    This handler adds a 0.1s delay to ensure display sequence accuracy.
-    """
+# --- 1. Real-Time Logging Architecture ---
+
+# Global broadcaster to send logs to multiple connected web clients
+class LogBroadcaster:
+    def __init__(self):
+        self.listeners = []
+        self.history = [] # Cache recent logs for new connections
+
+    def listen(self):
+        """Returns a queue for a new web client to consume"""
+        q = queue.Queue()
+        self.listeners.append(q)
+        # Replay history so new users see what happened recently
+        for msg in self.history[-30:]:
+            q.put(msg)
+        return q
+
+    def broadcast(self, message):
+        """Push a message to all active listeners"""
+        # Format as Server-Sent Event (SSE) data
+        payload = f"data: {json.dumps({'text': message})}\n\n"
+        
+        self.history.append(payload)
+        if len(self.history) > 200: self.history.pop(0)
+        
+        dead_listeners = []
+        for q in self.listeners:
+            try:
+                q.put(payload)
+            except:
+                dead_listeners.append(q)
+        
+        # Cleanup disconnected clients
+        for d in dead_listeners:
+            if d in self.listeners: self.listeners.remove(d)
+
+broadcaster = LogBroadcaster()
+
+# Custom Handler to write to Stdout (Railway) AND Web UI
+class StreamLogger(logging.StreamHandler):
     def emit(self, record):
         try:
-            super().emit(record)
-            self.flush()
+            msg = self.format(record)
+            
+            # 1. Write to Railway/Terminal (Force flush for immediate display)
+            sys.stdout.write(msg + '\n')
+            sys.stdout.flush()
+            
+            # 2. Send to Web Frontend
+            broadcaster.broadcast(msg)
+            
+            # 3. Requested Delay for sequencing accuracy
             time.sleep(0.1) 
         except Exception:
             self.handleError(record)
 
-# --- 2. Logging Configuration ---
+# Configure Root Logger
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[DelayedStreamHandler(sys.stdout)]
+    handlers=[StreamLogger()]
 )
+logger = logging.getLogger()
+
+# Silence noisy libraries
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
 
 app = Flask(__name__)
-logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # --- Configuration ---
 FILE_PATH = 'text.txt'
@@ -47,12 +95,17 @@ NUM_LAYERS = 4
 DROPOUT = 0.1
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# --- 3. Data & Tokenizer ---
+# Global Training State
+training_active = False
+model_ready = False
+
+# --- 2. Data & Tokenizer ---
 
 def ensure_file_exists():
     if not os.path.exists(FILE_PATH):
-        # Sample data for financial context
-        data = "Asset: A resource... Bond: A loan... Equity: Ownership... Finance: Management... " * 100
+        # Create dummy financial data
+        base_text = "Asset: Resource with economic value. Equity: Ownership interest. Liability: Financial obligation. "
+        data = base_text * 200 
         with open(FILE_PATH, 'w', encoding='utf-8') as f:
             f.write(data)
 
@@ -68,23 +121,20 @@ encode = lambda s: [stoi[c] for c in s if c in stoi]
 decode = lambda l: ''.join([itos[i] for i in l])
 
 data_tensor = torch.tensor(encode(text), dtype=torch.long)
-# Split for Train/Val loss logging
 n = int(0.9 * len(data_tensor))
 train_data = data_tensor[:n]
 val_data = data_tensor[n:]
 
 def get_batch(split='train'):
     data = train_data if split == 'train' else val_data
-    # Ensure we don't go out of bounds
     max_idx = len(data) - BLOCK_SIZE
     if max_idx <= 0: return torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.long).to(DEVICE), torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.long).to(DEVICE)
-    
     ix = torch.randint(max_idx, (BATCH_SIZE,))
     x = torch.stack([data[i:i+BLOCK_SIZE] for i in ix])
     y = torch.stack([data[i+1:i+BLOCK_SIZE+1] for i in ix])
     return x.to(DEVICE), y.to(DEVICE)
 
-# --- 4. Model Architecture ---
+# --- 3. Model Architecture ---
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -118,11 +168,10 @@ class TransformerModel(nn.Module):
 
 model = TransformerModel(vocab_size, EMBED_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT).to(DEVICE)
 
-# --- 5. Training & Loss Estimation ---
+# --- 4. Background Training Logic ---
 
 @torch.no_grad()
 def estimate_loss():
-    """ Helper to average losses across multiple batches for cleaner logging """
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -136,17 +185,24 @@ def estimate_loss():
     model.train()
     return out
 
-def train_and_save():
-    app.logger.info("Starting training sequence...")
+def training_thread_target():
+    global training_active, model_ready
+    training_active = True
+    
+    logger.info("Initializing training sequence on background thread...")
+    logger.info(f"Device: {DEVICE} | Batch Size: {BATCH_SIZE} | Iters: {MAX_ITERS}")
+    
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     model.train()
     
+    start_time = time.time()
+    
     for iter in range(MAX_ITERS + 1):
-        # Every 20 iterations, log both training and validation loss
         if iter % 20 == 0:
             losses = estimate_loss()
-            app.logger.info(f"Iter {iter:04d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f}")
-
+            elapsed = time.time() - start_time
+            logger.info(f"Iter {iter:04d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | T: {elapsed:.1f}s")
+        
         xb, yb = get_batch('train')
         logits = model(xb)
         loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
@@ -154,74 +210,103 @@ def train_and_save():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-    
+
     torch.save(model.state_dict(), MODEL_PATH)
-    app.logger.info(f"Training Complete. Model saved to {MODEL_PATH}")
+    logger.info(f"Training Complete. Model saved to {MODEL_PATH}")
+    training_active = False
+    model_ready = True
 
-def load_model():
-    if os.path.exists(MODEL_PATH):
-        app.logger.info("Loading existing model weights...")
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-        model.eval()
-    else:
-        app.logger.info("Model weights not found. Running training...")
-        train_and_save()
-        model.eval()
+def start_training_background():
+    if not training_active:
+        t = threading.Thread(target=training_thread_target)
+        t.daemon = True # Ensure thread dies if main app dies
+        t.start()
 
-# --- 6. Interaction Logging ---
-
-def log_api_call(req_id, prompt, generated, duration):
-    """ Structured JSON log for the generation event """
-    try:
-        log_data = {
-            "event": "prediction",
-            "id": req_id,
-            "duration_ms": round(duration, 2),
-            "chars_in": len(prompt),
-            "chars_out": len(generated) - len(prompt),
-            "prompt": prompt[:50] + "...",
-            "response": generated[-50:] if len(generated) > 50 else generated
-        }
-        app.logger.info(json.dumps(log_data))
-    except Exception as e:
-        app.logger.error(f"Logging failed: {e}")
-
-# --- 7. Flask Routes ---
+# --- 5. Web Interface & Routes ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>AI Control Center</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body { font-family: 'Inter', system-ui, sans-serif; background: #f8fafc; display: flex; justify-content: center; padding: 40px 20px; color: #1e293b; }
-        .card { background: white; padding: 32px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); width: 100%; max-width: 550px; border: 1px solid #e2e8f0; }
-        h2 { margin-top: 0; font-weight: 700; color: #0f172a; }
-        label { display: block; margin-bottom: 8px; font-weight: 500; font-size: 14px; color: #64748b; }
-        textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box; font-size: 16px; margin-bottom: 16px; outline: none; transition: border 0.2s; }
-        textarea:focus { border-color: #3b82f6; }
-        .btn-group { display: flex; gap: 10px; flex-direction: column; }
-        .primary-btn { background: #2563eb; color: white; border: none; padding: 14px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: 0.2s; }
-        .primary-btn:hover { background: #1d4ed8; }
-        .secondary-btn { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; padding: 10px; border-radius: 8px; font-weight: 500; cursor: pointer; text-decoration: none; text-align: center; font-size: 14px; }
-        .secondary-btn:hover { background: #e2e8f0; }
-        #output { margin-top: 24px; background: #f1f5f9; padding: 16px; border-radius: 10px; min-height: 80px; white-space: pre-wrap; font-size: 15px; border: 1px dashed #cbd5e1; color: #334155; }
-        .status { font-size: 12px; margin-top: 20px; color: #94a3b8; text-align: center; }
+        :root { --primary: #2563eb; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; --mono: #0f172a; }
+        body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 20px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; }
+        .container { width: 100%; max-width: 800px; display: grid; gap: 20px; }
+        
+        /* Card Styles */
+        .card { background: var(--card); padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
+        h2 { margin-top: 0; font-size: 1.25rem; font-weight: 700; color: #0f172a; display: flex; justify-content: space-between; align-items: center; }
+        
+        /* Console Styles */
+        .console-window { background: #1e1e1e; color: #10b981; font-family: 'Fira Code', monospace; padding: 16px; border-radius: 8px; height: 300px; overflow-y: auto; font-size: 13px; line-height: 1.5; border: 1px solid #334155; display: flex; flex-direction: column-reverse; /* Auto scroll to bottom trick */ }
+        .log-entry { border-bottom: 1px solid #333; padding: 2px 0; }
+        .log-time { color: #64748b; margin-right: 8px; user-select: none; }
+        
+        /* Input Styles */
+        textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-family: inherit; margin: 10px 0; box-sizing: border-box; resize: vertical; }
+        .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
+        button, .btn { padding: 10px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; border: none; font-size: 0.9rem; text-decoration: none; display: inline-block; text-align: center; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-secondary { background: #e2e8f0; color: #475569; }
+        .btn-secondary:hover { background: #cbd5e1; }
+        
+        /* Output Area */
+        #output { background: #f1f5f9; padding: 16px; border-radius: 8px; min-height: 60px; white-space: pre-wrap; margin-top: 10px; border-left: 4px solid var(--primary); }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h2>Financial AI Interface</h2>
-        <label for="prompt">Starting Text (Prompt)</label>
-        <textarea id="prompt">Equity</textarea>
-        <div class="btn-group">
-            <button class="primary-btn" onclick="generate()">Generate Prediction</button>
-            <a href="/download" class="secondary-btn">💾 Download Model Weights (.pth)</a>
+    <div class="container">
+        <!-- Live Training Console -->
+        <div class="card">
+            <h2>🚀 System Logs & Training Progress <span style="font-size:0.8em; font-weight:400; color:#64748b">Live Stream</span></h2>
+            <div id="console" class="console-window">
+                <!-- Logs appear here -->
+            </div>
+            <div style="margin-top: 10px; font-size: 12px; color: #64748b;">
+                System running on: {{ device }}
+            </div>
         </div>
-        <div id="output">Prediction will appear here...</div>
-        <div class="status">Running on {{ device }}</div>
+
+        <!-- Interaction Interface -->
+        <div class="card">
+            <h2>Financial AI Interface</h2>
+            <label style="font-weight: 500; font-size: 14px;">Context Prompt</label>
+            <textarea id="prompt">Equity</textarea>
+            
+            <div class="btn-group">
+                <button class="btn btn-primary" onclick="generate()">Generate Prediction</button>
+                <button class="btn btn-secondary" onclick="triggerTrain()">Restart Training</button>
+                <a href="/download" class="btn btn-secondary">💾 Download .pth</a>
+            </div>
+
+            <div id="output">Ready.</div>
+        </div>
     </div>
+
     <script>
+        // 1. Setup SSE for Real-time Logging
+        const consoleDiv = document.getElementById('console');
+        const eventSource = new EventSource('/logs');
+        
+        eventSource.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            const line = document.createElement('div');
+            line.className = 'log-entry';
+            line.innerText = data.text; // Log text already contains timestamp from python formatter
+            
+            // Append to top of the flex-reversed container (visually bottom)
+            consoleDiv.insertBefore(line, consoleDiv.firstChild); 
+        };
+
+        eventSource.onerror = function() {
+            // connection lost, maybe server restarting
+            console.log("Stream lost, retrying...");
+        };
+
+        // 2. Generation Logic
         async function generate() {
             const prompt = document.getElementById('prompt').value;
             const output = document.getElementById('output');
@@ -238,6 +323,12 @@ HTML_TEMPLATE = """
                 output.innerText = "Error communicating with server.";
             }
         }
+
+        async function triggerTrain() {
+            if(confirm("Start re-training? This will take a moment.")) {
+                fetch('/train', {method: 'POST'});
+            }
+        }
     </script>
 </body>
 </html>
@@ -247,24 +338,52 @@ HTML_TEMPLATE = """
 def home(): 
     return render_template_string(HTML_TEMPLATE, device=DEVICE)
 
+@app.route('/logs')
+def stream_logs():
+    """SSE Endpoint for streaming logs to browser"""
+    def generate():
+        q = broadcaster.listen()
+        while True:
+            msg = q.get()
+            yield msg
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+@app.route('/train', methods=['POST'])
+def manual_train():
+    if not training_active:
+        start_training_background()
+        return jsonify({"status": "Training started"})
+    return jsonify({"status": "Training already in progress"})
+
 @app.route('/download')
 def download_file():
     if os.path.exists(MODEL_PATH):
         return send_file(MODEL_PATH, as_attachment=True)
-    return "Model file not found.", 404
+    return "Model file not found. Please wait for training to complete.", 404
 
 @app.route('/generate', methods=['POST'])
 def api_generate():
+    global model_ready
     req_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
     prompt = request.json.get('prompt', 'Equity')
     
-    app.logger.info(f"API | Req: {req_id} | In: {prompt[:15]}...")
+    logger.info(f"API Request {req_id} | In: {prompt[:20]}...")
+
+    if not model_ready and not os.path.exists(MODEL_PATH):
+        return jsonify({'text': 'Model is currently training. Please check the log console above and wait...'})
+
+    # If model exists but not loaded (e.g. restarts), load it
+    if not model_ready and os.path.exists(MODEL_PATH):
+        try:
+            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+            model_ready = True
+        except:
+             return jsonify({'text': 'Model file corrupted or loading failed.'})
 
     try:
         context = torch.tensor(encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
     except KeyError:
-        return jsonify({'text': 'Error: Invalid characters in prompt.'})
+        return jsonify({'text': 'Error: Prompt contains unknown characters.'})
         
     generated = prompt
     model.eval()
@@ -275,13 +394,24 @@ def api_generate():
             next_char = torch.multinomial(probs, num_samples=1)
             context = torch.cat((context, next_char), dim=1)
             generated += decode([next_char.item()])
-    
-    duration = (time.time() - start_time) * 1000
-    log_api_call(req_id, prompt, generated, duration)
-
+            
+    logger.info(f"API Request {req_id} | Complete.")
     return jsonify({'text': generated})
 
 if __name__ == '__main__':
-    load_model()
+    # On startup, check if we need to train
+    if os.path.exists(MODEL_PATH):
+        logger.info("Existing model found. Loading...")
+        try:
+            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+            model_ready = True
+            logger.info("Model loaded. Server Ready.")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+    else:
+        logger.info("No model found. Starting background training...")
+        start_training_background()
+
     port = int(os.environ.get('PORT', 8080))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    # We must use threaded=True (default in recent Flask) for SSE and background threads to work well
+    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
