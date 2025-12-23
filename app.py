@@ -85,7 +85,7 @@ app = Flask(__name__)
 # --- Configuration ---
 FILE_PATH = 'text.txt'
 MODEL_PATH = 'financial_model.pth' 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 BLOCK_SIZE = 64
 MAX_ITERS = 100
 LEARNING_RATE = 3e-4
