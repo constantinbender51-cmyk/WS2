@@ -3,11 +3,46 @@ import torch.nn as nn
 import torch.optim as optim
 import math
 import os
+import logging
+import time
+import uuid
+import json
+import sys
 from flask import Flask, request, jsonify, render_template_string, send_file
+
+# --- 1. Custom Delayed Logging Handler ---
+class DelayedStreamHandler(logging.StreamHandler):
+    """
+    Custom handler that adds a small delay after every log emission.
+    This prevents log messages from racing each other in cloud consoles,
+    ensuring strictly ordered display.
+    """
+    def emit(self, record):
+        try:
+            super().emit(record)
+            self.flush() # Force flush to stdout
+            time.sleep(0.1) # The requested 0.1s delay
+        except Exception:
+            self.handleError(record)
+
+# --- 2. Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[
+        DelayedStreamHandler(sys.stdout)
+    ]
+)
+
+app = Flask(__name__)
+
+# Reduce noise from internal Flask logger to keep our custom logs clear
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
 
 # --- Configuration ---
 FILE_PATH = 'text.txt'
-MODEL_PATH = 'financial_model.pth' # The weights file
+MODEL_PATH = 'financial_model.pth' 
 BATCH_SIZE = 32
 BLOCK_SIZE = 64
 MAX_ITERS = 1000
@@ -18,9 +53,8 @@ NUM_LAYERS = 4
 DROPOUT = 0.1
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-app = Flask(__name__)
 
-# --- 1. Data & Tokenizer ---
+# --- 3. Data & Tokenizer ---
 
 def ensure_file_exists():
     if not os.path.exists(FILE_PATH):
@@ -48,7 +82,8 @@ def get_batch():
     y = torch.stack([train_data[i+1:i+BLOCK_SIZE+1] for i in ix])
     return x.to(DEVICE), y.to(DEVICE)
 
-# --- 2. Model Architecture ---
+
+# --- 4. Model Architecture ---
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -80,13 +115,13 @@ class TransformerModel(nn.Module):
         output = self.transformer_encoder(src, mask=mask)
         return self.decoder(output.permute(1, 0, 2))
 
-# Initialize model
 model = TransformerModel(vocab_size, EMBED_DIM, NUM_HEADS, NUM_LAYERS, DROPOUT).to(DEVICE)
 
-# --- 3. Persistence Logic ---
+
+# --- 5. Persistence Logic ---
 
 def train_and_save():
-    print(f"Starting training...")
+    app.logger.info("Starting training sequence...")
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     model.train()
@@ -97,21 +132,56 @@ def train_and_save():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        if iter % 500 == 0: print(f"Iter {iter}: Loss {loss.item():.4f}")
+        if iter % 200 == 0: 
+            # Logs here will now automatically pause for 0.1s
+            app.logger.info(f"Training Progress | Iter {iter} | Loss {loss.item():.4f}")
     
     torch.save(model.state_dict(), MODEL_PATH)
-    print(f"Model saved to {MODEL_PATH}")
+    app.logger.info(f"Training Complete. Model saved to {MODEL_PATH}")
 
 def load_model():
     if os.path.exists(MODEL_PATH):
-        print(f"Loading existing model...")
+        app.logger.info("Model file found. Loading weights...")
         model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
         model.eval()
+        app.logger.info("Model loaded successfully.")
     else:
+        app.logger.info("Model file missing. Initiating training...")
         train_and_save()
         model.eval()
 
-# --- 4. Web Interface & Routes ---
+
+# --- 6. Structured Logging Helper ---
+
+def log_interaction(req_id, prompt, generated_text, duration_ms):
+    """
+    Constructs a JSON audit log. 
+    The DelayedStreamHandler will ensure this prints cleanly.
+    """
+    try:
+        input_len = len(prompt)
+        output_len = len(generated_text) - input_len
+        
+        audit_entry = {
+            "event": "llm_generation",
+            "req_id": req_id,
+            "timestamp": time.time(),
+            "duration_ms": round(duration_ms, 2),
+            "input_chars": input_len,
+            "output_chars": output_len,
+            "prompt_snippet": prompt[:50] + "..." if len(prompt) > 50 else prompt,
+            "full_prompt": prompt,
+            "full_response": generated_text,
+            "model_device": DEVICE
+        }
+        
+        app.logger.info(json.dumps(audit_entry))
+        
+    except Exception as e:
+        app.logger.error(f"Logging Error: {e}")
+
+
+# --- 7. Web Interface & Routes ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -182,14 +252,24 @@ def download_file():
 
 @app.route('/generate', methods=['POST'])
 def api_generate():
+    req_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+    
     prompt = request.json.get('prompt', 'Equity')
+    
+    # This log will pause execution for 0.1s
+    app.logger.info(f"Incoming Request {req_id} | Prompt: {prompt[:15]}...")
+
     try:
         context = torch.tensor(encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
     except KeyError:
-        return jsonify({'text': 'Error: Prompt contains characters not seen in training.'})
+        err_msg = 'Error: Prompt contains characters not seen in training.'
+        app.logger.warning(f"Request {req_id} Failed: {err_msg}")
+        return jsonify({'text': err_msg})
         
     generated = prompt
     model.eval()
+    
     for _ in range(150):
         with torch.no_grad():
             logits = model(context[:, -BLOCK_SIZE:])[:, -1, :]
@@ -197,9 +277,16 @@ def api_generate():
             next_char = torch.multinomial(probs, num_samples=1)
             context = torch.cat((context, next_char), dim=1)
             generated += decode([next_char.item()])
+    
+    duration_ms = (time.time() - start_time) * 1000
+    
+    # This log (which is large) will also pause for 0.1s
+    log_interaction(req_id, prompt, generated, duration_ms)
+
     return jsonify({'text': generated})
 
 if __name__ == '__main__':
     load_model()
-    print(f"\nServer ready at http://0.0.0.0:")
-    app.run(debug=False, host='0.0.0.0', port=8080)
+    port = int(os.environ.get('PORT', 8080))
+    print(f"\nServer ready at http://0.0.0.0:{port}")
+    app.run(debug=False, host='0.0.0.0', port=port)
