@@ -132,7 +132,7 @@ def train_and_save():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        if iter % 200 == 0: 
+        if iter % 20 == 0: 
             # Logs here will now automatically pause for 0.1s
             app.logger.info(f"Training Progress | Iter {iter} | Loss {loss.item():.4f}")
     
