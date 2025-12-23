@@ -85,14 +85,14 @@ app = Flask(__name__)
 # --- Configuration ---
 FILE_PATH = 'text.txt'
 MODEL_PATH = 'financial_model.pth' 
-BATCH_SIZE = 32
-BLOCK_SIZE = 64
-MAX_ITERS = 10000
+BATCH_SIZE = 64
+BLOCK_SIZE = 256
+MAX_ITERS = 5000
 LEARNING_RATE = 3e-4
-EMBED_DIM = 128
-NUM_HEADS = 4
-NUM_LAYERS = 4
-DROPOUT = 0.1
+EMBED_DIM = 384
+NUM_HEADS = 6
+NUM_LAYERS = 6
+DROPOUT = 0.2
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Global Training State
