@@ -91,7 +91,7 @@ MAX_ITERS = 100
 LEARNING_RATE = 3e-4
 EMBED_DIM = 384
 NUM_HEADS = 6
-NUM_LAYERS = 6
+NUM_LAYERS = 5
 DROPOUT = 0.1
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
