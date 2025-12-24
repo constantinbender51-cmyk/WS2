@@ -10,11 +10,12 @@ import json
 import sys
 import threading
 import queue
+import shutil
 from flask import Flask, request, jsonify, render_template_string, send_file, Response, stream_with_context
 
-# --- 1. Real-Time Logging Architecture ---
+# --- 1. Real-Time Logging & Data Architecture ---
 
-# Global broadcaster to send logs to multiple connected web clients
+# Global broadcaster to send logs and metrics to multiple connected web clients
 class LogBroadcaster:
     def __init__(self):
         self.listeners = []
@@ -25,14 +26,15 @@ class LogBroadcaster:
         q = queue.Queue()
         self.listeners.append(q)
         # Replay history so new users see what happened recently
-        for msg in self.history[-30:]:
+        for msg in self.history[-50:]:
             q.put(msg)
         return q
 
-    def broadcast(self, message):
+    def broadcast(self, data_dict):
         """Push a message to all active listeners"""
         # Format as Server-Sent Event (SSE) data
-        payload = f"data: {json.dumps({'text': message})}\n\n"
+        # data_dict should have a 'type': 'log' or 'metric'
+        payload = f"data: {json.dumps(data_dict)}\n\n"
         
         self.history.append(payload)
         if len(self.history) > 200: self.history.pop(0)
@@ -60,11 +62,11 @@ class StreamLogger(logging.StreamHandler):
             sys.stdout.write(msg + '\n')
             sys.stdout.flush()
             
-            # 2. Send to Web Frontend
-            broadcaster.broadcast(msg)
+            # 2. Send to Web Frontend as a 'log' type event
+            broadcaster.broadcast({'type': 'log', 'text': msg})
             
-            # 3. Requested Delay for sequencing accuracy
-            time.sleep(0.1) 
+            # 3. Small delay to prevent event flooding
+            time.sleep(0.01) 
         except Exception:
             self.handleError(record)
 
@@ -87,7 +89,7 @@ FILE_PATH = 'text.txt'
 MODEL_PATH = 'financial_model.pth' 
 BATCH_SIZE = 64
 BLOCK_SIZE = 256
-MAX_ITERS = 100
+MAX_ITERS = 100000  # Increased to 100k for long training
 LEARNING_RATE = 3e-4
 EMBED_DIM = 384
 NUM_HEADS = 6
@@ -185,24 +187,55 @@ def estimate_loss():
     model.train()
     return out
 
+def save_checkpoint(filename):
+    """Atomic save to avoid corruption during download"""
+    temp_name = filename + ".tmp"
+    torch.save(model.state_dict(), temp_name)
+    os.replace(temp_name, filename)
+
 def training_thread_target():
     global training_active, model_ready
     training_active = True
     
-    logger.info("Initializing training sequence on background thread...")
-    logger.info(f"Device: {DEVICE} | Batch Size: {BATCH_SIZE} | Iters: {MAX_ITERS}")
-    
+    logger.info("Initializing training sequence...")
+    logger.info(f"Target: {MAX_ITERS} iterations | Device: {DEVICE}")
+
+    # Persistence: Load existing model if available to resume/finetune
+    if os.path.exists(MODEL_PATH):
+        try:
+            logger.info("Found existing model. Loading weights to resume training...")
+            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+            model_ready = True
+        except Exception as e:
+            logger.error(f"Could not load existing model: {e}")
+
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     model.train()
     
     start_time = time.time()
     
     for iter in range(MAX_ITERS + 1):
-        if iter % 20 == 0:
+        # Monitoring: Every 100 iters, check loss and update graph
+        if iter % 100 == 0:
             losses = estimate_loss()
             elapsed = time.time() - start_time
-            logger.info(f"Iter {iter:04d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | T: {elapsed:.1f}s")
+            
+            # Log to console
+            logger.info(f"Iter {iter:06d} | Train: {losses['train']:.4f} | Val: {losses['val']:.4f} | T: {elapsed:.1f}s")
+            
+            # Send data to Graph
+            broadcaster.broadcast({
+                'type': 'metric',
+                'iter': iter,
+                'train_loss': losses['train'],
+                'val_loss': losses['val']
+            })
         
+        # Checkpointing: Every 500 iters, save to disk so user can download
+        if iter > 0 and iter % 500 == 0:
+            save_checkpoint(MODEL_PATH)
+            # logger.info("Checkpoint saved.") 
+
         xb, yb = get_batch('train')
         logits = model(xb)
         loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
@@ -211,15 +244,15 @@ def training_thread_target():
         loss.backward()
         optimizer.step()
 
-    torch.save(model.state_dict(), MODEL_PATH)
-    logger.info(f"Training Complete. Model saved to {MODEL_PATH}")
+    save_checkpoint(MODEL_PATH)
+    logger.info(f"Training Complete. Final model saved to {MODEL_PATH}")
     training_active = False
     model_ready = True
 
 def start_training_background():
     if not training_active:
         t = threading.Thread(target=training_thread_target)
-        t.daemon = True # Ensure thread dies if main app dies
+        t.daemon = True 
         t.start()
 
 # --- 5. Web Interface & Routes ---
@@ -228,25 +261,29 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AI Control Center</title>
+    <title>AI Training Monitor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Chart.js for Graphing -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; --mono: #0f172a; }
         body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 20px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; }
-        .container { width: 100%; max-width: 800px; display: grid; gap: 20px; }
+        .container { width: 100%; max-width: 900px; display: grid; gap: 20px; }
         
         /* Card Styles */
         .card { background: var(--card); padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
         h2 { margin-top: 0; font-size: 1.25rem; font-weight: 700; color: #0f172a; display: flex; justify-content: space-between; align-items: center; }
         
         /* Console Styles */
-        .console-window { background: #1e1e1e; color: #10b981; font-family: 'Fira Code', monospace; padding: 16px; border-radius: 8px; height: 300px; overflow-y: auto; font-size: 13px; line-height: 1.5; border: 1px solid #334155; display: flex; flex-direction: column-reverse; /* Auto scroll to bottom trick */ }
+        .console-window { background: #1e1e1e; color: #10b981; font-family: 'Fira Code', monospace; padding: 16px; border-radius: 8px; height: 200px; overflow-y: auto; font-size: 12px; line-height: 1.5; border: 1px solid #334155; display: flex; flex-direction: column-reverse; }
         .log-entry { border-bottom: 1px solid #333; padding: 2px 0; }
-        .log-time { color: #64748b; margin-right: 8px; user-select: none; }
         
+        /* Graph Styles */
+        .chart-container { position: relative; height: 300px; width: 100%; }
+
         /* Input Styles */
-        textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-family: inherit; margin: 10px 0; box-sizing: border-box; resize: vertical; }
-        .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
+        textarea { width: 100%; height: 80px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-family: inherit; margin: 10px 0; box-sizing: border-box; resize: vertical; }
+        .btn-group { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;}
         button, .btn { padding: 10px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; border: none; font-size: 0.9rem; text-decoration: none; display: inline-block; text-align: center; }
         .btn-primary { background: var(--primary); color: white; }
         .btn-primary:hover { opacity: 0.9; }
@@ -259,54 +296,107 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <!-- Live Training Console -->
+        
+        <!-- Live Graph -->
         <div class="card">
-            <h2>🚀 System Logs & Training Progress <span style="font-size:0.8em; font-weight:400; color:#64748b">Live Stream</span></h2>
-            <div id="console" class="console-window">
-                <!-- Logs appear here -->
-            </div>
-            <div style="margin-top: 10px; font-size: 12px; color: #64748b;">
-                System running on: {{ device }}
+            <h2>📈 Training Loss Monitor</h2>
+            <div class="chart-container">
+                <canvas id="lossChart"></canvas>
             </div>
         </div>
 
-        <!-- Interaction Interface -->
+        <!-- Live Console -->
         <div class="card">
-            <h2>Financial AI Interface</h2>
-            <label style="font-weight: 500; font-size: 14px;">Context Prompt</label>
+            <h2>🚀 System Logs <span style="font-size:0.8em; font-weight:400; color:#64748b">Iter: <span id="iter-count">0</span></span></h2>
+            <div id="console" class="console-window"></div>
+        </div>
+
+        <!-- Controls -->
+        <div class="card">
+            <h2>Model Controls</h2>
             <textarea id="prompt">Equity</textarea>
             
             <div class="btn-group">
-                <button class="btn btn-primary" onclick="generate()">Generate Prediction</button>
+                <button class="btn btn-primary" onclick="generate()">Test Model</button>
                 <button class="btn btn-secondary" onclick="triggerTrain()">Restart Training</button>
-                <a href="/download" class="btn btn-secondary">💾 Download .pth</a>
+                <a href="/download" class="btn btn-secondary">💾 Download Checkpoint (.pth)</a>
             </div>
-
             <div id="output">Ready.</div>
         </div>
     </div>
 
     <script>
-        // 1. Setup SSE for Real-time Logging
+        // 1. Setup Chart.js
+        const ctx = document.getElementById('lossChart').getContext('2d');
+        const lossChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Train Loss',
+                    borderColor: '#2563eb',
+                    backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                    data: [],
+                    tension: 0.4
+                }, {
+                    label: 'Val Loss',
+                    borderColor: '#dc2626',
+                    backgroundColor: 'rgba(220, 38, 38, 0.1)',
+                    data: [],
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false, // Disable animation for performance
+                scales: {
+                    x: { title: { display: true, text: 'Iterations' } },
+                    y: { title: { display: true, text: 'Loss' } }
+                }
+            }
+        });
+
+        // 2. Setup SSE for Real-time Logging & Metrics
         const consoleDiv = document.getElementById('console');
+        const iterSpan = document.getElementById('iter-count');
         const eventSource = new EventSource('/logs');
         
         eventSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
-            const line = document.createElement('div');
-            line.className = 'log-entry';
-            line.innerText = data.text; // Log text already contains timestamp from python formatter
             
-            // Append to top of the flex-reversed container (visually bottom)
-            consoleDiv.insertBefore(line, consoleDiv.firstChild); 
+            if (data.type === 'log') {
+                // Handle text log
+                const line = document.createElement('div');
+                line.className = 'log-entry';
+                line.innerText = data.text;
+                consoleDiv.insertBefore(line, consoleDiv.firstChild);
+            } 
+            else if (data.type === 'metric') {
+                // Handle graph update
+                iterSpan.innerText = data.iter;
+                
+                // Add data point
+                lossChart.data.labels.push(data.iter);
+                lossChart.data.datasets[0].data.push(data.train_loss);
+                lossChart.data.datasets[1].data.push(data.val_loss);
+                
+                // Keep chart from getting too crowded (keep last 100 points)
+                if (lossChart.data.labels.length > 100) {
+                    lossChart.data.labels.shift();
+                    lossChart.data.datasets[0].data.shift();
+                    lossChart.data.datasets[1].data.shift();
+                }
+                
+                lossChart.update();
+            }
         };
 
         eventSource.onerror = function() {
-            // connection lost, maybe server restarting
             console.log("Stream lost, retrying...");
         };
 
-        // 2. Generation Logic
+        // 3. Interaction Logic
         async function generate() {
             const prompt = document.getElementById('prompt').value;
             const output = document.getElementById('output');
@@ -325,7 +415,7 @@ HTML_TEMPLATE = """
         }
 
         async function triggerTrain() {
-            if(confirm("Start re-training? This will take a moment.")) {
+            if(confirm("Restart training? This will continue from current weights but reset the loop.")) {
                 fetch('/train', {method: 'POST'});
             }
         }
@@ -359,7 +449,7 @@ def manual_train():
 def download_file():
     if os.path.exists(MODEL_PATH):
         return send_file(MODEL_PATH, as_attachment=True)
-    return "Model file not found. Please wait for training to complete.", 404
+    return "Model file not found. Please wait for training to initialize.", 404
 
 @app.route('/generate', methods=['POST'])
 def api_generate():
@@ -369,16 +459,16 @@ def api_generate():
     
     logger.info(f"API Request {req_id} | In: {prompt[:20]}...")
 
-    if not model_ready and not os.path.exists(MODEL_PATH):
-        return jsonify({'text': 'Model is currently training. Please check the log console above and wait...'})
-
-    # If model exists but not loaded (e.g. restarts), load it
+    # Auto-load if exists but not loaded
     if not model_ready and os.path.exists(MODEL_PATH):
         try:
             model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
             model_ready = True
         except:
-             return jsonify({'text': 'Model file corrupted or loading failed.'})
+             pass
+
+    if not model_ready:
+        return jsonify({'text': 'Model is currently training/initializing. Please wait...'})
 
     try:
         context = torch.tensor(encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
@@ -399,19 +489,8 @@ def api_generate():
     return jsonify({'text': generated})
 
 if __name__ == '__main__':
-    # On startup, check if we need to train
-    if os.path.exists(MODEL_PATH):
-        logger.info("Existing model found. Loading...")
-        try:
-            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-            model_ready = True
-            logger.info("Model loaded. Server Ready.")
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-    else:
-        logger.info("No model found. Starting background training...")
-        start_training_background()
+    # On startup, start background training (which will load existing model if found)
+    start_training_background()
 
     port = int(os.environ.get('PORT', 8080))
-    # We must use threaded=True (default in recent Flask) for SSE and background threads to work well
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
