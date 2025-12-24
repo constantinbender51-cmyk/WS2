@@ -93,8 +93,8 @@ MAX_ITERS = 100000  # Increased to 100k for long training
 LEARNING_RATE = 3e-4
 EMBED_DIM = 384
 NUM_HEADS = 6
-NUM_LAYERS = 5
-DROPOUT = 0.1
+NUM_LAYERS = 4
+DROPOUT = 0.2
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Global Training State
