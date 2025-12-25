@@ -7,8 +7,9 @@ import matplotlib
 # Set backend to Agg for server (headless) rendering
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 
-from flask import Flask, send_file, make_response
+from flask import Flask, send_file
 from gymnasium import spaces
 import gymnasium as gym
 from sklearn.preprocessing import StandardScaler
@@ -19,15 +20,15 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 WINDOW_SIZE = 30
-# Reduced steps for web demo speed (prevent timeout). 
-# In production, increase this to 50,000+
-TRAINING_STEPS = 8000  
+# Training steps. Increase to 50000+ for better results if time permits.
+TRAINING_STEPS = 10000  
 TRAIN_TEST_SPLIT = 0.8
 INITIAL_BALANCE = 10000.0
 
 # Map discrete actions (0-10) to Leverage (-5 to 5)
 LEVERAGE_MAP = {i: i - 5 for i in range(11)}
 
+# Exact metrics from your file
 METRICS_TO_FETCH = [
     {"slug": "market-price", "key": "price"},
     {"slug": "hash-rate", "key": "hash"},
@@ -36,41 +37,78 @@ METRICS_TO_FETCH = [
     {"slug": "trade-volume", "key": "volume"}
 ]
 
-# --- DATA FETCHING (Cached in memory to speed up re-runs) ---
+BASE_URL = "https://api.blockchain.info/charts/{slug}"
+
+# --- DATA FETCHING (COPIED FROM YOUR FILE) ---
 _DATA_CACHE = None
 
-def fetch_data():
+def fetch_single_metric(slug):
+    """
+    Fetches data using the EXACT logic from binance_analysis (8).py
+    """
+    url = BASE_URL.format(slug=slug)
+    
+    # Parameters exactly as in your working file
+    params = {
+        "timespan": "all",
+        "format": "json", 
+        "sampled": "false"
+    }
+    
+    # User-Agent is crucial to avoid 403 Forbidden errors
+    headers = {"User-Agent": "Mozilla/5.0 (Cloud Deployment)"}
+    
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'values' in data:
+            df = pd.DataFrame(data['values'])
+            df['date'] = pd.to_datetime(df['x'], unit='s')
+            df.set_index('date', inplace=True)
+            
+            # Filter 2018+
+            df = df[df.index >= '2018-01-01']
+            
+            # Return just the Y value (metric value)
+            return df['y']
+    except Exception as e:
+        print(f"Error fetching {slug}: {e}")
+        return None
+
+def fetch_and_prepare_data():
     global _DATA_CACHE
     if _DATA_CACHE is not None:
         return _DATA_CACHE
 
     print("Fetching data from Blockchain.com...")
-    base_url = "https://api.blockchain.info/charts/{slug}"
     data_frames = []
 
     for item in METRICS_TO_FETCH:
-        url = base_url.format(slug=item['slug'])
-        params = {"timespan": "all", "format": "json", "sampled": "false"}
-        try:
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            df = pd.DataFrame(resp.json()['values'])
-            df['date'] = pd.to_datetime(df['x'], unit='s')
-            df.set_index('date', inplace=True)
-            df = df.rename(columns={'y': item['key']})[['key']]
-            # Filter 2018+
-            df = df[df.index >= '2018-01-01']
+        series = fetch_single_metric(item['slug'])
+        if series is not None:
+            # Rename series to the key (e.g., 'price', 'hash')
+            df = series.to_frame(name=item['key'])
             data_frames.append(df)
-        except Exception as e:
-            print(f"Error fetching {item['slug']}: {e}")
+        else:
+            print(f"Failed to load {item['slug']}")
             return None
 
+    # Merge all metrics on date index
     full_df = pd.concat(data_frames, axis=1).dropna()
     
-    # Feature Engineering
-    vol_tx_ratio = full_df['volume'] / full_df['tx_count']
-    weekly_avg = vol_tx_ratio.resample('W').mean()
-    full_df['vol_tx_weekly'] = weekly_avg.reindex(full_df.index).ffill()
+    # --- Feature Engineering ---
+    # Derived Metric: Volume / Transactions (Weekly)
+    # We calculate the weekly mean, then reindex back to daily + forward fill
+    if 'volume' in full_df.columns and 'tx_count' in full_df.columns:
+        vol_tx_ratio = full_df['volume'] / full_df['tx_count']
+        weekly_avg = vol_tx_ratio.resample('W').mean()
+        full_df['vol_tx_weekly'] = weekly_avg.reindex(full_df.index).ffill()
+    else:
+        # Fallback if specific columns fail
+        full_df['vol_tx_weekly'] = 0
+
     full_df.dropna(inplace=True)
     
     _DATA_CACHE = full_df
@@ -78,11 +116,16 @@ def fetch_data():
 
 def preprocess_data(df):
     df = df.copy()
+    # Daily return for environment simulation
     df['pct_change'] = df['price'].pct_change().fillna(0)
     
     feature_cols = ['price', 'hash', 'tx_count', 'revenue', 'volume', 'vol_tx_weekly']
-    features = df[feature_cols].values
+    
+    # Ensure all columns exist
+    valid_cols = [c for c in feature_cols if c in df.columns]
+    features = df[valid_cols].values
 
+    # Normalize inputs for LSTM
     scaler = StandardScaler()
     normalized_features = scaler.fit_transform(features)
     
@@ -96,7 +139,11 @@ class CryptoTradingEnv(gym.Env):
         self.features = features
         self.n_features = features.shape[1]
         self.window_size = WINDOW_SIZE
-        self.action_space = spaces.Discrete(11) # -5 to +5
+        
+        # Action: 0 to 10 (mapped to -5 to +5 leverage)
+        self.action_space = spaces.Discrete(11) 
+        
+        # Observation: Matrix of shape (WINDOW_SIZE, n_features)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, 
             shape=(self.window_size, self.n_features), 
@@ -126,7 +173,10 @@ class CryptoTradingEnv(gym.Env):
         if self.current_step >= len(self.df) - 1:
             return self._get_observation(), 0, True, False, {}
         
+        # Market move happens 'tomorrow'
         current_price_change = self.df['pct_change'].iloc[self.current_step]
+        
+        # Calculate PnL: Leverage * %Change
         step_return = target_leverage * current_price_change
         self.portfolio_value *= (1 + step_return)
         
@@ -135,6 +185,7 @@ class CryptoTradingEnv(gym.Env):
         if len(self.returns_history) > 20:
             mean_ret = np.mean(self.returns_history[-30:])
             std_ret = np.std(self.returns_history[-30:]) + 1e-9
+            # Reward is Sharpe Ratio of rolling window
             reward = mean_ret / std_ret
         else:
             reward = step_return
@@ -144,7 +195,7 @@ class CryptoTradingEnv(gym.Env):
         
         self.history['portfolio'].append(self.portfolio_value)
         
-        # Benchmark logic
+        # Benchmark logic (Buy & Hold 1x)
         if not self.history['benchmark']:
             self.history['benchmark'].append(self.initial_balance)
         else:
@@ -159,12 +210,12 @@ class CryptoTradingEnv(gym.Env):
 def home():
     return """
     <div style="font-family: sans-serif; max-width: 600px; margin: 50px auto; text-align: center;">
-        <h1>LSTM Crypto Trader</h1>
+        <h1>LSTM Crypto Trader (Revised)</h1>
         <p>Model: Recurrent PPO (LSTM) | Action Space: -5x to 5x Leverage</p>
-        <p>Data: Blockchain.com (Price, Hash, Tx, Revenue, Vol/Tx)</p>
+        <p>Data Source: Blockchain.com (Direct API Fetch)</p>
         <hr>
         <a href="/train_and_plot" style="
-            background-color: #007bff; color: white; padding: 15px 30px; 
+            background-color: #28a745; color: white; padding: 15px 30px; 
             text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 18px;">
             Run Analysis & Generate Plot
         </a>
@@ -176,21 +227,22 @@ def home():
 
 @app.route('/train_and_plot')
 def run_strategy():
-    # 1. Prepare Data
-    raw_df = fetch_data()
-    if raw_df is None:
-        return "Error fetching data from Blockchain.com"
+    # 1. Fetch Data
+    raw_df = fetch_and_prepare_data()
+    if raw_df is None or raw_df.empty:
+        return "Error: Could not fetch data. Please check logs."
         
     df, norm_features = preprocess_data(raw_df)
     
-    # Split
+    # Split Data
     split_idx = int(len(df) * TRAIN_TEST_SPLIT)
     train_df = df.iloc[:split_idx]
     train_feat = norm_features[:split_idx]
     test_df = df.iloc[split_idx:]
     test_feat = norm_features[split_idx:]
 
-    # 2. Train
+    # 2. Train Model
+    # Create Vectorized Environment for SB3
     train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat)])
     
     model = RecurrentPPO(
@@ -204,6 +256,7 @@ def run_strategy():
         policy_kwargs={"lstm_hidden_size": 64, "enable_critic_lstm": True}
     )
     
+    # Train
     model.learn(total_timesteps=TRAINING_STEPS)
 
     # 3. Backtest
@@ -215,7 +268,7 @@ def run_strategy():
         action, _states = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = test_env.step(action)
 
-    # 4. Plotting
+    # 4. Plot Results
     history = test_env.history
     portfolio = np.array(history['portfolio'])
     benchmark = np.array(history['benchmark'])
@@ -235,19 +288,19 @@ def run_strategy():
     s_sharpe = get_sharpe(portfolio)
     b_sharpe = get_sharpe(benchmark)
 
-    # Figure
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(dates, portfolio, label=f'AI Strategy (Sharpe: {s_sharpe:.2f})', color='#28a745')
+    ax.plot(dates, portfolio, label=f'AI Strategy (Sharpe: {s_sharpe:.2f})', color='#007bff')
     ax.plot(dates, benchmark, label=f'Buy & Hold (Sharpe: {b_sharpe:.2f})', color='#6c757d', linestyle='--')
     
     ax.set_title(f'RL Strategy vs Benchmark (Test Data)\nSteps Trained: {TRAINING_STEPS}')
     ax.set_ylabel('Portfolio Value ($)')
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.xticks(rotation=30)
     plt.tight_layout()
 
-    # Output to buffer
+    # Save to buffer
     img_buffer = io.BytesIO()
     plt.savefig(img_buffer, format='png', dpi=100)
     img_buffer.seek(0)
