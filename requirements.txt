@@ -1,7 +1,8 @@
-requests
-pandas
-numpy
-matplotlib
-flask
-torch
-torchvision
+pandas 
+numpy 
+matplotlib 
+requests 
+gymnasium 
+stable-baselines3 
+sb3-contrib 
+scikit-learn
