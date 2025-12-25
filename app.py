@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 import logging
 import sys
+import traceback
 
 from flask import Flask, jsonify, render_template_string, send_file
 from gymnasium import spaces
@@ -21,22 +22,14 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib import RecurrentPPO
 
-# --- LOGGING ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("RL_Trader")
-
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
 WINDOW_SIZE = 30
-TRAINING_STEPS = 30000  # ~10 passes through the dataset
+TRAINING_STEPS = 30000 
 TRAIN_TEST_SPLIT = 0.8
 INITIAL_BALANCE = 10000.0
-TRADING_FEE = 0.001  # 0.1% fee per leverage unit changed
+TRADING_FEE = 0.001 
 
 # --- SHARED STATE ---
 GLOBAL_STATE = {
@@ -46,9 +39,10 @@ GLOBAL_STATE = {
     "total_steps": TRAINING_STEPS,
     "metrics": {
         "portfolio": [],      
-        "mean_rewards": [],   # To track learning progress
-        "actions": [0] * 11   # To track what moves it's choosing
+        "mean_rewards": [],
+        "actions": [0] * 11
     },
+    "logs": [],  # Store logs here for the frontend
     "error_msg": "",
     "final_plot_ready": False,
     "results": {}
@@ -57,7 +51,39 @@ GLOBAL_STATE = {
 state_lock = threading.Lock()
 worker_thread_started = False
 
-# Mapping: 0->-5, 5->0, 10->+5
+# --- CUSTOM LOGGING HANDLER ---
+class ListHandler(logging.Handler):
+    """
+    Redirects logs to the GLOBAL_STATE list so they show up in the web UI.
+    """
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            with state_lock:
+                GLOBAL_STATE["logs"].append(log_entry)
+                # Keep only last 500 logs to save memory
+                if len(GLOBAL_STATE["logs"]) > 500:
+                    GLOBAL_STATE["logs"].pop(0)
+        except Exception:
+            self.handleError(record)
+
+# Setup Logger
+logger = logging.getLogger("RL_Trader")
+logger.setLevel(logging.INFO)
+
+# 1. Console Handler (Standard Output for Railway/Docker)
+c_handler = logging.StreamHandler(sys.stdout)
+c_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+c_handler.setFormatter(c_format)
+logger.addHandler(c_handler)
+
+# 2. Web List Handler (For the Dashboard)
+l_handler = ListHandler()
+l_format = logging.Formatter('[%(levelname)s] %(message)s')
+l_handler.setFormatter(l_format)
+logger.addHandler(l_handler)
+
+# --- CONSTANTS ---
 LEVERAGE_MAP = {i: i - 5 for i in range(11)}
 
 METRICS_TO_FETCH = [
@@ -75,6 +101,7 @@ def fetch_single_metric(slug):
     params = {"timespan": "all", "format": "json", "sampled": "false"}
     headers = {"User-Agent": "Mozilla/5.0 (Cloud Deployment)"}
     try:
+        logger.info(f"Fetching {slug}...")
         response = requests.get(url, params=params, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -88,13 +115,14 @@ def fetch_single_metric(slug):
         return None
 
 def fetch_and_prepare_data():
-    logger.info("Fetching Blockchain.com data...")
+    logger.info("Starting batch data fetch...")
     data_frames = []
     for item in METRICS_TO_FETCH:
         series = fetch_single_metric(item['slug'])
         if series is not None:
             data_frames.append(series.to_frame(name=item['key']))
         else:
+            logger.error(f"Failed to fetch {item['slug']}")
             return None
 
     full_df = pd.concat(data_frames, axis=1).dropna()
@@ -108,19 +136,24 @@ def fetch_and_prepare_data():
         full_df['vol_tx_weekly'] = 0
 
     full_df.dropna(inplace=True)
+    logger.info(f"Data prepared: {len(full_df)} rows.")
     return full_df
 
 def preprocess_data(df):
     df = df.copy()
     df['pct_change'] = df['price'].pct_change().fillna(0)
-    
-    # Add rolling volatility for the state (helps agent see risk)
     df['volatility'] = df['pct_change'].rolling(window=7).std().fillna(0)
     
     feature_cols = ['price', 'hash', 'tx_count', 'revenue', 'volume', 'vol_tx_weekly', 'volatility']
     valid_cols = [c for c in feature_cols if c in df.columns]
     
     features = df[valid_cols].values
+    
+    # Sanity check for NaNs
+    if np.isnan(features).any():
+        logger.warning("NaNs detected in features! Filling with 0.")
+        features = np.nan_to_num(features)
+
     scaler = StandardScaler()
     normalized_features = scaler.fit_transform(features)
     
@@ -158,95 +191,104 @@ class CryptoTradingEnv(gym.Env):
         
     def _get_observation(self):
         obs = self.features[self.current_step - self.window_size : self.current_step]
-        return obs.astype(np.float32)
+        # Protect against NaNs in observation which kill the LSTM
+        return np.nan_to_num(obs).astype(np.float32)
 
     def step(self, action):
-        # 1. Parse Action
-        if isinstance(action, np.ndarray): action_val = int(action.item())
-        else: action_val = int(action)
-        
-        target_leverage = LEVERAGE_MAP[action_val]
-        
-        # 2. Update Stats (Dashboard)
-        if self.is_training:
-             with state_lock:
-                 GLOBAL_STATE["metrics"]["actions"][action_val] += 1
+        try:
+            # 1. Parse Action
+            if isinstance(action, np.ndarray): action_val = int(action.item())
+            else: action_val = int(action)
+            
+            target_leverage = LEVERAGE_MAP[action_val]
+            
+            # 2. Update Stats
+            if self.is_training:
+                 with state_lock:
+                     GLOBAL_STATE["metrics"]["actions"][action_val] += 1
 
-        # 3. Check for Data End
-        if self.current_step >= len(self.df) - 1:
-            return self._get_observation(), 0, True, False, {}
+            # 3. Check for Data End
+            if self.current_step >= len(self.df) - 1:
+                return self._get_observation(), 0, True, False, {}
 
-        # 4. Execute Trade Logic
-        # Calculate Cost to change position
-        leverage_change = abs(target_leverage - self.current_leverage)
-        cost_percent = leverage_change * TRADING_FEE
-        
-        # Market Move
-        market_return = self.df['pct_change'].iloc[self.current_step]
-        
-        # Portfolio Move: (Leverage * Market) - Costs
-        gross_return = (target_leverage * market_return)
-        net_return = gross_return - cost_percent
-        
-        self.portfolio_value *= (1 + net_return)
-        self.current_leverage = target_leverage
-        
-        # 5. Reward Engineering (The most important part)
-        
-        # A. Bankruptcy Penalty (Survival Constraint)
-        # If we lose 50% of the account, kill the episode.
-        if self.portfolio_value < self.initial_balance * 0.5:
-            done = True
-            reward = -100  # massive penalty
+            # 4. Market Moves
+            market_return = self.df['pct_change'].iloc[self.current_step]
+            
+            # Sanity Check for bad data
+            if np.isnan(market_return) or np.isinf(market_return):
+                market_return = 0
+                logger.warning(f"Bad data at step {self.current_step}")
+
+            # Cost Calculation
+            leverage_change = abs(target_leverage - self.current_leverage)
+            cost_percent = leverage_change * TRADING_FEE
+            
+            # PnL Calculation
+            gross_return = (target_leverage * market_return)
+            net_return = gross_return - cost_percent
+            
+            self.portfolio_value *= (1 + net_return)
+            self.current_leverage = target_leverage
+            
+            # 5. Reward & Done Logic
+            done = False
+            
+            # BANKRUPTCY CHECK
+            if self.portfolio_value < self.initial_balance * 0.4:
+                done = True
+                reward = -100 # Heavy penalty
+            else:
+                # Reward: Log Return normalized for stability
+                # Using log return handles compounding better
+                reward = np.log(1 + net_return + 1e-9) * 10 
+                
+                # Volatility Penalty
+                volatility = self.df['volatility'].iloc[self.current_step]
+                if abs(target_leverage) > 2 and volatility > 0.03:
+                    reward -= 1.0
+
+            # Dashboard Updates
+            if self.is_training:
+                with state_lock:
+                    if self.current_step % 50 == 0:
+                        GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
+
+            # 6. Advance
+            self.current_step += 1
+            if self.current_step >= len(self.df) - 1:
+                done = True
+            
+            self.history['portfolio'].append(self.portfolio_value)
+            
+            # Benchmark Update
+            if not self.history['benchmark']:
+                self.history['benchmark'].append(self.initial_balance)
+            else:
+                prev = self.history['benchmark'][-1]
+                self.history['benchmark'].append(prev * (1 + market_return))
+
             return self._get_observation(), reward, done, False, {}
-            
-        # B. Sharpe-Optimized Reward
-        # Reward = Return - (Volatility Penalty)
-        # We scale return by 100 to make it significant for the Neural Net
-        reward = (net_return * 100) 
-        
-        # Penalize holding max leverage if market is volatile (soft constraint)
-        volatility = self.df['volatility'].iloc[self.current_step]
-        if abs(target_leverage) > 3 and volatility > 0.02:
-            reward -= 0.5 # discourage reckless leverage in high vol
-            
-        # Update Dashboard
-        if self.is_training:
-            with state_lock:
-                if self.current_step % 50 == 0:
-                    GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
-                    # Also track rolling mean reward roughly
-                    GLOBAL_STATE["metrics"]["mean_rewards"].append(float(reward))
 
-        # 6. Advance
-        self.current_step += 1
-        done = (self.current_step >= len(self.df) - 1)
-        
-        self.history['portfolio'].append(self.portfolio_value)
-        
-        # Benchmark
-        if not self.history['benchmark']:
-            self.history['benchmark'].append(self.initial_balance)
-        else:
-            prev = self.history['benchmark'][-1]
-            self.history['benchmark'].append(prev * (1 + market_return))
-
-        return self._get_observation(), reward, done, False, {}
+        except Exception as e:
+            logger.error(f"Error in env step {self.current_step}: {e}")
+            # Return safe values to prevent crash, but terminate episode
+            return self._get_observation(), 0, True, False, {}
 
 # --- WORKER ---
 def training_worker():
-    logger.info("WORKER: Started.")
+    logger.info("Background Worker: Started.")
     try:
         with state_lock:
             GLOBAL_STATE["status"] = "fetching"
             GLOBAL_STATE["message"] = "Fetching Data..."
         
         raw_df = fetch_and_prepare_data()
-        if raw_df is None or raw_df.empty: raise Exception("No Data")
+        if raw_df is None or raw_df.empty: 
+            raise Exception("Data fetch returned empty or None")
 
         with state_lock:
             GLOBAL_STATE["status"] = "preprocessing"
-            GLOBAL_STATE["message"] = "Processing..."
+            GLOBAL_STATE["message"] = "Processing Data..."
             
         df, norm_features = preprocess_data(raw_df)
         
@@ -255,44 +297,54 @@ def training_worker():
         train_feat = norm_features[:split]
         test_df = df.iloc[split:]
         test_feat = norm_features[split:]
+        
+        logger.info(f"Train Set: {len(train_df)} days | Test Set: {len(test_df)} days")
 
         with state_lock:
             GLOBAL_STATE["status"] = "training"
-            GLOBAL_STATE["message"] = f"Optimizing Sharpe ({TRAINING_STEPS} Steps)..."
+            GLOBAL_STATE["message"] = f"Training Model ({TRAINING_STEPS} Steps)..."
         
         train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat, is_training=True)])
         
+        logger.info("Initializing PPO LSTM...")
         model = RecurrentPPO(
             "MlpLstmPolicy", 
             train_env, 
             verbose=0,
             learning_rate=3e-4,
-            n_steps=512, # Long batch size for stable updates
+            n_steps=512, 
             batch_size=64,
-            ent_coef=0.02, # High entropy to encourage trying different leverages
+            ent_coef=0.02, 
             gamma=0.99,
             policy_kwargs={"lstm_hidden_size": 128, "enable_critic_lstm": True}
         )
         
-        # Callback to update progress bar
         class ProgCallback(BaseCallback):
             def _on_step(self):
                 with state_lock: GLOBAL_STATE["progress"] = self.num_timesteps
+                if self.num_timesteps % 1000 == 0:
+                    logger.info(f"Step {self.num_timesteps}/{TRAINING_STEPS} completed.")
                 return True
         
+        logger.info("Starting .learn()...")
         model.learn(total_timesteps=TRAINING_STEPS, callback=ProgCallback())
+        logger.info("Training finished.")
 
         with state_lock:
             GLOBAL_STATE["status"] = "backtesting"
-            GLOBAL_STATE["message"] = "Final Test Run..."
+            GLOBAL_STATE["message"] = "Backtesting on 2024+ data..."
 
         test_env = CryptoTradingEnv(test_df, test_feat)
         obs, _ = test_env.reset()
         done = False
+        logger.info("Running backtest loop...")
+        
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, _, done, _, _ = test_env.step(action)
 
+        logger.info("Backtest complete. Generating results.")
+        
         with state_lock:
             GLOBAL_STATE["results"] = {
                 "dates": test_df.index[WINDOW_SIZE : WINDOW_SIZE + len(test_env.history['portfolio'])],
@@ -300,14 +352,18 @@ def training_worker():
                 "benchmark": test_env.history['benchmark']
             }
             GLOBAL_STATE["status"] = "completed"
-            GLOBAL_STATE["message"] = "Done."
+            GLOBAL_STATE["message"] = "Analysis Done."
             GLOBAL_STATE["final_plot_ready"] = True
             
     except Exception as e:
-        logger.error(f"Worker failed: {e}", exc_info=True)
+        # Capture the FULL Traceback
+        err_msg = traceback.format_exc()
+        logger.error(f"FATAL WORKER CRASH:\n{err_msg}")
         with state_lock:
             GLOBAL_STATE["status"] = "error"
             GLOBAL_STATE["error_msg"] = str(e)
+            # Log it to the UI console too
+            GLOBAL_STATE["logs"].append(f"[FATAL] {str(e)}")
 
 # --- FLASK ROUTES ---
 @app.route('/')
@@ -323,10 +379,10 @@ def get_status():
             "progress": GLOBAL_STATE["progress"],
             "total": GLOBAL_STATE["total_steps"],
             "portfolio": GLOBAL_STATE["metrics"]["portfolio"], 
-            "rewards": GLOBAL_STATE["metrics"]["mean_rewards"],
             "actions": GLOBAL_STATE["metrics"]["actions"],
             "error": GLOBAL_STATE["error_msg"],
-            "ready": GLOBAL_STATE["final_plot_ready"]
+            "ready": GLOBAL_STATE["final_plot_ready"],
+            "logs": GLOBAL_STATE["logs"][-50:] # Send last 50 logs to frontend
         })
 
 @app.route('/result.png')
@@ -338,7 +394,6 @@ def get_result_image():
     port = np.array(data["portfolio"])
     bench = np.array(data["benchmark"])
     
-    # Slice to same length
     L = min(len(port), len(bench), len(dates))
     dates, port, bench = dates[:L], port[:L], bench[:L]
     
@@ -364,65 +419,98 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>RL Training</title>
+    <title>RL Training Console</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { background:#121212; color:#eee; font-family:sans-serif; margin:20px; }
-        .card { background:#1e1e1e; padding:20px; margin-bottom:20px; border-radius:8px; }
-        .bar-bg { background:#333; height:8px; border-radius:4px; overflow:hidden; }
-        .bar-fill { background:#00e676; height:100%; width:0%; transition:0.3s; }
-        h2 { margin-top:0; font-size:16px; color:#aaa; }
-        .grid { display:grid; grid-template-columns: 1fr 1fr; gap:20px; }
-        @media(max-width:600px) { .grid { grid-template-columns: 1fr; } }
+        body { background:#0d1117; color:#c9d1d9; font-family:'Courier New', monospace; margin:20px; }
+        .card { background:#161b22; padding:20px; margin-bottom:20px; border: 1px solid #30363d; border-radius:6px; }
+        .bar-bg { background:#21262d; height:10px; border-radius:5px; overflow:hidden; }
+        .bar-fill { background:#238636; height:100%; width:0%; transition:0.3s; }
+        .grid { display:grid; grid-template-columns: 2fr 1fr; gap:20px; }
+        
+        /* TERMINAL STYLES */
+        .terminal { 
+            background: #000; 
+            color: #0f0; 
+            padding: 15px; 
+            height: 200px; 
+            overflow-y: auto; 
+            font-size: 12px;
+            border-radius: 4px;
+            border: 1px solid #333;
+        }
+        .log-entry { margin-bottom: 2px; border-bottom: 1px solid #111; }
+        .log-entry:last-child { border: none; }
+        
+        @media(max-width:800px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
     <div class="card">
-        <div style="display:flex; justify-content:space-between;">
-            <h1 style="margin:0; font-size:20px;">Deep RL Trader</h1>
-            <span id="status" style="font-weight:bold; color:#00e676;">Loading...</span>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h1 style="margin:0; font-size:20px;">RL Trading Bot Control</h1>
+            <span id="status" style="font-weight:bold; color:#238636;">LOADING</span>
         </div>
-        <p id="msg" style="color:#777; font-size:14px;">...</p>
-        <div class="bar-bg"><div id="bar" class="bar-fill"></div></div>
+        <div style="margin:15px 0;">
+            <div class="bar-bg"><div id="bar" class="bar-fill"></div></div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; color:#8b949e; margin-top:5px;">
+                <span id="msg">Initializing...</span>
+                <span id="counts">0 / 0</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3 style="margin-top:0;">Live System Logs</h3>
+        <div id="terminal" class="terminal"></div>
     </div>
 
     <div class="grid" id="live-area">
         <div class="card">
-            <h2>Portfolio Value (Training Episodes)</h2>
-            <canvas id="portChart"></canvas>
+            <h3>Training Portfolio</h3>
+            <canvas id="portChart" height="200"></canvas>
         </div>
         <div class="card">
-            <h2>Action Distribution (Leverage Used)</h2>
-            <canvas id="actChart"></canvas>
+            <h3>Leverage Distribution</h3>
+            <canvas id="actChart" height="200"></canvas>
         </div>
     </div>
 
     <div id="final-area" class="card" style="display:none;">
-        <h2>Final Performance (Test Data)</h2>
+        <h3>Final Results</h3>
         <img id="final-img" style="width:100%; border-radius:4px;">
     </div>
 
     <script>
         const pc = new Chart(document.getElementById('portChart'), {
-            type:'line', data:{datasets:[{borderColor:'#00e676', borderWidth:1, radius:0, data:[]}]},
-            options:{animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{grid:{color:'#333'}}}}
+            type:'line', data:{datasets:[{borderColor:'#238636', borderWidth:1, radius:0, data:[]}]},
+            options:{animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{grid:{color:'#21262d'}}}}
         });
         
         const ac = new Chart(document.getElementById('actChart'), {
             type:'bar', 
             data:{
                 labels:['-5x','-4x','-3x','-2x','-1x','0x','1x','2x','3x','4x','5x'],
-                datasets:[{backgroundColor:'#3d5afe', data:new Array(11).fill(0)}]
+                datasets:[{backgroundColor:'#1f6feb', data:new Array(11).fill(0)}]
             },
             options:{animation:false, plugins:{legend:{display:false}}, scales:{y:{display:false}}}
         });
+
+        const term = document.getElementById('terminal');
 
         setInterval(() => {
             fetch('/api/status').then(r=>r.json()).then(d => {
                 document.getElementById('status').innerText = d.status.toUpperCase();
                 document.getElementById('msg').innerText = d.message;
+                document.getElementById('counts').innerText = `${d.progress} / ${d.total}`;
                 document.getElementById('bar').style.width = (d.progress/d.total*100)+'%';
+                
+                // Update Logs
+                if (d.logs && d.logs.length > 0) {
+                    term.innerHTML = d.logs.map(l => `<div class="log-entry">${l}</div>`).join('');
+                    term.scrollTop = term.scrollHeight; // Auto-scroll
+                }
                 
                 if(d.status === 'training') {
                     pc.data.labels = new Array(d.portfolio.length).fill('');
