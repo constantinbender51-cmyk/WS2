@@ -13,7 +13,7 @@ from matplotlib.ticker import FuncFormatter
 import logging
 import sys
 
-from flask import Flask, send_file, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, send_file
 from gymnasium import spaces
 import gymnasium as gym
 from sklearn.preprocessing import StandardScaler
@@ -21,7 +21,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib import RecurrentPPO
 
-# --- LOGGING CONFIGURATION ---
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -33,19 +33,21 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 WINDOW_SIZE = 30
-TRAINING_STEPS = 20000  # Increased slightly
+TRAINING_STEPS = 30000  # ~10 passes through the dataset
 TRAIN_TEST_SPLIT = 0.8
 INITIAL_BALANCE = 10000.0
+TRADING_FEE = 0.001  # 0.1% fee per leverage unit changed
 
-# --- SHARED GLOBAL STATE ---
+# --- SHARED STATE ---
 GLOBAL_STATE = {
     "status": "initializing",
     "message": "Booting up...",
     "progress": 0,
     "total_steps": TRAINING_STEPS,
     "metrics": {
-        "portfolio": [],      # Full history of portfolio values
-        "entropy": []         # Tracks if model is 'confused' (high) or 'sure' (low)
+        "portfolio": [],      
+        "mean_rewards": [],   # To track learning progress
+        "actions": [0] * 11   # To track what moves it's choosing
     },
     "error_msg": "",
     "final_plot_ready": False,
@@ -55,6 +57,7 @@ GLOBAL_STATE = {
 state_lock = threading.Lock()
 worker_thread_started = False
 
+# Mapping: 0->-5, 5->0, 10->+5
 LEVERAGE_MAP = {i: i - 5 for i in range(11)}
 
 METRICS_TO_FETCH = [
@@ -85,7 +88,7 @@ def fetch_single_metric(slug):
         return None
 
 def fetch_and_prepare_data():
-    logger.info("Starting batch data fetch...")
+    logger.info("Fetching Blockchain.com data...")
     data_frames = []
     for item in METRICS_TO_FETCH:
         series = fetch_single_metric(item['slug'])
@@ -96,6 +99,7 @@ def fetch_and_prepare_data():
 
     full_df = pd.concat(data_frames, axis=1).dropna()
     
+    # Feature: Volume / Transaction Ratio
     if 'volume' in full_df.columns and 'tx_count' in full_df.columns:
         vol_tx_ratio = full_df['volume'] / full_df['tx_count']
         weekly_avg = vol_tx_ratio.resample('W').mean()
@@ -109,11 +113,17 @@ def fetch_and_prepare_data():
 def preprocess_data(df):
     df = df.copy()
     df['pct_change'] = df['price'].pct_change().fillna(0)
-    feature_cols = ['price', 'hash', 'tx_count', 'revenue', 'volume', 'vol_tx_weekly']
+    
+    # Add rolling volatility for the state (helps agent see risk)
+    df['volatility'] = df['pct_change'].rolling(window=7).std().fillna(0)
+    
+    feature_cols = ['price', 'hash', 'tx_count', 'revenue', 'volume', 'vol_tx_weekly', 'volatility']
     valid_cols = [c for c in feature_cols if c in df.columns]
+    
     features = df[valid_cols].values
     scaler = StandardScaler()
     normalized_features = scaler.fit_transform(features)
+    
     return df, normalized_features
 
 # --- GYM ENVIRONMENT ---
@@ -142,97 +152,113 @@ class CryptoTradingEnv(gym.Env):
         self.balance = self.initial_balance
         self.current_step = self.window_size
         self.portfolio_value = self.initial_balance
+        self.current_leverage = 0
         self.history = {'portfolio': [], 'benchmark': []}
-        self.returns_history = [] 
-
+        self.returns_window = [] 
+        
     def _get_observation(self):
         obs = self.features[self.current_step - self.window_size : self.current_step]
         return obs.astype(np.float32)
 
     def step(self, action):
-        if isinstance(action, np.ndarray):
-            action_val = int(action.item())
-        else:
-            action_val = int(action)
-
+        # 1. Parse Action
+        if isinstance(action, np.ndarray): action_val = int(action.item())
+        else: action_val = int(action)
+        
         target_leverage = LEVERAGE_MAP[action_val]
         
+        # 2. Update Stats (Dashboard)
+        if self.is_training:
+             with state_lock:
+                 GLOBAL_STATE["metrics"]["actions"][action_val] += 1
+
+        # 3. Check for Data End
         if self.current_step >= len(self.df) - 1:
             return self._get_observation(), 0, True, False, {}
-        
-        current_price_change = self.df['pct_change'].iloc[self.current_step]
-        step_return = target_leverage * current_price_change
-        self.portfolio_value *= (1 + step_return)
-        
-        # Simple Reward: Log return of portfolio
-        # We use log return to treat 50% gain and 50% loss symmetrically
-        reward = np.log(1 + step_return + 1e-9)
 
+        # 4. Execute Trade Logic
+        # Calculate Cost to change position
+        leverage_change = abs(target_leverage - self.current_leverage)
+        cost_percent = leverage_change * TRADING_FEE
+        
+        # Market Move
+        market_return = self.df['pct_change'].iloc[self.current_step]
+        
+        # Portfolio Move: (Leverage * Market) - Costs
+        gross_return = (target_leverage * market_return)
+        net_return = gross_return - cost_percent
+        
+        self.portfolio_value *= (1 + net_return)
+        self.current_leverage = target_leverage
+        
+        # 5. Reward Engineering (The most important part)
+        
+        # A. Bankruptcy Penalty (Survival Constraint)
+        # If we lose 50% of the account, kill the episode.
+        if self.portfolio_value < self.initial_balance * 0.5:
+            done = True
+            reward = -100  # massive penalty
+            return self._get_observation(), reward, done, False, {}
+            
+        # B. Sharpe-Optimized Reward
+        # Reward = Return - (Volatility Penalty)
+        # We scale return by 100 to make it significant for the Neural Net
+        reward = (net_return * 100) 
+        
+        # Penalize holding max leverage if market is volatile (soft constraint)
+        volatility = self.df['volatility'].iloc[self.current_step]
+        if abs(target_leverage) > 3 and volatility > 0.02:
+            reward -= 0.5 # discourage reckless leverage in high vol
+            
+        # Update Dashboard
         if self.is_training:
             with state_lock:
-                # Log every 50th step to keep JSON size manageable but show full history
-                if self.current_step % 50 == 0:  
+                if self.current_step % 50 == 0:
                     GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
+                    # Also track rolling mean reward roughly
+                    GLOBAL_STATE["metrics"]["mean_rewards"].append(float(reward))
 
+        # 6. Advance
         self.current_step += 1
         done = (self.current_step >= len(self.df) - 1)
         
         self.history['portfolio'].append(self.portfolio_value)
+        
+        # Benchmark
         if not self.history['benchmark']:
             self.history['benchmark'].append(self.initial_balance)
         else:
-            prev_bench = self.history['benchmark'][-1]
-            self.history['benchmark'].append(prev_bench * (1 + current_price_change))
+            prev = self.history['benchmark'][-1]
+            self.history['benchmark'].append(prev * (1 + market_return))
 
         return self._get_observation(), reward, done, False, {}
 
-# --- CALLBACK ---
-class DashboardCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super(DashboardCallback, self).__init__(verbose)
-
-    def _on_step(self) -> bool:
-        # Capture Entropy (Uncertainty) from the model's logs
-        # SB3 calculates this internally; we can sometimes access it, 
-        # but for simplicity we'll just track progress here.
-        with state_lock:
-            GLOBAL_STATE["progress"] = self.num_timesteps
-        
-        if self.num_timesteps % 500 == 0:
-            logger.info(f"Step {self.num_timesteps}/{TRAINING_STEPS}")
-        return True
-
-# --- WORKER THREAD ---
+# --- WORKER ---
 def training_worker():
-    logger.info("WORKER: Thread started.")
+    logger.info("WORKER: Started.")
     try:
         with state_lock:
             GLOBAL_STATE["status"] = "fetching"
-            GLOBAL_STATE["message"] = "Downloading blockchain data..."
+            GLOBAL_STATE["message"] = "Fetching Data..."
         
         raw_df = fetch_and_prepare_data()
-        
-        if raw_df is None or raw_df.empty:
-            with state_lock:
-                GLOBAL_STATE["status"] = "error"
-                GLOBAL_STATE["error_msg"] = "Data fetch failed"
-            return
+        if raw_df is None or raw_df.empty: raise Exception("No Data")
 
         with state_lock:
             GLOBAL_STATE["status"] = "preprocessing"
-            GLOBAL_STATE["message"] = f"Preprocessing {len(raw_df)} days of data..."
-
+            GLOBAL_STATE["message"] = "Processing..."
+            
         df, norm_features = preprocess_data(raw_df)
         
-        split_idx = int(len(df) * TRAIN_TEST_SPLIT)
-        train_df = df.iloc[:split_idx]
-        train_feat = norm_features[:split_idx]
-        test_df = df.iloc[split_idx:]
-        test_feat = norm_features[split_idx:]
+        split = int(len(df) * TRAIN_TEST_SPLIT)
+        train_df = df.iloc[:split]
+        train_feat = norm_features[:split]
+        test_df = df.iloc[split:]
+        test_feat = norm_features[split:]
 
         with state_lock:
             GLOBAL_STATE["status"] = "training"
-            GLOBAL_STATE["message"] = f"Training LSTM Agent ({TRAINING_STEPS} Steps)..."
+            GLOBAL_STATE["message"] = f"Optimizing Sharpe ({TRAINING_STEPS} Steps)..."
         
         train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat, is_training=True)])
         
@@ -241,47 +267,49 @@ def training_worker():
             train_env, 
             verbose=0,
             learning_rate=3e-4,
-            n_steps=256, # Increased batch size for stability
+            n_steps=512, # Long batch size for stable updates
             batch_size=64,
-            ent_coef=0.01,
+            ent_coef=0.02, # High entropy to encourage trying different leverages
+            gamma=0.99,
             policy_kwargs={"lstm_hidden_size": 128, "enable_critic_lstm": True}
         )
         
-        model.learn(total_timesteps=TRAINING_STEPS, callback=DashboardCallback())
+        # Callback to update progress bar
+        class ProgCallback(BaseCallback):
+            def _on_step(self):
+                with state_lock: GLOBAL_STATE["progress"] = self.num_timesteps
+                return True
+        
+        model.learn(total_timesteps=TRAINING_STEPS, callback=ProgCallback())
 
         with state_lock:
             GLOBAL_STATE["status"] = "backtesting"
-            GLOBAL_STATE["message"] = "Evaluating performance on unseen 2024 data..."
+            GLOBAL_STATE["message"] = "Final Test Run..."
 
         test_env = CryptoTradingEnv(test_df, test_feat)
         obs, _ = test_env.reset()
         done = False
-        
         while not done:
-            action, _states = model.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = test_env.step(action)
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, _, _ = test_env.step(action)
 
-        # Store Final Results
-        dates = test_df.index[WINDOW_SIZE : WINDOW_SIZE + len(test_env.history['portfolio'])]
-        
         with state_lock:
             GLOBAL_STATE["results"] = {
-                "dates": dates,
+                "dates": test_df.index[WINDOW_SIZE : WINDOW_SIZE + len(test_env.history['portfolio'])],
                 "portfolio": test_env.history['portfolio'],
                 "benchmark": test_env.history['benchmark']
             }
             GLOBAL_STATE["status"] = "completed"
-            GLOBAL_STATE["message"] = "Training Finished."
+            GLOBAL_STATE["message"] = "Done."
             GLOBAL_STATE["final_plot_ready"] = True
             
     except Exception as e:
-        logger.critical("FATAL ERROR", exc_info=True)
+        logger.error(f"Worker failed: {e}", exc_info=True)
         with state_lock:
             GLOBAL_STATE["status"] = "error"
             GLOBAL_STATE["error_msg"] = str(e)
 
 # --- FLASK ROUTES ---
-
 @app.route('/')
 def dashboard():
     return render_template_string(HTML_TEMPLATE)
@@ -294,165 +322,124 @@ def get_status():
             "message": GLOBAL_STATE["message"],
             "progress": GLOBAL_STATE["progress"],
             "total": GLOBAL_STATE["total_steps"],
-            # Return FULL history (downsampled in step function)
             "portfolio": GLOBAL_STATE["metrics"]["portfolio"], 
+            "rewards": GLOBAL_STATE["metrics"]["mean_rewards"],
+            "actions": GLOBAL_STATE["metrics"]["actions"],
             "error": GLOBAL_STATE["error_msg"],
             "ready": GLOBAL_STATE["final_plot_ready"]
         })
 
 @app.route('/result.png')
 def get_result_image():
-    with state_lock:
-        data = GLOBAL_STATE.get("results", {})
-    
-    if not data:
-        return "No results yet", 404
+    with state_lock: data = GLOBAL_STATE.get("results", {})
+    if not data: return "No results", 404
 
     dates = data["dates"]
-    portfolio = np.array(data["portfolio"])
-    benchmark = np.array(data["benchmark"])
-
-    min_len = min(len(portfolio), len(benchmark), len(dates))
-    portfolio = portfolio[:min_len]
-    benchmark = benchmark[:min_len]
-    dates = dates[:min_len]
-
-    def get_sharpe(series):
-        r = pd.Series(series).pct_change().dropna()
+    port = np.array(data["portfolio"])
+    bench = np.array(data["benchmark"])
+    
+    # Slice to same length
+    L = min(len(port), len(bench), len(dates))
+    dates, port, bench = dates[:L], port[:L], bench[:L]
+    
+    def get_sharpe(s):
+        r = pd.Series(s).pct_change().dropna()
         if r.std() == 0: return 0
         return (r.mean() / r.std()) * np.sqrt(365)
 
-    s_sharpe = get_sharpe(portfolio)
-    b_sharpe = get_sharpe(benchmark)
-
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(dates, portfolio, label=f'AI Strategy (Sharpe: {s_sharpe:.2f})', color='#28a745', linewidth=2)
-    ax.plot(dates, benchmark, label=f'Buy & Hold (Sharpe: {b_sharpe:.2f})', color='#6c757d', linestyle='--', alpha=0.7)
-    
-    ax.set_title('Test Set Performance (2024-Present)', fontsize=14)
-    ax.set_ylabel('Portfolio Value ($)')
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+    ax.plot(dates, port, label=f'AI (Sharpe: {get_sharpe(port):.2f})', color='#00e676')
+    ax.plot(dates, bench, label=f'Hold (Sharpe: {get_sharpe(bench):.2f})', color='gray', linestyle='--')
+    ax.set_title("Out-of-Sample Performance")
     ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=100)
-    img_buffer.seek(0)
+    ax.grid(True, alpha=0.2)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
     plt.close(fig)
-    return send_file(img_buffer, mimetype='image/png')
+    return send_file(buf, mimetype='image/png')
 
-# --- FRONTEND ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RL Training Monitor</title>
+    <title>RL Training</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { background-color: #0f111a; color: #cfd8dc; font-family: 'Segoe UI', sans-serif; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        .card { background-color: #1a1c24; border-radius: 8px; padding: 25px; margin-bottom: 20px; border: 1px solid #2f3342; }
-        h1 { color: #fff; font-size: 24px; margin: 0 0 10px 0; }
-        .status-pill { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; text-transform: uppercase; float: right; }
-        .pill-active { background: #3d5afe; color: white; }
-        .pill-done { background: #00e676; color: #004d40; }
-        .pill-error { background: #ff1744; color: white; }
-        
-        #progress-bg { background: #2f3342; height: 6px; border-radius: 3px; margin: 20px 0 10px 0; overflow: hidden; }
-        #progress-fill { background: #3d5afe; height: 100%; width: 0%; transition: width 0.3s; }
-        
-        #final-img { width: 100%; border-radius: 4px; display: none; }
+        body { background:#121212; color:#eee; font-family:sans-serif; margin:20px; }
+        .card { background:#1e1e1e; padding:20px; margin-bottom:20px; border-radius:8px; }
+        .bar-bg { background:#333; height:8px; border-radius:4px; overflow:hidden; }
+        .bar-fill { background:#00e676; height:100%; width:0%; transition:0.3s; }
+        h2 { margin-top:0; font-size:16px; color:#aaa; }
+        .grid { display:grid; grid-template-columns: 1fr 1fr; gap:20px; }
+        @media(max-width:600px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="card">
+        <div style="display:flex; justify-content:space-between;">
+            <h1 style="margin:0; font-size:20px;">Deep RL Trader</h1>
+            <span id="status" style="font-weight:bold; color:#00e676;">Loading...</span>
+        </div>
+        <p id="msg" style="color:#777; font-size:14px;">...</p>
+        <div class="bar-bg"><div id="bar" class="bar-fill"></div></div>
+    </div>
+
+    <div class="grid" id="live-area">
         <div class="card">
-            <span id="badge" class="status-pill pill-active">Initializing</span>
-            <h1>Training Monitor</h1>
-            <div style="display:flex; justify-content:space-between; font-size:14px; color:#90a4ae;">
-                <span id="msg">Preparing environment...</span>
-                <span id="counts">0 / 0 Steps</span>
-            </div>
-            <div id="progress-bg"><div id="progress-fill"></div></div>
+            <h2>Portfolio Value (Training Episodes)</h2>
+            <canvas id="portChart"></canvas>
         </div>
-
-        <div id="live-panel" class="card">
-            <h2 style="font-size:18px; margin-top:0;">Training Episodes (Portfolio Value)</h2>
-            <p style="font-size:12px; color:#607d8b;">
-                *Each "loop" you see is one simulation of the dataset (2018-2023). 
-                The drop means the episode ended and reset to $10k.
-            </p>
-            <canvas id="liveChart" height="200"></canvas>
-        </div>
-
-        <div id="result-panel" class="card" style="display:none;">
-            <h2 style="font-size:18px; margin-top:0;">Final Result (Unseen Data)</h2>
-            <img id="final-img" src="">
+        <div class="card">
+            <h2>Action Distribution (Leverage Used)</h2>
+            <canvas id="actChart"></canvas>
         </div>
     </div>
 
+    <div id="final-area" class="card" style="display:none;">
+        <h2>Final Performance (Test Data)</h2>
+        <img id="final-img" style="width:100%; border-radius:4px;">
+    </div>
+
     <script>
-        const ctx = document.getElementById('liveChart').getContext('2d');
-        const chart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'Portfolio Value',
-                    data: [],
-                    borderColor: '#00e676',
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    tension: 0
-                }]
+        const pc = new Chart(document.getElementById('portChart'), {
+            type:'line', data:{datasets:[{borderColor:'#00e676', borderWidth:1, radius:0, data:[]}]},
+            options:{animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{grid:{color:'#333'}}}}
+        });
+        
+        const ac = new Chart(document.getElementById('actChart'), {
+            type:'bar', 
+            data:{
+                labels:['-5x','-4x','-3x','-2x','-1x','0x','1x','2x','3x','4x','5x'],
+                datasets:[{backgroundColor:'#3d5afe', data:new Array(11).fill(0)}]
             },
-            options: {
-                responsive: true,
-                animation: false,
-                plugins: { legend: { display: false } },
-                scales: {
-                    x: { display: false },
-                    y: { grid: { color: '#2f3342' } }
-                }
-            }
+            options:{animation:false, plugins:{legend:{display:false}}, scales:{y:{display:false}}}
         });
 
-        function poll() {
-            fetch('/api/status').then(r => r.json()).then(d => {
-                // Update Header
-                document.getElementById('badge').innerText = d.status;
+        setInterval(() => {
+            fetch('/api/status').then(r=>r.json()).then(d => {
+                document.getElementById('status').innerText = d.status.toUpperCase();
                 document.getElementById('msg').innerText = d.message;
-                document.getElementById('counts').innerText = `${d.progress} / ${d.total}`;
-                document.getElementById('progress-fill').style.width = (d.progress/d.total*100) + '%';
+                document.getElementById('bar').style.width = (d.progress/d.total*100)+'%';
                 
-                // Update Live Chart
-                if(d.status === 'training' && d.portfolio.length > 0) {
-                    chart.data.labels = new Array(d.portfolio.length).fill('');
-                    chart.data.datasets[0].data = d.portfolio;
-                    chart.update();
+                if(d.status === 'training') {
+                    pc.data.labels = new Array(d.portfolio.length).fill('');
+                    pc.data.datasets[0].data = d.portfolio;
+                    pc.update();
+                    
+                    ac.data.datasets[0].data = d.actions;
+                    ac.update();
                 }
-
-                // Show Final
+                
                 if(d.ready) {
-                    document.getElementById('live-panel').style.display = 'none';
-                    const res = document.getElementById('result-panel');
-                    const img = document.getElementById('final-img');
-                    if(res.style.display === 'none') {
-                        res.style.display = 'block';
-                        img.style.display = 'block';
-                        document.getElementById('badge').className = 'status-pill pill-done';
-                        img.src = '/result.png?t=' + Date.now();
-                    }
-                    return;
+                    document.getElementById('live-area').style.display = 'none';
+                    document.getElementById('final-area').style.display = 'block';
+                    document.getElementById('final-img').src = '/result.png?t='+Date.now();
                 }
-                setTimeout(poll, 1000);
             });
-        }
-        poll();
+        }, 1000);
     </script>
 </body>
 </html>
@@ -464,5 +451,4 @@ if not worker_thread_started:
     worker_thread_started = True
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
