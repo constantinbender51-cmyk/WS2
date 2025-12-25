@@ -1,5 +1,8 @@
 import io
 import os
+import json
+import time
+import threading
 import requests
 import numpy as np
 import pandas as pd
@@ -9,26 +12,41 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
-from flask import Flask, send_file
+from flask import Flask, send_file, jsonify, render_template_string
 from gymnasium import spaces
 import gymnasium as gym
 from sklearn.preprocessing import StandardScaler
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib import RecurrentPPO
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
 WINDOW_SIZE = 30
-# Training steps. Increase to 50000+ for better results if time permits.
-TRAINING_STEPS = 10000  
+TRAINING_STEPS = 15000  
 TRAIN_TEST_SPLIT = 0.8
 INITIAL_BALANCE = 10000.0
+
+# Global State for the Dashboard
+GLOBAL_STATE = {
+    "status": "idle",        # idle, training, completed, error
+    "progress": 0,           # current step
+    "total_steps": TRAINING_STEPS,
+    "metrics": {
+        "rewards": [],       # History of rewards
+        "portfolio": []      # History of portfolio value during training
+    },
+    "error_msg": "",
+    "final_plot_ready": False
+}
+
+# Lock for thread safety
+state_lock = threading.Lock()
 
 # Map discrete actions (0-10) to Leverage (-5 to 5)
 LEVERAGE_MAP = {i: i - 5 for i in range(11)}
 
-# Exact metrics from your file
 METRICS_TO_FETCH = [
     {"slug": "market-price", "key": "price"},
     {"slug": "hash-rate", "key": "hash"},
@@ -36,120 +54,81 @@ METRICS_TO_FETCH = [
     {"slug": "miners-revenue", "key": "revenue"},
     {"slug": "trade-volume", "key": "volume"}
 ]
-
 BASE_URL = "https://api.blockchain.info/charts/{slug}"
 
-# --- DATA FETCHING (COPIED FROM YOUR FILE) ---
+# --- DATA FETCHING ---
 _DATA_CACHE = None
 
 def fetch_single_metric(slug):
-    """
-    Fetches data using the EXACT logic from binance_analysis (8).py
-    """
     url = BASE_URL.format(slug=slug)
-    
-    # Parameters exactly as in your working file
-    params = {
-        "timespan": "all",
-        "format": "json", 
-        "sampled": "false"
-    }
-    
-    # User-Agent is crucial to avoid 403 Forbidden errors
+    params = {"timespan": "all", "format": "json", "sampled": "false"}
     headers = {"User-Agent": "Mozilla/5.0 (Cloud Deployment)"}
-    
     try:
         response = requests.get(url, params=params, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
-        
         if 'values' in data:
             df = pd.DataFrame(data['values'])
             df['date'] = pd.to_datetime(df['x'], unit='s')
             df.set_index('date', inplace=True)
-            
-            # Filter 2018+
-            df = df[df.index >= '2018-01-01']
-            
-            # Return just the Y value (metric value)
-            return df['y']
+            return df[df.index >= '2018-01-01']['y']
     except Exception as e:
         print(f"Error fetching {slug}: {e}")
         return None
 
 def fetch_and_prepare_data():
     global _DATA_CACHE
-    if _DATA_CACHE is not None:
-        return _DATA_CACHE
+    if _DATA_CACHE is not None: return _DATA_CACHE
 
     print("Fetching data from Blockchain.com...")
     data_frames = []
-
     for item in METRICS_TO_FETCH:
         series = fetch_single_metric(item['slug'])
         if series is not None:
-            # Rename series to the key (e.g., 'price', 'hash')
-            df = series.to_frame(name=item['key'])
-            data_frames.append(df)
+            data_frames.append(series.to_frame(name=item['key']))
         else:
-            print(f"Failed to load {item['slug']}")
             return None
 
-    # Merge all metrics on date index
     full_df = pd.concat(data_frames, axis=1).dropna()
     
-    # --- Feature Engineering ---
-    # Derived Metric: Volume / Transactions (Weekly)
-    # We calculate the weekly mean, then reindex back to daily + forward fill
+    # Feature Engineering
     if 'volume' in full_df.columns and 'tx_count' in full_df.columns:
         vol_tx_ratio = full_df['volume'] / full_df['tx_count']
         weekly_avg = vol_tx_ratio.resample('W').mean()
         full_df['vol_tx_weekly'] = weekly_avg.reindex(full_df.index).ffill()
     else:
-        # Fallback if specific columns fail
         full_df['vol_tx_weekly'] = 0
 
     full_df.dropna(inplace=True)
-    
     _DATA_CACHE = full_df
     return full_df
 
 def preprocess_data(df):
     df = df.copy()
-    # Daily return for environment simulation
     df['pct_change'] = df['price'].pct_change().fillna(0)
-    
     feature_cols = ['price', 'hash', 'tx_count', 'revenue', 'volume', 'vol_tx_weekly']
-    
-    # Ensure all columns exist
     valid_cols = [c for c in feature_cols if c in df.columns]
     features = df[valid_cols].values
-
-    # Normalize inputs for LSTM
     scaler = StandardScaler()
     normalized_features = scaler.fit_transform(features)
-    
     return df, normalized_features
 
 # --- GYM ENVIRONMENT ---
 class CryptoTradingEnv(gym.Env):
-    def __init__(self, df, features, initial_balance=10000):
+    def __init__(self, df, features, initial_balance=10000, is_training=False):
         super(CryptoTradingEnv, self).__init__()
         self.df = df
         self.features = features
         self.n_features = features.shape[1]
         self.window_size = WINDOW_SIZE
-        
-        # Action: 0 to 10 (mapped to -5 to +5 leverage)
         self.action_space = spaces.Discrete(11) 
-        
-        # Observation: Matrix of shape (WINDOW_SIZE, n_features)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, 
             shape=(self.window_size, self.n_features), 
             dtype=np.float32
         )
         self.initial_balance = initial_balance
+        self.is_training = is_training
         self.reset_env()
 
     def reset(self, seed=None):
@@ -168,34 +147,42 @@ class CryptoTradingEnv(gym.Env):
         return obs.astype(np.float32)
 
     def step(self, action):
-        target_leverage = LEVERAGE_MAP[action]
+        # FIX: Ensure action is an integer for dictionary lookup
+        if isinstance(action, np.ndarray):
+            action_val = int(action.item())
+        else:
+            action_val = int(action)
+
+        target_leverage = LEVERAGE_MAP[action_val]
         
         if self.current_step >= len(self.df) - 1:
             return self._get_observation(), 0, True, False, {}
         
-        # Market move happens 'tomorrow'
         current_price_change = self.df['pct_change'].iloc[self.current_step]
-        
-        # Calculate PnL: Leverage * %Change
         step_return = target_leverage * current_price_change
         self.portfolio_value *= (1 + step_return)
         
-        # Reward: Differential Sharpe (Simplified)
+        # Reward Engineering
         self.returns_history.append(step_return)
         if len(self.returns_history) > 20:
             mean_ret = np.mean(self.returns_history[-30:])
             std_ret = np.std(self.returns_history[-30:]) + 1e-9
-            # Reward is Sharpe Ratio of rolling window
             reward = mean_ret / std_ret
         else:
             reward = step_return
+
+        # Update Global Dashboard State (Only if training)
+        if self.is_training:
+            with state_lock:
+                if self.current_step % 10 == 0: 
+                    # Convert to standard float for JSON serialization
+                    GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
+                    GLOBAL_STATE["metrics"]["rewards"].append(float(reward))
 
         self.current_step += 1
         done = (self.current_step >= len(self.df) - 1)
         
         self.history['portfolio'].append(self.portfolio_value)
-        
-        # Benchmark logic (Buy & Hold 1x)
         if not self.history['benchmark']:
             self.history['benchmark'].append(self.initial_balance)
         else:
@@ -204,46 +191,45 @@ class CryptoTradingEnv(gym.Env):
 
         return self._get_observation(), reward, done, False, {}
 
-# --- FLASK ROUTES ---
+# --- CUSTOM CALLBACK ---
+class DashboardCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(DashboardCallback, self).__init__(verbose)
 
-@app.route('/')
-def home():
-    return """
-    <div style="font-family: sans-serif; max-width: 600px; margin: 50px auto; text-align: center;">
-        <h1>LSTM Crypto Trader (Revised)</h1>
-        <p>Model: Recurrent PPO (LSTM) | Action Space: -5x to 5x Leverage</p>
-        <p>Data Source: Blockchain.com (Direct API Fetch)</p>
-        <hr>
-        <a href="/train_and_plot" style="
-            background-color: #28a745; color: white; padding: 15px 30px; 
-            text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 18px;">
-            Run Analysis & Generate Plot
-        </a>
-        <p style="color: #666; font-size: 12px; margin-top: 20px;">
-            Note: This may take 30-60 seconds to train on the server.
-        </p>
-    </div>
-    """
+    def _on_step(self) -> bool:
+        with state_lock:
+            GLOBAL_STATE["progress"] = self.num_timesteps
+        return True
 
-@app.route('/train_and_plot')
-def run_strategy():
-    # 1. Fetch Data
+# --- BACKGROUND WORKER ---
+# Define this globally so the route can access it
+final_results_data = {}
+
+def training_worker():
+    global final_results_data
+    with state_lock:
+        GLOBAL_STATE["status"] = "training"
+    
+    print("Background Worker: Fetching Data...")
     raw_df = fetch_and_prepare_data()
+    
     if raw_df is None or raw_df.empty:
-        return "Error: Could not fetch data. Please check logs."
-        
+        with state_lock:
+            GLOBAL_STATE["status"] = "error"
+            GLOBAL_STATE["error_msg"] = "Failed to fetch data from Blockchain.com"
+        return
+
     df, norm_features = preprocess_data(raw_df)
     
-    # Split Data
     split_idx = int(len(df) * TRAIN_TEST_SPLIT)
     train_df = df.iloc[:split_idx]
     train_feat = norm_features[:split_idx]
     test_df = df.iloc[split_idx:]
     test_feat = norm_features[split_idx:]
 
-    # 2. Train Model
-    # Create Vectorized Environment for SB3
-    train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat)])
+    print("Background Worker: Starting Training...")
+    
+    train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat, is_training=True)])
     
     model = RecurrentPPO(
         "MlpLstmPolicy", 
@@ -256,30 +242,67 @@ def run_strategy():
         policy_kwargs={"lstm_hidden_size": 64, "enable_critic_lstm": True}
     )
     
-    # Train
-    model.learn(total_timesteps=TRAINING_STEPS)
+    callback = DashboardCallback()
+    model.learn(total_timesteps=TRAINING_STEPS, callback=callback)
 
-    # 3. Backtest
+    print("Background Worker: Backtesting...")
+    with state_lock:
+        GLOBAL_STATE["status"] = "backtesting"
+
     test_env = CryptoTradingEnv(test_df, test_feat)
     obs, _ = test_env.reset()
     done = False
     
     while not done:
         action, _states = model.predict(obs, deterministic=True)
+        # step() inside predict might return array, but predict converts it
+        # We need to manually handle step here
         obs, reward, done, truncated, info = test_env.step(action)
 
-    # 4. Plot Results
-    history = test_env.history
-    portfolio = np.array(history['portfolio'])
-    benchmark = np.array(history['benchmark'])
-    
-    # Align lengths
-    min_len = min(len(portfolio), len(benchmark))
+    final_results_data = {
+        "dates": test_df.index[WINDOW_SIZE : WINDOW_SIZE + len(test_env.history['portfolio'])],
+        "portfolio": test_env.history['portfolio'],
+        "benchmark": test_env.history['benchmark']
+    }
+
+    with state_lock:
+        GLOBAL_STATE["status"] = "completed"
+        GLOBAL_STATE["final_plot_ready"] = True
+    print("Background Worker: Finished.")
+
+# --- FLASK ROUTES ---
+
+@app.route('/')
+def dashboard():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/status')
+def get_status():
+    with state_lock:
+        return jsonify({
+            "status": GLOBAL_STATE["status"],
+            "progress": GLOBAL_STATE["progress"],
+            "total": GLOBAL_STATE["total_steps"],
+            "portfolio": GLOBAL_STATE["metrics"]["portfolio"][-500:],
+            "rewards": GLOBAL_STATE["metrics"]["rewards"][-500:],
+            "error": GLOBAL_STATE["error_msg"],
+            "ready": GLOBAL_STATE["final_plot_ready"]
+        })
+
+@app.route('/result.png')
+def get_result_image():
+    if not final_results_data:
+        return "No results yet", 404
+
+    dates = final_results_data["dates"]
+    portfolio = np.array(final_results_data["portfolio"])
+    benchmark = np.array(final_results_data["benchmark"])
+
+    min_len = min(len(portfolio), len(benchmark), len(dates))
     portfolio = portfolio[:min_len]
     benchmark = benchmark[:min_len]
-    dates = test_df.index[WINDOW_SIZE : WINDOW_SIZE + min_len]
+    dates = dates[:min_len]
 
-    # Calculate Sharpe
     def get_sharpe(series):
         r = pd.Series(series).pct_change().dropna()
         if r.std() == 0: return 0
@@ -289,10 +312,10 @@ def run_strategy():
     b_sharpe = get_sharpe(benchmark)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(dates, portfolio, label=f'AI Strategy (Sharpe: {s_sharpe:.2f})', color='#007bff')
-    ax.plot(dates, benchmark, label=f'Buy & Hold (Sharpe: {b_sharpe:.2f})', color='#6c757d', linestyle='--')
+    ax.plot(dates, portfolio, label=f'AI Strategy (Sharpe: {s_sharpe:.2f})', color='#28a745', linewidth=2)
+    ax.plot(dates, benchmark, label=f'Buy & Hold (Sharpe: {b_sharpe:.2f})', color='#6c757d', linestyle='--', alpha=0.7)
     
-    ax.set_title(f'RL Strategy vs Benchmark (Test Data)\nSteps Trained: {TRAINING_STEPS}')
+    ax.set_title('Final Strategy Performance (Out-of-Sample)', fontsize=14)
     ax.set_ylabel('Portfolio Value ($)')
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
     ax.legend()
@@ -300,14 +323,140 @@ def run_strategy():
     plt.xticks(rotation=30)
     plt.tight_layout()
 
-    # Save to buffer
     img_buffer = io.BytesIO()
     plt.savefig(img_buffer, format='png', dpi=100)
     img_buffer.seek(0)
     plt.close(fig)
-
     return send_file(img_buffer, mimetype='image/png')
 
+# --- FRONTEND TEMPLATE ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RL Trading Bot Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .card { background-color: #1e1e1e; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h1, h2 { color: #fff; margin-top: 0; }
+        .status-badge { display: inline-block; padding: 5px 10px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 12px; }
+        .status-idle { background-color: #6c757d; }
+        .status-training { background-color: #007bff; }
+        .status-backtesting { background-color: #ffc107; color: #000; }
+        .status-completed { background-color: #28a745; }
+        .status-error { background-color: #dc3545; }
+        
+        #progress-container { width: 100%; background-color: #333; height: 10px; border-radius: 5px; margin: 15px 0; overflow: hidden; }
+        #progress-bar { height: 100%; background-color: #007bff; width: 0%; transition: width 0.5s; }
+        
+        canvas { max-height: 300px; width: 100%; }
+        #final-result-img { width: 100%; border-radius: 8px; display: none; }
+        .live-panel { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h1>Strategy Dashboard</h1>
+                <span id="status-badge" class="status-badge status-idle">Initializing...</span>
+            </div>
+            <p>Model: <strong>LSTM PPO</strong> | Target: <strong>Maximize Sharpe</strong></p>
+            
+            <div id="progress-container">
+                <div id="progress-bar"></div>
+            </div>
+            <p id="progress-text" style="text-align: right; font-size: 14px; color: #aaa;">0 / 0 Steps</p>
+        </div>
+
+        <!-- Live Training Charts -->
+        <div id="live-panel" class="live-panel">
+            <div class="card">
+                <h2>Live Training: Portfolio Evolution</h2>
+                <canvas id="portfolioChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Final Results -->
+        <div id="result-panel" class="card" style="display:none;">
+            <h2>Final Backtest Results</h2>
+            <img id="final-result-img" src="" alt="Final Result Plot">
+        </div>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('portfolioChart').getContext('2d');
+        const portfolioChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Training Portfolio Value',
+                    data: [],
+                    borderColor: '#007bff',
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    tension: 0.1
+                }]
+            },
+            options: {
+                responsive: true,
+                animation: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { display: false },
+                    y: { grid: { color: '#333' } }
+                }
+            }
+        });
+
+        function updateDashboard() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    const badge = document.getElementById('status-badge');
+                    badge.className = 'status-badge status-' + data.status;
+                    badge.innerText = data.status.toUpperCase();
+
+                    const pct = Math.min(100, (data.progress / data.total) * 100);
+                    document.getElementById('progress-bar').style.width = pct + '%';
+                    document.getElementById('progress-text').innerText = `${data.progress} / ${data.total} Steps`;
+
+                    if (data.status === 'completed' && data.ready) {
+                        document.getElementById('live-panel').style.display = 'none';
+                        const resPanel = document.getElementById('result-panel');
+                        const resImg = document.getElementById('final-result-img');
+                        
+                        if (resPanel.style.display === 'none') {
+                            resPanel.style.display = 'block';
+                            resImg.style.display = 'block';
+                            resImg.src = '/result.png?t=' + new Date().getTime();
+                        }
+                        return;
+                    }
+
+                    if (data.status === 'training' && data.portfolio.length > 0) {
+                        const newData = data.portfolio;
+                        portfolioChart.data.labels = new Array(newData.length).fill('');
+                        portfolioChart.data.datasets[0].data = newData;
+                        portfolioChart.update();
+                    }
+                })
+                .catch(err => console.error(err));
+        }
+
+        setInterval(updateDashboard, 1000);
+    </script>
+</body>
+</html>
+"""
+
 if __name__ == "__main__":
+    t = threading.Thread(target=training_worker, daemon=True)
+    t.start()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
