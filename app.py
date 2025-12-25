@@ -1,6 +1,5 @@
 import io
 import os
-import json
 import time
 import threading
 import requests
@@ -23,7 +22,6 @@ from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib import RecurrentPPO
 
 # --- LOGGING CONFIGURATION ---
-# This forces logs to stdout so they show up in Railway/Docker logs
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -35,7 +33,7 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 WINDOW_SIZE = 30
-TRAINING_STEPS = 15000  
+TRAINING_STEPS = 20000  # Increased slightly
 TRAIN_TEST_SPLIT = 0.8
 INITIAL_BALANCE = 10000.0
 
@@ -46,8 +44,8 @@ GLOBAL_STATE = {
     "progress": 0,
     "total_steps": TRAINING_STEPS,
     "metrics": {
-        "rewards": [],
-        "portfolio": []
+        "portfolio": [],      # Full history of portfolio values
+        "entropy": []         # Tracks if model is 'confused' (high) or 'sure' (low)
     },
     "error_msg": "",
     "final_plot_ready": False,
@@ -57,7 +55,6 @@ GLOBAL_STATE = {
 state_lock = threading.Lock()
 worker_thread_started = False
 
-# --- CONSTANTS & MAPS ---
 LEVERAGE_MAP = {i: i - 5 for i in range(11)}
 
 METRICS_TO_FETCH = [
@@ -69,13 +66,12 @@ METRICS_TO_FETCH = [
 ]
 BASE_URL = "https://api.blockchain.info/charts/{slug}"
 
-# --- DATA FETCHING UTILITIES ---
+# --- DATA FETCHING ---
 def fetch_single_metric(slug):
     url = BASE_URL.format(slug=slug)
     params = {"timespan": "all", "format": "json", "sampled": "false"}
     headers = {"User-Agent": "Mozilla/5.0 (Cloud Deployment)"}
     try:
-        logger.info(f"Fetching {slug}...")
         response = requests.get(url, params=params, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -83,10 +79,7 @@ def fetch_single_metric(slug):
             df = pd.DataFrame(data['values'])
             df['date'] = pd.to_datetime(df['x'], unit='s')
             df.set_index('date', inplace=True)
-            logger.info(f"Successfully fetched {slug} ({len(df)} rows)")
             return df[df.index >= '2018-01-01']['y']
-        else:
-            logger.warning(f"No 'values' key in response for {slug}")
     except Exception as e:
         logger.error(f"Error fetching {slug}: {e}")
         return None
@@ -99,12 +92,10 @@ def fetch_and_prepare_data():
         if series is not None:
             data_frames.append(series.to_frame(name=item['key']))
         else:
-            logger.error(f"Critical: Failed to fetch {item['slug']}")
             return None
 
     full_df = pd.concat(data_frames, axis=1).dropna()
     
-    # Derived Metric: Volume/Tx
     if 'volume' in full_df.columns and 'tx_count' in full_df.columns:
         vol_tx_ratio = full_df['volume'] / full_df['tx_count']
         weekly_avg = vol_tx_ratio.resample('W').mean()
@@ -113,7 +104,6 @@ def fetch_and_prepare_data():
         full_df['vol_tx_weekly'] = 0
 
     full_df.dropna(inplace=True)
-    logger.info(f"Data prepared: {len(full_df)} rows total.")
     return full_df
 
 def preprocess_data(df):
@@ -174,19 +164,15 @@ class CryptoTradingEnv(gym.Env):
         step_return = target_leverage * current_price_change
         self.portfolio_value *= (1 + step_return)
         
-        self.returns_history.append(step_return)
-        if len(self.returns_history) > 20:
-            mean_ret = np.mean(self.returns_history[-30:])
-            std_ret = np.std(self.returns_history[-30:]) + 1e-9
-            reward = mean_ret / std_ret
-        else:
-            reward = step_return
+        # Simple Reward: Log return of portfolio
+        # We use log return to treat 50% gain and 50% loss symmetrically
+        reward = np.log(1 + step_return + 1e-9)
 
         if self.is_training:
             with state_lock:
-                if self.current_step % 25 == 0:  
+                # Log every 50th step to keep JSON size manageable but show full history
+                if self.current_step % 50 == 0:  
                     GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
-                    GLOBAL_STATE["metrics"]["rewards"].append(float(reward))
 
         self.current_step += 1
         done = (self.current_step >= len(self.df) - 1)
@@ -206,10 +192,14 @@ class DashboardCallback(BaseCallback):
         super(DashboardCallback, self).__init__(verbose)
 
     def _on_step(self) -> bool:
+        # Capture Entropy (Uncertainty) from the model's logs
+        # SB3 calculates this internally; we can sometimes access it, 
+        # but for simplicity we'll just track progress here.
         with state_lock:
             GLOBAL_STATE["progress"] = self.num_timesteps
+        
         if self.num_timesteps % 500 == 0:
-            logger.info(f"Training Progress: {self.num_timesteps}/{TRAINING_STEPS}")
+            logger.info(f"Step {self.num_timesteps}/{TRAINING_STEPS}")
         return True
 
 # --- WORKER THREAD ---
@@ -223,16 +213,14 @@ def training_worker():
         raw_df = fetch_and_prepare_data()
         
         if raw_df is None or raw_df.empty:
-            msg = "Failed to fetch data from Blockchain.com"
-            logger.error(msg)
             with state_lock:
                 GLOBAL_STATE["status"] = "error"
-                GLOBAL_STATE["error_msg"] = msg
+                GLOBAL_STATE["error_msg"] = "Data fetch failed"
             return
 
         with state_lock:
             GLOBAL_STATE["status"] = "preprocessing"
-            GLOBAL_STATE["message"] = "Calculating features..."
+            GLOBAL_STATE["message"] = f"Preprocessing {len(raw_df)} days of data..."
 
         df, norm_features = preprocess_data(raw_df)
         
@@ -242,36 +230,29 @@ def training_worker():
         test_df = df.iloc[split_idx:]
         test_feat = norm_features[split_idx:]
 
-        logger.info(f"Training set: {len(train_df)} days. Test set: {len(test_df)} days.")
-
         with state_lock:
             GLOBAL_STATE["status"] = "training"
-            GLOBAL_STATE["message"] = f"Training LSTM PPO ({TRAINING_STEPS} steps)..."
+            GLOBAL_STATE["message"] = f"Training LSTM Agent ({TRAINING_STEPS} Steps)..."
         
-        logger.info("Initializing PPO model...")
         train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat, is_training=True)])
         
         model = RecurrentPPO(
             "MlpLstmPolicy", 
             train_env, 
-            verbose=0, # We use custom callback for logging
+            verbose=0,
             learning_rate=3e-4,
-            n_steps=128,
+            n_steps=256, # Increased batch size for stability
             batch_size=64,
             ent_coef=0.01,
-            policy_kwargs={"lstm_hidden_size": 64, "enable_critic_lstm": True}
+            policy_kwargs={"lstm_hidden_size": 128, "enable_critic_lstm": True}
         )
         
-        logger.info("Starting model.learn()...")
-        callback = DashboardCallback()
-        model.learn(total_timesteps=TRAINING_STEPS, callback=callback)
-        logger.info("Model training complete.")
+        model.learn(total_timesteps=TRAINING_STEPS, callback=DashboardCallback())
 
         with state_lock:
             GLOBAL_STATE["status"] = "backtesting"
-            GLOBAL_STATE["message"] = "Running backtest on unseen data..."
+            GLOBAL_STATE["message"] = "Evaluating performance on unseen 2024 data..."
 
-        logger.info("Starting backtest on test data...")
         test_env = CryptoTradingEnv(test_df, test_feat)
         obs, _ = test_env.reset()
         done = False
@@ -280,7 +261,7 @@ def training_worker():
             action, _states = model.predict(obs, deterministic=True)
             obs, reward, done, truncated, info = test_env.step(action)
 
-        # Store Final Results in Memory
+        # Store Final Results
         dates = test_df.index[WINDOW_SIZE : WINDOW_SIZE + len(test_env.history['portfolio'])]
         
         with state_lock:
@@ -290,16 +271,14 @@ def training_worker():
                 "benchmark": test_env.history['benchmark']
             }
             GLOBAL_STATE["status"] = "completed"
-            GLOBAL_STATE["message"] = "Simulation Complete."
+            GLOBAL_STATE["message"] = "Training Finished."
             GLOBAL_STATE["final_plot_ready"] = True
-        
-        logger.info("Backtest complete. Results stored.")
             
     except Exception as e:
-        logger.critical("FATAL ERROR IN WORKER THREAD", exc_info=True)
+        logger.critical("FATAL ERROR", exc_info=True)
         with state_lock:
             GLOBAL_STATE["status"] = "error"
-            GLOBAL_STATE["error_msg"] = f"Internal Error: {str(e)}"
+            GLOBAL_STATE["error_msg"] = str(e)
 
 # --- FLASK ROUTES ---
 
@@ -315,7 +294,8 @@ def get_status():
             "message": GLOBAL_STATE["message"],
             "progress": GLOBAL_STATE["progress"],
             "total": GLOBAL_STATE["total_steps"],
-            "portfolio": GLOBAL_STATE["metrics"]["portfolio"][-100:], 
+            # Return FULL history (downsampled in step function)
+            "portfolio": GLOBAL_STATE["metrics"]["portfolio"], 
             "error": GLOBAL_STATE["error_msg"],
             "ready": GLOBAL_STATE["final_plot_ready"]
         })
@@ -349,7 +329,7 @@ def get_result_image():
     ax.plot(dates, portfolio, label=f'AI Strategy (Sharpe: {s_sharpe:.2f})', color='#28a745', linewidth=2)
     ax.plot(dates, benchmark, label=f'Buy & Hold (Sharpe: {b_sharpe:.2f})', color='#6c757d', linestyle='--', alpha=0.7)
     
-    ax.set_title('Final Strategy Performance (Out-of-Sample)', fontsize=14)
+    ax.set_title('Test Set Performance (2024-Present)', fontsize=14)
     ax.set_ylabel('Portfolio Value ($)')
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
     ax.legend()
@@ -363,77 +343,71 @@ def get_result_image():
     plt.close(fig)
     return send_file(img_buffer, mimetype='image/png')
 
-# --- FRONTEND TEMPLATE ---
+# --- FRONTEND ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RL Trading Bot Dashboard</title>
+    <title>RL Training Monitor</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px; }
+        body { background-color: #0f111a; color: #cfd8dc; font-family: 'Segoe UI', sans-serif; padding: 20px; }
         .container { max-width: 1000px; margin: 0 auto; }
-        .card { background-color: #1e1e1e; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        .status-badge { display: inline-block; padding: 5px 10px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 12px; }
-        .status-initializing { background-color: #6c757d; }
-        .status-fetching { background-color: #17a2b8; }
-        .status-preprocessing { background-color: #6f42c1; }
-        .status-training { background-color: #007bff; }
-        .status-backtesting { background-color: #ffc107; color: #000; }
-        .status-completed { background-color: #28a745; }
-        .status-error { background-color: #dc3545; }
+        .card { background-color: #1a1c24; border-radius: 8px; padding: 25px; margin-bottom: 20px; border: 1px solid #2f3342; }
+        h1 { color: #fff; font-size: 24px; margin: 0 0 10px 0; }
+        .status-pill { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; text-transform: uppercase; float: right; }
+        .pill-active { background: #3d5afe; color: white; }
+        .pill-done { background: #00e676; color: #004d40; }
+        .pill-error { background: #ff1744; color: white; }
         
-        #progress-container { width: 100%; background-color: #333; height: 10px; border-radius: 5px; margin: 15px 0; overflow: hidden; }
-        #progress-bar { height: 100%; background-color: #007bff; width: 0%; transition: width 0.5s; }
+        #progress-bg { background: #2f3342; height: 6px; border-radius: 3px; margin: 20px 0 10px 0; overflow: hidden; }
+        #progress-fill { background: #3d5afe; height: 100%; width: 0%; transition: width 0.3s; }
         
-        canvas { max-height: 300px; width: 100%; }
-        #final-result-img { width: 100%; border-radius: 8px; display: none; }
-        .live-panel { display: block; }
+        #final-img { width: 100%; border-radius: 4px; display: none; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h1>Auto-GPT Trader</h1>
-                <span id="status-badge" class="status-badge status-initializing">Loading...</span>
+            <span id="badge" class="status-pill pill-active">Initializing</span>
+            <h1>Training Monitor</h1>
+            <div style="display:flex; justify-content:space-between; font-size:14px; color:#90a4ae;">
+                <span id="msg">Preparing environment...</span>
+                <span id="counts">0 / 0 Steps</span>
             </div>
-            <p id="status-message" style="color: #aaa; margin-bottom: 5px;">System check...</p>
-            
-            <div id="progress-container">
-                <div id="progress-bar"></div>
-            </div>
-            <p id="progress-text" style="text-align: right; font-size: 14px; color: #aaa;">0 / 0 Steps</p>
+            <div id="progress-bg"><div id="progress-fill"></div></div>
         </div>
 
-        <div id="live-panel" class="live-panel">
-            <div class="card">
-                <h2>Live Portfolio Equity</h2>
-                <canvas id="portfolioChart"></canvas>
-            </div>
+        <div id="live-panel" class="card">
+            <h2 style="font-size:18px; margin-top:0;">Training Episodes (Portfolio Value)</h2>
+            <p style="font-size:12px; color:#607d8b;">
+                *Each "loop" you see is one simulation of the dataset (2018-2023). 
+                The drop means the episode ended and reset to $10k.
+            </p>
+            <canvas id="liveChart" height="200"></canvas>
         </div>
 
         <div id="result-panel" class="card" style="display:none;">
-            <h2>Strategy Performance</h2>
-            <img id="final-result-img" src="" alt="Final Result Plot">
+            <h2 style="font-size:18px; margin-top:0;">Final Result (Unseen Data)</h2>
+            <img id="final-img" src="">
         </div>
     </div>
 
     <script>
-        const ctx = document.getElementById('portfolioChart').getContext('2d');
-        const portfolioChart = new Chart(ctx, {
+        const ctx = document.getElementById('liveChart').getContext('2d');
+        const chart = new Chart(ctx, {
             type: 'line',
             data: {
                 labels: [],
                 datasets: [{
                     label: 'Portfolio Value',
                     data: [],
-                    borderColor: '#007bff',
-                    borderWidth: 1.5,
+                    borderColor: '#00e676',
+                    borderWidth: 1,
                     pointRadius: 0,
-                    tension: 0.1
+                    tension: 0
                 }]
             },
             options: {
@@ -442,50 +416,43 @@ HTML_TEMPLATE = """
                 plugins: { legend: { display: false } },
                 scales: {
                     x: { display: false },
-                    y: { grid: { color: '#333' } }
+                    y: { grid: { color: '#2f3342' } }
                 }
             }
         });
 
-        function updateDashboard() {
-            fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    const badge = document.getElementById('status-badge');
-                    badge.className = 'status-badge status-' + data.status;
-                    badge.innerText = data.status.toUpperCase();
-                    document.getElementById('status-message').innerText = data.message;
+        function poll() {
+            fetch('/api/status').then(r => r.json()).then(d => {
+                // Update Header
+                document.getElementById('badge').innerText = d.status;
+                document.getElementById('msg').innerText = d.message;
+                document.getElementById('counts').innerText = `${d.progress} / ${d.total}`;
+                document.getElementById('progress-fill').style.width = (d.progress/d.total*100) + '%';
+                
+                // Update Live Chart
+                if(d.status === 'training' && d.portfolio.length > 0) {
+                    chart.data.labels = new Array(d.portfolio.length).fill('');
+                    chart.data.datasets[0].data = d.portfolio;
+                    chart.update();
+                }
 
-                    if (data.total > 0) {
-                        const pct = Math.min(100, (data.progress / data.total) * 100);
-                        document.getElementById('progress-bar').style.width = pct + '%';
-                        document.getElementById('progress-text').innerText = `${data.progress} / ${data.total} Steps`;
+                // Show Final
+                if(d.ready) {
+                    document.getElementById('live-panel').style.display = 'none';
+                    const res = document.getElementById('result-panel');
+                    const img = document.getElementById('final-img');
+                    if(res.style.display === 'none') {
+                        res.style.display = 'block';
+                        img.style.display = 'block';
+                        document.getElementById('badge').className = 'status-pill pill-done';
+                        img.src = '/result.png?t=' + Date.now();
                     }
-
-                    if (data.status === 'completed' && data.ready) {
-                        document.getElementById('live-panel').style.display = 'none';
-                        const resPanel = document.getElementById('result-panel');
-                        const resImg = document.getElementById('final-result-img');
-                        
-                        if (resPanel.style.display === 'none') {
-                            resPanel.style.display = 'block';
-                            resImg.style.display = 'block';
-                            resImg.src = '/result.png?t=' + new Date().getTime();
-                        }
-                        return; 
-                    }
-
-                    if (data.status === 'training' && data.portfolio.length > 0) {
-                        const newData = data.portfolio;
-                        portfolioChart.data.labels = new Array(newData.length).fill('');
-                        portfolioChart.data.datasets[0].data = newData;
-                        portfolioChart.update();
-                    }
-                })
-                .catch(err => console.error(err));
+                    return;
+                }
+                setTimeout(poll, 1000);
+            });
         }
-
-        setInterval(updateDashboard, 1000);
+        poll();
     </script>
 </body>
 </html>
@@ -495,9 +462,7 @@ if not worker_thread_started:
     t = threading.Thread(target=training_worker, daemon=True)
     t.start()
     worker_thread_started = True
-    logger.info("BACKGROUND: Training thread initialized.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    logger.info(f"STARTING: Flask app on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
