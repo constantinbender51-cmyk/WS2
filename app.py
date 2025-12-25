@@ -11,6 +11,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+import logging
+import sys
 
 from flask import Flask, send_file, jsonify, render_template_string
 from gymnasium import spaces
@@ -19,6 +21,15 @@ from sklearn.preprocessing import StandardScaler
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib import RecurrentPPO
+
+# --- LOGGING CONFIGURATION ---
+# This forces logs to stdout so they show up in Railway/Docker logs
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("RL_Trader")
 
 app = Flask(__name__)
 
@@ -29,9 +40,8 @@ TRAIN_TEST_SPLIT = 0.8
 INITIAL_BALANCE = 10000.0
 
 # --- SHARED GLOBAL STATE ---
-# This dictionary acts as the "database" for the running process
 GLOBAL_STATE = {
-    "status": "initializing",  # Default state
+    "status": "initializing",
     "message": "Booting up...",
     "progress": 0,
     "total_steps": TRAINING_STEPS,
@@ -44,7 +54,6 @@ GLOBAL_STATE = {
     "results": {}
 }
 
-# Threading primitives
 state_lock = threading.Lock()
 worker_thread_started = False
 
@@ -66,6 +75,7 @@ def fetch_single_metric(slug):
     params = {"timespan": "all", "format": "json", "sampled": "false"}
     headers = {"User-Agent": "Mozilla/5.0 (Cloud Deployment)"}
     try:
+        logger.info(f"Fetching {slug}...")
         response = requests.get(url, params=params, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -73,19 +83,23 @@ def fetch_single_metric(slug):
             df = pd.DataFrame(data['values'])
             df['date'] = pd.to_datetime(df['x'], unit='s')
             df.set_index('date', inplace=True)
+            logger.info(f"Successfully fetched {slug} ({len(df)} rows)")
             return df[df.index >= '2018-01-01']['y']
+        else:
+            logger.warning(f"No 'values' key in response for {slug}")
     except Exception as e:
-        print(f"Error fetching {slug}: {e}")
+        logger.error(f"Error fetching {slug}: {e}")
         return None
 
 def fetch_and_prepare_data():
-    print("Fetching data from Blockchain.com...")
+    logger.info("Starting batch data fetch...")
     data_frames = []
     for item in METRICS_TO_FETCH:
         series = fetch_single_metric(item['slug'])
         if series is not None:
             data_frames.append(series.to_frame(name=item['key']))
         else:
+            logger.error(f"Critical: Failed to fetch {item['slug']}")
             return None
 
     full_df = pd.concat(data_frames, axis=1).dropna()
@@ -99,6 +113,7 @@ def fetch_and_prepare_data():
         full_df['vol_tx_weekly'] = 0
 
     full_df.dropna(inplace=True)
+    logger.info(f"Data prepared: {len(full_df)} rows total.")
     return full_df
 
 def preprocess_data(df):
@@ -145,7 +160,6 @@ class CryptoTradingEnv(gym.Env):
         return obs.astype(np.float32)
 
     def step(self, action):
-        # Handle numpy/tensor actions
         if isinstance(action, np.ndarray):
             action_val = int(action.item())
         else:
@@ -168,10 +182,9 @@ class CryptoTradingEnv(gym.Env):
         else:
             reward = step_return
 
-        # Live updates for dashboard
         if self.is_training:
             with state_lock:
-                if self.current_step % 25 == 0:  # Update less frequently for performance
+                if self.current_step % 25 == 0:  
                     GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
                     GLOBAL_STATE["metrics"]["rewards"].append(float(reward))
 
@@ -195,13 +208,13 @@ class DashboardCallback(BaseCallback):
     def _on_step(self) -> bool:
         with state_lock:
             GLOBAL_STATE["progress"] = self.num_timesteps
+        if self.num_timesteps % 500 == 0:
+            logger.info(f"Training Progress: {self.num_timesteps}/{TRAINING_STEPS}")
         return True
 
 # --- WORKER THREAD ---
 def training_worker():
-    """
-    The main logic. Runs ONCE in the background.
-    """
+    logger.info("WORKER: Thread started.")
     try:
         with state_lock:
             GLOBAL_STATE["status"] = "fetching"
@@ -210,9 +223,11 @@ def training_worker():
         raw_df = fetch_and_prepare_data()
         
         if raw_df is None or raw_df.empty:
+            msg = "Failed to fetch data from Blockchain.com"
+            logger.error(msg)
             with state_lock:
                 GLOBAL_STATE["status"] = "error"
-                GLOBAL_STATE["error_msg"] = "Failed to fetch data from Blockchain.com"
+                GLOBAL_STATE["error_msg"] = msg
             return
 
         with state_lock:
@@ -227,16 +242,19 @@ def training_worker():
         test_df = df.iloc[split_idx:]
         test_feat = norm_features[split_idx:]
 
+        logger.info(f"Training set: {len(train_df)} days. Test set: {len(test_df)} days.")
+
         with state_lock:
             GLOBAL_STATE["status"] = "training"
             GLOBAL_STATE["message"] = f"Training LSTM PPO ({TRAINING_STEPS} steps)..."
         
+        logger.info("Initializing PPO model...")
         train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat, is_training=True)])
         
         model = RecurrentPPO(
             "MlpLstmPolicy", 
             train_env, 
-            verbose=0,
+            verbose=0, # We use custom callback for logging
             learning_rate=3e-4,
             n_steps=128,
             batch_size=64,
@@ -244,13 +262,16 @@ def training_worker():
             policy_kwargs={"lstm_hidden_size": 64, "enable_critic_lstm": True}
         )
         
+        logger.info("Starting model.learn()...")
         callback = DashboardCallback()
         model.learn(total_timesteps=TRAINING_STEPS, callback=callback)
+        logger.info("Model training complete.")
 
         with state_lock:
             GLOBAL_STATE["status"] = "backtesting"
             GLOBAL_STATE["message"] = "Running backtest on unseen data..."
 
+        logger.info("Starting backtest on test data...")
         test_env = CryptoTradingEnv(test_df, test_feat)
         obs, _ = test_env.reset()
         done = False
@@ -271,13 +292,14 @@ def training_worker():
             GLOBAL_STATE["status"] = "completed"
             GLOBAL_STATE["message"] = "Simulation Complete."
             GLOBAL_STATE["final_plot_ready"] = True
+        
+        logger.info("Backtest complete. Results stored.")
             
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.critical("FATAL ERROR IN WORKER THREAD", exc_info=True)
         with state_lock:
             GLOBAL_STATE["status"] = "error"
-            GLOBAL_STATE["error_msg"] = str(e)
+            GLOBAL_STATE["error_msg"] = f"Internal Error: {str(e)}"
 
 # --- FLASK ROUTES ---
 
@@ -287,14 +309,13 @@ def dashboard():
 
 @app.route('/api/status')
 def get_status():
-    # Return light JSON for polling
     with state_lock:
         return jsonify({
             "status": GLOBAL_STATE["status"],
             "message": GLOBAL_STATE["message"],
             "progress": GLOBAL_STATE["progress"],
             "total": GLOBAL_STATE["total_steps"],
-            "portfolio": GLOBAL_STATE["metrics"]["portfolio"][-100:], # Only send recent history
+            "portfolio": GLOBAL_STATE["metrics"]["portfolio"][-100:], 
             "error": GLOBAL_STATE["error_msg"],
             "ready": GLOBAL_STATE["final_plot_ready"]
         })
@@ -387,7 +408,6 @@ HTML_TEMPLATE = """
             <p id="progress-text" style="text-align: right; font-size: 14px; color: #aaa;">0 / 0 Steps</p>
         </div>
 
-        <!-- Live Training Charts -->
         <div id="live-panel" class="live-panel">
             <div class="card">
                 <h2>Live Portfolio Equity</h2>
@@ -395,7 +415,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Final Results -->
         <div id="result-panel" class="card" style="display:none;">
             <h2>Strategy Performance</h2>
             <img id="final-result-img" src="" alt="Final Result Plot">
@@ -432,20 +451,17 @@ HTML_TEMPLATE = """
             fetch('/api/status')
                 .then(response => response.json())
                 .then(data => {
-                    // Update Status
                     const badge = document.getElementById('status-badge');
                     badge.className = 'status-badge status-' + data.status;
                     badge.innerText = data.status.toUpperCase();
                     document.getElementById('status-message').innerText = data.message;
 
-                    // Update Progress
                     if (data.total > 0) {
                         const pct = Math.min(100, (data.progress / data.total) * 100);
                         document.getElementById('progress-bar').style.width = pct + '%';
                         document.getElementById('progress-text').innerText = `${data.progress} / ${data.total} Steps`;
                     }
 
-                    // Handle Completion
                     if (data.status === 'completed' && data.ready) {
                         document.getElementById('live-panel').style.display = 'none';
                         const resPanel = document.getElementById('result-panel');
@@ -456,10 +472,9 @@ HTML_TEMPLATE = """
                             resImg.style.display = 'block';
                             resImg.src = '/result.png?t=' + new Date().getTime();
                         }
-                        return; // Stop polling
+                        return; 
                     }
 
-                    // Update Live Chart
                     if (data.status === 'training' && data.portfolio.length > 0) {
                         const newData = data.portfolio;
                         portfolioChart.data.labels = new Array(newData.length).fill('');
@@ -476,15 +491,13 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- INITIALIZATION ---
-# This block runs when the script is loaded, ensuring the thread starts 
-# regardless of whether it's imported (Gunicorn) or run directly.
 if not worker_thread_started:
     t = threading.Thread(target=training_worker, daemon=True)
     t.start()
     worker_thread_started = True
-    print("Background worker thread started.")
+    logger.info("BACKGROUND: Training thread initialized.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    logger.info(f"STARTING: Flask app on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
