@@ -1,542 +1,283 @@
-import io
-import os
-import time
-import threading
-import requests
-import numpy as np
+import gdown
 import pandas as pd
-import matplotlib
-# Set backend to Agg for server (headless) rendering
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-import logging
-import sys
-import traceback
-
-from flask import Flask, jsonify, render_template_string, send_file
-from gymnasium import spaces
-import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
-from sb3_contrib import RecurrentPPO
+import matplotlib.pyplot as plt
+import os
 
-app = Flask(__name__)
+# --- Configuration ---
+torch.manual_seed(42)
+np.random.seed(42)
 
-# --- CONFIGURATION ---
-WINDOW_SIZE = 30
-TRAINING_STEPS = 30000 
-TRAIN_TEST_SPLIT = 0.8
-INITIAL_BALANCE = 10000.0
-TRADING_FEE = 0.001 
+HORIZONS_DAYS = [1, 2, 3, 4, 5, 6, 7, 14, 30]  # Target horizons
+LOOKBACK_SLOPES = range(1, 31)                 # Feature lookbacks (1d to 30d)
+SEQ_LEN = 24                                   # LSTM Sequence length (e.g., 24 hours context)
+RESAMPLE_FREQ = '1h'                           # Resample 1-min data to 1-hour
+BATCH_SIZE = 64
+EPOCHS = 20                                    # Keep low for demo speed, increase for results
 
-# --- SHARED STATE ---
-GLOBAL_STATE = {
-    "status": "initializing",
-    "message": "Booting up...",
-    "progress": 0,
-    "total_steps": TRAINING_STEPS,
-    "metrics": {
-        "portfolio": [],      
-        "mean_rewards": [],
-        "actions": [0] * 11
-    },
-    "logs": [],  # Store logs here for the frontend
-    "error_msg": "",
-    "final_plot_ready": False,
-    "results": {}
-}
+# --- 1. Data Loading & Resampling ---
+def get_and_process_data():
+    file_id = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
+    url = f'https://drive.google.com/uc?id={file_id}'
+    output_file = 'ohlcv_data.csv'
 
-state_lock = threading.Lock()
-worker_thread_started = False
+    if not os.path.exists(output_file):
+        print(f"Downloading data...")
+        gdown.download(url, output_file, quiet=False)
 
-# --- CUSTOM LOGGING HANDLER ---
-class ListHandler(logging.Handler):
-    """
-    Redirects logs to the GLOBAL_STATE list so they show up in the web UI.
-    """
-    def emit(self, record):
-        try:
-            log_entry = self.format(record)
-            with state_lock:
-                GLOBAL_STATE["logs"].append(log_entry)
-                # Keep only last 500 logs to save memory
-                if len(GLOBAL_STATE["logs"]) > 500:
-                    GLOBAL_STATE["logs"].pop(0)
-        except Exception:
-            self.handleError(record)
-
-# Setup Logger
-logger = logging.getLogger("RL_Trader")
-logger.setLevel(logging.INFO)
-
-# 1. Console Handler (Standard Output for Railway/Docker)
-c_handler = logging.StreamHandler(sys.stdout)
-c_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-c_handler.setFormatter(c_format)
-logger.addHandler(c_handler)
-
-# 2. Web List Handler (For the Dashboard)
-l_handler = ListHandler()
-l_format = logging.Formatter('[%(levelname)s] %(message)s')
-l_handler.setFormatter(l_format)
-logger.addHandler(l_handler)
-
-# --- CONSTANTS ---
-LEVERAGE_MAP = {i: i - 5 for i in range(11)}
-
-METRICS_TO_FETCH = [
-    {"slug": "market-price", "key": "price"},
-    {"slug": "hash-rate", "key": "hash"},
-    {"slug": "n-transactions", "key": "tx_count"},
-    {"slug": "miners-revenue", "key": "revenue"},
-    {"slug": "trade-volume", "key": "volume"}
-]
-BASE_URL = "https://api.blockchain.info/charts/{slug}"
-
-# --- DATA FETCHING ---
-def fetch_single_metric(slug):
-    url = BASE_URL.format(slug=slug)
-    params = {"timespan": "all", "format": "json", "sampled": "false"}
-    headers = {"User-Agent": "Mozilla/5.0 (Cloud Deployment)"}
+    print("Loading and resampling data...")
     try:
-        logger.info(f"Fetching {slug}...")
-        response = requests.get(url, params=params, headers=headers, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if 'values' in data:
-            df = pd.DataFrame(data['values'])
-            df['date'] = pd.to_datetime(df['x'], unit='s')
-            df.set_index('date', inplace=True)
-            return df[df.index >= '2018-01-01']['y']
+        df = pd.read_csv(output_file)
+        df.columns = [c.lower().strip() for c in df.columns]
+        date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col).sort_index()
+        
+        # Resample to Hourly to make LSTM training feasible
+        # Using 'last' for close price, 'max' for high, etc.
+        df_resampled = df['close'].resample(RESAMPLE_FREQ).last().dropna().to_frame()
+        
+        return df_resampled
     except Exception as e:
-        logger.error(f"Error fetching {slug}: {e}")
+        print(f"Error: {e}")
         return None
 
-def fetch_and_prepare_data():
-    logger.info("Starting batch data fetch...")
-    data_frames = []
-    for item in METRICS_TO_FETCH:
-        series = fetch_single_metric(item['slug'])
-        if series is not None:
-            data_frames.append(series.to_frame(name=item['key']))
-        else:
-            logger.error(f"Failed to fetch {item['slug']}")
-            return None
-
-    full_df = pd.concat(data_frames, axis=1).dropna()
+# --- 2. Optimized Rolling Slope Calculation ---
+def calculate_rolling_slope(series, window_size):
+    """
+    Calculates rolling slope efficiently using vectorized operations.
+    Slope = Cov(x, y) / Var(x)
+    Since x is linear (0, 1, 2...), Var(x) is constant for a fixed window.
+    """
+    y = series.values
+    x = np.arange(window_size)
     
-    # Feature: Volume / Transaction Ratio
-    if 'volume' in full_df.columns and 'tx_count' in full_df.columns:
-        vol_tx_ratio = full_df['volume'] / full_df['tx_count']
-        weekly_avg = vol_tx_ratio.resample('W').mean()
-        full_df['vol_tx_weekly'] = weekly_avg.reindex(full_df.index).ffill()
-    else:
-        full_df['vol_tx_weekly'] = 0
-
-    full_df.dropna(inplace=True)
-    logger.info(f"Data prepared: {len(full_df)} rows.")
-    return full_df
-
-def preprocess_data(df):
-    df = df.copy()
-    df['pct_change'] = df['price'].pct_change().fillna(0)
-    df['volatility'] = df['pct_change'].rolling(window=7).std().fillna(0)
+    # Pre-calculate x stats
+    sx = x.sum()
+    sx2 = (x ** 2).sum()
+    var_x = sx2 - (sx ** 2) / window_size
     
-    feature_cols = ['price', 'hash', 'tx_count', 'revenue', 'volume', 'vol_tx_weekly', 'volatility']
-    valid_cols = [c for c in feature_cols if c in df.columns]
+    # We need rolling sum of y and rolling sum of xy
+    # Using pandas rolling is easiest for y sum
+    s_y = series.rolling(window_size).sum()
     
-    features = df[valid_cols].values
+    # For xy, we can't use simple rolling because x resets [0..W] at every step.
+    # However, for a linear trend, we can use stride_tricks for speed or a loop for simplicity.
+    # Given the dataset size (~8000 hours), a simple loop with numpy is fast enough if optimized.
+    # Let's use stride_tricks for max speed.
     
-    # Sanity check for NaNs
-    if np.isnan(features).any():
-        logger.warning("NaNs detected in features! Filling with 0.")
-        features = np.nan_to_num(features)
+    strides = y.strides + y.strides
+    shape = (len(y) - window_size + 1, window_size)
+    y_strided = np.lib.stride_tricks.as_strided(y, shape=shape, strides=strides)
+    
+    # x is constant [0, 1, ... W-1] broadcasted
+    # Calculate numerator: N * sum(xy) - sum(x)*sum(y)
+    # But slope formula: (sum((x-mx)(y-my))) / sum((x-mx)^2)
+    # Simplified: (N*sum(xy) - sum(x)sum(y)) / (N*sum(x^2) - (sum(x))^2)
+    
+    denominator = window_size * sx2 - sx**2
+    
+    # Vectorized dot product for sum(xy) across all windows
+    sum_xy = y_strided.dot(x)
+    sum_y = s_y.dropna().values
+    
+    numerator = (window_size * sum_xy) - (sx * sum_y)
+    
+    slopes = numerator / denominator
+    
+    # Pad beginning with NaNs to match index
+    pad = np.full(window_size - 1, np.nan)
+    return np.concatenate([pad, slopes])
 
+def feature_engineering(df):
+    print("Calculating 30 feature slopes (this may take a moment)...")
+    
+    # 1 day = 24 hours (given 1h resampling)
+    feature_data = pd.DataFrame(index=df.index)
+    
+    for day in LOOKBACK_SLOPES:
+        window_hours = day * 24
+        # Need at least window_size data points
+        if len(df) > window_hours:
+            feature_data[f'slope_{day}d'] = calculate_rolling_slope(df['close'], window_hours)
+            
+    # Targets: Price direction at future horizons
+    # 1 if Price(t+h) > Price(t), else 0
+    target_data = pd.DataFrame(index=df.index)
+    for h_days in HORIZONS_DAYS:
+        h_hours = h_days * 24
+        # Shift close backwards to compare future to current
+        future_close = df['close'].shift(-h_hours)
+        target_data[f'target_{h_days}d'] = (future_close > df['close']).astype(int)
+        
+        # Mask the last h_hours where target is unknown
+        target_data.loc[df.index[-h_hours:], f'target_{h_days}d'] = np.nan
+
+    # Combine and drop NaNs
+    full_data = pd.concat([feature_data, target_data], axis=1).dropna()
+    return full_data
+
+# --- 3. Dataset Prep ---
+def create_sequences(data, feature_cols, target_cols, seq_len):
+    X_vals = data[feature_cols].values
+    y_vals = data[target_cols].values
+    
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(X_vals[i : i+seq_len])
+        y.append(y_vals[i+seq_len]) # Target is the outcome at the END of the sequence step
+        
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+# --- 4. Model Definition ---
+class TrendLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
+        super(TrendLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        # x shape: (batch, seq_len, features)
+        out, _ = self.lstm(x)
+        # Take last time step
+        out = out[:, -1, :] 
+        out = self.fc(out)
+        return self.sigmoid(out)
+
+# --- 5. Main Execution ---
+def main():
+    # A. Get Data
+    df = get_and_process_data()
+    if df is None: return
+
+    # B. Feature Engineering
+    data = feature_engineering(df)
+    print(f"Processed Dataset Shape: {data.shape}")
+
+    # C. Split 60/20/20
+    n = len(data)
+    train_end = int(n * 0.6)
+    val_end = int(n * 0.8)
+    
+    feature_cols = [c for c in data.columns if 'slope' in c]
+    target_cols = [c for c in data.columns if 'target' in c]
+    
+    # Scaling Features (Fit on Train only)
     scaler = StandardScaler()
-    normalized_features = scaler.fit_transform(features)
+    scaler.fit(data.iloc[:train_end][feature_cols])
     
-    return df, normalized_features
+    data[feature_cols] = scaler.transform(data[feature_cols])
+    
+    train_data = data.iloc[:train_end]
+    val_data = data.iloc[train_end:val_end]
+    test_data = data.iloc[val_end:]
+    
+    # Create Sequences
+    X_train, y_train = create_sequences(train_data, feature_cols, target_cols, SEQ_LEN)
+    X_val, y_val = create_sequences(val_data, feature_cols, target_cols, SEQ_LEN)
+    X_test, y_test = create_sequences(test_data, feature_cols, target_cols, SEQ_LEN)
+    
+    # Convert to Tensors
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)), shuffle=True, batch_size=BATCH_SIZE)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)), batch_size=BATCH_SIZE)
+    
+    # D. Model Setup
+    model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols))
+    criterion = nn.BCELoss() # Binary Cross Entropy for Probability
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    train_losses = []
+    val_losses = []
 
-# --- GYM ENVIRONMENT ---
-class CryptoTradingEnv(gym.Env):
-    def __init__(self, df, features, initial_balance=10000, is_training=False):
-        super(CryptoTradingEnv, self).__init__()
-        self.df = df
-        self.features = features
-        self.n_features = features.shape[1]
-        self.window_size = WINDOW_SIZE
-        self.action_space = spaces.Discrete(11) 
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, 
-            shape=(self.window_size, self.n_features), 
-            dtype=np.float32
-        )
-        self.initial_balance = initial_balance
-        self.is_training = is_training
-        self.reset_env()
-
-    def reset(self, seed=None):
-        self.reset_env()
-        return self._get_observation(), {}
-
-    def reset_env(self):
-        self.balance = self.initial_balance
-        self.current_step = self.window_size
-        self.portfolio_value = self.initial_balance
-        self.current_leverage = 0
-        self.history = {'portfolio': [], 'benchmark': []}
-        self.returns_window = [] 
+    print("\n--- Starting Training ---")
+    for epoch in range(EPOCHS):
+        model.train()
+        batch_loss = []
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            batch_loss.append(loss.item())
         
-    def _get_observation(self):
-        obs = self.features[self.current_step - self.window_size : self.current_step]
-        # Protect against NaNs in observation which kill the LSTM
-        return np.nan_to_num(obs).astype(np.float32)
-
-    def step(self, action):
-        try:
-            # 1. Parse Action
-            if isinstance(action, np.ndarray): action_val = int(action.item())
-            else: action_val = int(action)
-            
-            target_leverage = LEVERAGE_MAP[action_val]
-            
-            # 2. Update Stats
-            if self.is_training:
-                 with state_lock:
-                     GLOBAL_STATE["metrics"]["actions"][action_val] += 1
-
-            # 3. Check for Data End
-            if self.current_step >= len(self.df) - 1:
-                return self._get_observation(), 0, True, False, {}
-
-            # 4. Market Moves
-            market_return = self.df['pct_change'].iloc[self.current_step]
-            
-            # Sanity Check for bad data
-            if np.isnan(market_return) or np.isinf(market_return):
-                market_return = 0
-                logger.warning(f"Bad data at step {self.current_step}")
-
-            # Cost Calculation
-            leverage_change = abs(target_leverage - self.current_leverage)
-            cost_percent = leverage_change * TRADING_FEE
-            
-            # PnL Calculation
-            gross_return = (target_leverage * market_return)
-            net_return = gross_return - cost_percent
-            
-            self.portfolio_value *= (1 + net_return)
-            self.current_leverage = target_leverage
-            
-            # 5. Reward & Done Logic
-            done = False
-            
-            # BANKRUPTCY CHECK
-            if self.portfolio_value < self.initial_balance * 0.4:
-                done = True
-                reward = -100 # Heavy penalty
-            else:
-                # Reward: Log Return normalized for stability
-                # Using log return handles compounding better
-                reward = np.log(1 + net_return + 1e-9) * 10 
+        # Validation
+        model.eval()
+        val_batch_loss = []
+        with torch.no_grad():
+            for X_v, y_v in val_loader:
+                y_p = model(X_v)
+                loss = criterion(y_p, y_v)
+                val_batch_loss.append(loss.item())
                 
-                # Volatility Penalty
-                volatility = self.df['volatility'].iloc[self.current_step]
-                if abs(target_leverage) > 2 and volatility > 0.03:
-                    reward -= 1.0
-
-            # Dashboard Updates
-            if self.is_training:
-                with state_lock:
-                    if self.current_step % 50 == 0:
-                        GLOBAL_STATE["metrics"]["portfolio"].append(float(self.portfolio_value))
-
-            # 6. Advance
-            self.current_step += 1
-            if self.current_step >= len(self.df) - 1:
-                done = True
-            
-            self.history['portfolio'].append(self.portfolio_value)
-            
-            # Benchmark Update
-            if not self.history['benchmark']:
-                self.history['benchmark'].append(self.initial_balance)
-            else:
-                prev = self.history['benchmark'][-1]
-                self.history['benchmark'].append(prev * (1 + market_return))
-
-            return self._get_observation(), reward, done, False, {}
-
-        except Exception as e:
-            logger.error(f"Error in env step {self.current_step}: {e}")
-            # Return safe values to prevent crash, but terminate episode
-            return self._get_observation(), 0, True, False, {}
-
-# --- WORKER ---
-def training_worker():
-    logger.info("Background Worker: Started.")
-    try:
-        with state_lock:
-            GLOBAL_STATE["status"] = "fetching"
-            GLOBAL_STATE["message"] = "Fetching Data..."
+        avg_train = np.mean(batch_loss)
+        avg_val = np.mean(val_batch_loss)
+        train_losses.append(avg_train)
+        val_losses.append(avg_val)
         
-        raw_df = fetch_and_prepare_data()
-        if raw_df is None or raw_df.empty: 
-            raise Exception("Data fetch returned empty or None")
+        if (epoch+1) % 2 == 0:
+            print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
 
-        with state_lock:
-            GLOBAL_STATE["status"] = "preprocessing"
-            GLOBAL_STATE["message"] = "Processing Data..."
-            
-        df, norm_features = preprocess_data(raw_df)
-        
-        split = int(len(df) * TRAIN_TEST_SPLIT)
-        train_df = df.iloc[:split]
-        train_feat = norm_features[:split]
-        test_df = df.iloc[split:]
-        test_feat = norm_features[split:]
-        
-        logger.info(f"Train Set: {len(train_df)} days | Test Set: {len(test_df)} days")
-
-        with state_lock:
-            GLOBAL_STATE["status"] = "training"
-            GLOBAL_STATE["message"] = f"Training Model ({TRAINING_STEPS} Steps)..."
-        
-        train_env = DummyVecEnv([lambda: CryptoTradingEnv(train_df, train_feat, is_training=True)])
-        
-        logger.info("Initializing PPO LSTM...")
-        model = RecurrentPPO(
-            "MlpLstmPolicy", 
-            train_env, 
-            verbose=0,
-            learning_rate=3e-4,
-            n_steps=512, 
-            batch_size=64,
-            ent_coef=0.02, 
-            gamma=0.99,
-            policy_kwargs={"lstm_hidden_size": 128, "enable_critic_lstm": True}
-        )
-        
-        class ProgCallback(BaseCallback):
-            def _on_step(self):
-                with state_lock: GLOBAL_STATE["progress"] = self.num_timesteps
-                if self.num_timesteps % 1000 == 0:
-                    logger.info(f"Step {self.num_timesteps}/{TRAINING_STEPS} completed.")
-                return True
-        
-        logger.info("Starting .learn()...")
-        model.learn(total_timesteps=TRAINING_STEPS, callback=ProgCallback())
-        logger.info("Training finished.")
-
-        with state_lock:
-            GLOBAL_STATE["status"] = "backtesting"
-            GLOBAL_STATE["message"] = "Backtesting on 2024+ data..."
-
-        test_env = CryptoTradingEnv(test_df, test_feat)
-        obs, _ = test_env.reset()
-        done = False
-        logger.info("Running backtest loop...")
-        
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, _, done, _, _ = test_env.step(action)
-
-        logger.info("Backtest complete. Generating results.")
-        
-        with state_lock:
-            GLOBAL_STATE["results"] = {
-                "dates": test_df.index[WINDOW_SIZE : WINDOW_SIZE + len(test_env.history['portfolio'])],
-                "portfolio": test_env.history['portfolio'],
-                "benchmark": test_env.history['benchmark']
-            }
-            GLOBAL_STATE["status"] = "completed"
-            GLOBAL_STATE["message"] = "Analysis Done."
-            GLOBAL_STATE["final_plot_ready"] = True
-            
-    except Exception as e:
-        # Capture the FULL Traceback
-        err_msg = traceback.format_exc()
-        logger.error(f"FATAL WORKER CRASH:\n{err_msg}")
-        with state_lock:
-            GLOBAL_STATE["status"] = "error"
-            GLOBAL_STATE["error_msg"] = str(e)
-            # Log it to the UI console too
-            GLOBAL_STATE["logs"].append(f"[FATAL] {str(e)}")
-
-# --- FLASK ROUTES ---
-@app.route('/')
-def dashboard():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/status')
-def get_status():
-    with state_lock:
-        return jsonify({
-            "status": GLOBAL_STATE["status"],
-            "message": GLOBAL_STATE["message"],
-            "progress": GLOBAL_STATE["progress"],
-            "total": GLOBAL_STATE["total_steps"],
-            "portfolio": GLOBAL_STATE["metrics"]["portfolio"], 
-            "actions": GLOBAL_STATE["metrics"]["actions"],
-            "error": GLOBAL_STATE["error_msg"],
-            "ready": GLOBAL_STATE["final_plot_ready"],
-            "logs": GLOBAL_STATE["logs"][-50:] # Send last 50 logs to frontend
-        })
-
-@app.route('/result.png')
-def get_result_image():
-    with state_lock: data = GLOBAL_STATE.get("results", {})
-    if not data: return "No results", 404
-
-    dates = data["dates"]
-    port = np.array(data["portfolio"])
-    bench = np.array(data["benchmark"])
+    # E. Visualization
+    print("\n--- Visualizing Results ---")
     
-    L = min(len(port), len(bench), len(dates))
-    dates, port, bench = dates[:L], port[:L], bench[:L]
+    # 1. Loss Curve
+    plt.figure(figsize=(14, 10))
+    plt.subplot(2, 1, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Training History')
+    plt.xlabel('Epoch')
+    plt.ylabel('BCE Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    def get_sharpe(s):
-        r = pd.Series(s).pct_change().dropna()
-        if r.std() == 0: return 0
-        return (r.mean() / r.std()) * np.sqrt(365)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(dates, port, label=f'AI (Sharpe: {get_sharpe(port):.2f})', color='#00e676')
-    ax.plot(dates, bench, label=f'Hold (Sharpe: {get_sharpe(bench):.2f})', color='gray', linestyle='--')
-    ax.set_title("Out-of-Sample Performance")
-    ax.legend()
-    ax.grid(True, alpha=0.2)
+    # 2. Test Predictions (Sample)
+    # We will predict on Test set and show certainty for 1 Day and 30 Day horizons
+    model.eval()
+    with torch.no_grad():
+        test_preds = model(torch.from_numpy(X_test)).numpy()
     
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return send_file(buf, mimetype='image/png')
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>RL Training Console</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { background:#0d1117; color:#c9d1d9; font-family:'Courier New', monospace; margin:20px; }
-        .card { background:#161b22; padding:20px; margin-bottom:20px; border: 1px solid #30363d; border-radius:6px; }
-        .bar-bg { background:#21262d; height:10px; border-radius:5px; overflow:hidden; }
-        .bar-fill { background:#238636; height:100%; width:0%; transition:0.3s; }
-        .grid { display:grid; grid-template-columns: 2fr 1fr; gap:20px; }
-        
-        /* TERMINAL STYLES */
-        .terminal { 
-            background: #000; 
-            color: #0f0; 
-            padding: 15px; 
-            height: 200px; 
-            overflow-y: auto; 
-            font-size: 12px;
-            border-radius: 4px;
-            border: 1px solid #333;
-        }
-        .log-entry { margin-bottom: 2px; border-bottom: 1px solid #111; }
-        .log-entry:last-child { border: none; }
-        
-        @media(max-width:800px) { .grid { grid-template-columns: 1fr; } }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h1 style="margin:0; font-size:20px;">RL Trading Bot Control</h1>
-            <span id="status" style="font-weight:bold; color:#238636;">LOADING</span>
-        </div>
-        <div style="margin:15px 0;">
-            <div class="bar-bg"><div id="bar" class="bar-fill"></div></div>
-            <div style="display:flex; justify-content:space-between; font-size:12px; color:#8b949e; margin-top:5px;">
-                <span id="msg">Initializing...</span>
-                <span id="counts">0 / 0</span>
-            </div>
-        </div>
-    </div>
+    # Create DataFrame for easier plotting
+    pred_df = pd.DataFrame(test_preds, columns=target_cols)
+    actual_df = pd.DataFrame(y_test, columns=target_cols)
     
-    <div class="card">
-        <h3 style="margin-top:0;">Live System Logs</h3>
-        <div id="terminal" class="terminal"></div>
-    </div>
+    # Plotting first 200 test points for 1-Day vs 30-Day prediction
+    plt.subplot(2, 1, 2)
+    
+    # Horizon indices
+    h1_idx = 0 # 1 Day
+    h30_idx = -1 # 30 Day
+    
+    subset = 150
+    x_axis = range(subset)
+    
+    # 1 Day Horizon
+    plt.plot(x_axis, actual_df.iloc[:subset, h1_idx], 'g-', alpha=0.3, label='Actual 1D Direction')
+    plt.plot(x_axis, pred_df.iloc[:subset, h1_idx], 'g--', label='Predicted 1D Probability')
+    
+    # 30 Day Horizon
+    plt.plot(x_axis, actual_df.iloc[:subset, h30_idx], 'b-', alpha=0.3, label='Actual 30D Direction')
+    plt.plot(x_axis, pred_df.iloc[:subset, h30_idx], 'b--', label='Predicted 30D Probability')
+    
+    plt.title(f'Test Set Predictions (First {subset} samples) - Up/Down Certainty')
+    plt.ylabel('Probability (0=Down, 1=Up)')
+    plt.xlabel('Time Steps (Hours)')
+    plt.legend(loc='lower right')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
 
-    <div class="grid" id="live-area">
-        <div class="card">
-            <h3>Training Portfolio</h3>
-            <canvas id="portChart" height="200"></canvas>
-        </div>
-        <div class="card">
-            <h3>Leverage Distribution</h3>
-            <canvas id="actChart" height="200"></canvas>
-        </div>
-    </div>
+    # F. Save Model
+    torch.save(model.state_dict(), 'trend_lstm_model.pth')
+    print("Model saved to trend_lstm_model.pth")
 
-    <div id="final-area" class="card" style="display:none;">
-        <h3>Final Results</h3>
-        <img id="final-img" style="width:100%; border-radius:4px;">
-    </div>
-
-    <script>
-        const pc = new Chart(document.getElementById('portChart'), {
-            type:'line', data:{datasets:[{borderColor:'#238636', borderWidth:1, radius:0, data:[]}]},
-            options:{animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{grid:{color:'#21262d'}}}}
-        });
-        
-        const ac = new Chart(document.getElementById('actChart'), {
-            type:'bar', 
-            data:{
-                labels:['-5x','-4x','-3x','-2x','-1x','0x','1x','2x','3x','4x','5x'],
-                datasets:[{backgroundColor:'#1f6feb', data:new Array(11).fill(0)}]
-            },
-            options:{animation:false, plugins:{legend:{display:false}}, scales:{y:{display:false}}}
-        });
-
-        const term = document.getElementById('terminal');
-
-        setInterval(() => {
-            fetch('/api/status').then(r=>r.json()).then(d => {
-                document.getElementById('status').innerText = d.status.toUpperCase();
-                document.getElementById('msg').innerText = d.message;
-                document.getElementById('counts').innerText = `${d.progress} / ${d.total}`;
-                document.getElementById('bar').style.width = (d.progress/d.total*100)+'%';
-                
-                // Update Logs
-                if (d.logs && d.logs.length > 0) {
-                    term.innerHTML = d.logs.map(l => `<div class="log-entry">${l}</div>`).join('');
-                    term.scrollTop = term.scrollHeight; // Auto-scroll
-                }
-                
-                if(d.status === 'training') {
-                    pc.data.labels = new Array(d.portfolio.length).fill('');
-                    pc.data.datasets[0].data = d.portfolio;
-                    pc.update();
-                    
-                    ac.data.datasets[0].data = d.actions;
-                    ac.update();
-                }
-                
-                if(d.ready) {
-                    document.getElementById('live-area').style.display = 'none';
-                    document.getElementById('final-area').style.display = 'block';
-                    document.getElementById('final-img').src = '/result.png?t='+Date.now();
-                }
-            });
-        }, 1000);
-    </script>
-</body>
-</html>
-"""
-
-if not worker_thread_started:
-    t = threading.Thread(target=training_worker, daemon=True)
-    t.start()
-    worker_thread_started = True
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+if __name__ == '__main__':
+    main()
