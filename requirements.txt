@@ -3,9 +3,6 @@ gunicorn
 pandas
 numpy
 matplotlib
-requests
-gymnasium
-stable-baselines3
-sb3-contrib
+torch
+gdown
 scikit-learn
-shimmy>=0.2.1
