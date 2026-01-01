@@ -27,17 +27,17 @@ np.random.seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 HORIZONS_DAYS = [1, 2, 3, 4, 5, 6, 7, 14, 30]
-
-# CHANGE 1: Single Feature Input
-# We only give the 1-day slope. The LSTM will use SEQ_LEN to "remember" the history 
-# and infer longer trends (3d, 7d, 30d) internally.
 LOOKBACK_SLOPES = [1] 
 
 SEQ_LEN = 24
-RESAMPLE_FREQ = '1d' # Daily candles
 BATCH_SIZE = 64
 EPOCHS = 10
 FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
+
+# --- FREQUENCY CONFIGURATION ---
+# We calculate features on High Res (1h), but Train on Low Res (1d)
+RESAMPLE_FREQ = '1h'      # Base frequency for loading/slope calculation (prevents window=1 error)
+TRAINING_FREQ = '1d'      # Frequency for the LSTM steps
 
 # --- Global State ---
 app = Flask(__name__)
@@ -65,24 +65,39 @@ def get_and_process_data():
     try:
         df = pd.read_csv(output_file)
         df.columns = [c.lower().strip() for c in df.columns]
+        
         date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
+        if not date_col:
+            raise ValueError("No date/time column found in CSV")
+            
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.set_index(date_col).sort_index()
         
-        # Resampling to Daily
+        log(f"Original data rows: {len(df)}")
+        
+        # Resample to BASE frequency (1h) first. 
+        # This keeps high fidelity for slope calculation.
         df_resampled = df['close'].resample(RESAMPLE_FREQ).last().dropna().to_frame()
+        
+        log(f"Resampled to Base Freq ({RESAMPLE_FREQ}). Rows: {len(df_resampled)}")
         return df_resampled
     except Exception as e:
         log(f"Data processing error: {e}")
         return None
 
 def calculate_rolling_slope_fast(series, window_size):
+    # REVERTED: Removed the "window_size < 2" check as requested.
+    # Since we are now using 1h data, 1 day window = 24 steps, so this is safe.
+    
     y = series.values
     x = np.arange(window_size)
     n = window_size
     sum_x = x.sum()
     sum_x2 = (x ** 2).sum()
     delta = n * sum_x2 - sum_x ** 2
+    
+    if delta == 0:
+        return np.full(len(y), np.nan)
     
     sum_y = np.convolve(y, np.ones(n), 'valid')
     sum_xy = np.convolve(y, x[::-1], 'valid')
@@ -94,6 +109,7 @@ def calculate_rolling_slope_fast(series, window_size):
     return np.concatenate([pad, m])
 
 def get_rows_per_day():
+    # Returns rows per day based on the BASE frequency (1h)
     if RESAMPLE_FREQ == '1h':
         return 24
     elif RESAMPLE_FREQ == '1d':
@@ -102,14 +118,15 @@ def get_rows_per_day():
         return 1440 
 
 def feature_engineering(df):
-    log("Feature Engineering (Calculating Slopes)...")
+    log("Feature Engineering (Calculating Slopes on 1H data)...")
     feature_data = pd.DataFrame(index=df.index)
     
-    rows_per_day = get_rows_per_day()
+    rows_per_day = get_rows_per_day() # 24 for 1h
     
-    # Only calculating slope_1d now
     for day in LOOKBACK_SLOPES:
         window_size = day * rows_per_day
+        # Window size is now 1 * 24 = 24. No div by zero error.
+        
         if len(df) > window_size:
             feature_data[f'slope_{day}d'] = calculate_rolling_slope_fast(df['close'], window_size)
             
@@ -119,10 +136,22 @@ def feature_engineering(df):
         h_steps = h_days * rows_per_day
         future_close = df['close'].shift(-h_steps)
         target_data[f'target_{h_days}d'] = (future_close > df['close']).astype(int)
+        
+        # Mask the end where we don't know the future
         target_data.loc[df.index[-h_steps:], f'target_{h_days}d'] = np.nan
 
-    full_data = pd.concat([feature_data, target_data], axis=1).dropna()
-    return full_data
+    # Combine
+    full_data = pd.concat([feature_data, target_data], axis=1)
+    
+    log(f"Data shape before training resample: {full_data.shape}")
+    
+    # --- CRITICAL STEP: Downsample to Training Frequency (1d) ---
+    log(f"Resampling to Training Frequency ({TRAINING_FREQ})...")
+    # We take the last value of the day. 
+    # Since slopes are rolling, the last value of the day represents the slope calculated over the previous 24h.
+    train_data = full_data.resample(TRAINING_FREQ).last().dropna()
+    
+    return train_data
 
 def create_sequences(data, feature_cols, target_cols, seq_len):
     X_vals = data[feature_cols].values
@@ -136,7 +165,6 @@ def create_sequences(data, feature_cols, target_cols, seq_len):
 class TrendLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(TrendLSTM, self).__init__()
-        # Dropout 0.6 kept for regularization
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.6)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.sigmoid = nn.Sigmoid()
@@ -162,11 +190,12 @@ def run_pipeline():
 
         training_state['status'] = 'processing'
         data = feature_engineering(df)
-        log(f"Dataset Shape: {data.shape}")
+        log(f"Dataset Shape (Ready for Train): {data.shape}")
 
-        # Check for dataset size assuming 2 years of data (~730 rows)
         if len(data) < SEQ_LEN + BATCH_SIZE:
-             log(f"WARNING: Dataset has {len(data)} rows. If this fails, ensure CSV has > 100 days of history.")
+             log(f"WARNING: Dataset has {len(data)} rows.")
+             if len(data) == 0:
+                 raise ValueError("Dataset is empty. Check NaN dropping.")
              if len(data) < 50:
                  raise ValueError(f"Dataset too small ({len(data)} rows) for training.")
 
@@ -192,14 +221,15 @@ def run_pipeline():
         X_val, y_val = create_sequences(val_data, feature_cols, target_cols, SEQ_LEN)
         X_test, y_test = create_sequences(test_data, feature_cols, target_cols, SEQ_LEN)
         
+        if len(X_train) == 0:
+            raise ValueError(f"Training set is empty. Rows: {len(train_data)}, SeqLen: {SEQ_LEN}")
+
         train_loader = DataLoader(TensorDataset(X_train, y_train), shuffle=True, batch_size=BATCH_SIZE)
         val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE)
         
-        # Model input_dim will now be 1
         model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols)).to(device)
         criterion = nn.BCELoss()
         
-        # Keeping low LR and high weight decay for stability
         optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
         
         train_losses = []
@@ -209,9 +239,7 @@ def run_pipeline():
         log(f"Starting Training on {device} for {EPOCHS} epochs...")
         
         total_batches = len(train_loader)
-        if total_batches == 0:
-             raise ValueError("Not enough data to create even one batch. Check dataset size.")
-
+        
         for epoch in range(EPOCHS):
             model.train()
             batch_loss = []
@@ -222,14 +250,10 @@ def run_pipeline():
                 y_pred = model(X_batch)
                 loss = criterion(y_pred, y_batch)
                 loss.backward()
-                
-                # Gradient Clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 batch_loss.append(loss.item())
                 
-                # Logging
                 log_freq = 10 if total_batches > 10 else 1
                 if (i + 1) % log_freq == 0 or (i + 1) == total_batches:
                     log(f"Epoch {epoch+1} | Batch {i+1}/{total_batches} | Loss: {loss.item():.4f}")
@@ -275,11 +299,9 @@ def run_pipeline():
         plt.subplot(2, 1, 2)
         subset = 200
         
-        # 1 Day Certainty
         plt.plot(actual_df.iloc[:subset, 0], color='lime', alpha=0.3, linewidth=1, label='Actual 1D')
         plt.plot(pred_df.iloc[:subset, 0], color='lime', linestyle='--', linewidth=1.5, label='Pred 1D Probability')
         
-        # 30 Day Certainty
         plt.plot(actual_df.iloc[:subset, -1], color='magenta', alpha=0.3, linewidth=1, label='Actual 30D')
         plt.plot(pred_df.iloc[:subset, -1], color='magenta', linestyle='--', linewidth=1.5, label='Pred 30D Probability')
         
