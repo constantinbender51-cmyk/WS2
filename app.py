@@ -35,46 +35,59 @@ class SimpleLSTM(nn.Module):
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        h0 = torch.zeros(1, x.size(0), self.hidden_size)
-        c0 = torch.zeros(1, x.size(0), self.hidden_size)
+        h0 = torch.zeros(1, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(1, x.size(0), self.hidden_size).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
         out = self.fc(out[:, -1, :])
         return out
 
+def get_best_fit_slope(y_window):
+    """Calculates the slope of the line of best fit for 10 points."""
+    # x values are just 0, 1, 2, ..., 9
+    n = len(y_window)
+    x = np.arange(n)
+    # Simple linear regression slope formula
+    m = (n * np.sum(x * y_window) - np.sum(x) * np.sum(y_window)) / (n * np.sum(x**2) - (np.sum(x))**2)
+    return m
+
 # --- Training Logic ---
 def train_model():
-    print("--- Starting Training with Slope Features ---")
+    print("--- Starting Training with Best-Fit Slope Features ---")
     
     # 1. Data Generation
-    N = 1000
+    N = 1200
     t = np.linspace(0, 100, N)
-    raw_data = np.sin(t) + 0.2 * np.random.normal(size=N)
+    raw_data = np.sin(t) + 0.15 * np.random.normal(size=N)
     
-    # 2. Calculate Slopes (Differences)
-    # slope[i] = raw_data[i] - raw_data[i-1]
-    # This results in N-1 points.
-    slopes = np.diff(raw_data)
+    # 2. Calculate Rolling Best-Fit Slopes
+    # Each 'slope' is calculated from the previous 10 amplitude points
+    slope_window = 10
+    slopes = []
+    for i in range(slope_window, len(raw_data)):
+        window = raw_data[i - slope_window : i]
+        slopes.append(get_best_fit_slope(window))
     
-    # 3. Prepare windowed data
-    # We want to use 20 "slopes" to predict the amplitude at the end of that window
-    window_size = 20
+    slopes = np.array(slopes)
+    
+    # 3. Prepare windowed data for LSTM
+    # We use a sequence of 20 'slopes' to predict the current amplitude
+    lstm_seq_length = 20
     X, y = [], []
     
-    # Because slopes is len N-1, we start indices accordingly
-    # We look at slopes from i to i+window_size
-    # We predict the amplitude at raw_data[i + window_size]
-    for i in range(len(slopes) - window_size):
-        X.append(slopes[i : i + window_size])
-        y.append(raw_data[i + window_size])
+    # The 'slopes' array starts representing data from index 'slope_window' onwards
+    for i in range(len(slopes) - lstm_seq_length):
+        X.append(slopes[i : i + lstm_seq_length])
+        # We predict the amplitude at the point corresponding to the end of this sequence
+        y.append(raw_data[i + slope_window + lstm_seq_length])
     
     X = torch.tensor(np.array(X), dtype=torch.float32).unsqueeze(-1) 
     y = torch.tensor(np.array(y), dtype=torch.float32).unsqueeze(-1)
     
     model = SimpleLSTM()
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
     
-    epochs = 500
+    epochs = 600
     with state.lock:
         state.total_epochs = epochs
 
@@ -91,37 +104,35 @@ def train_model():
             state.current_epoch = epoch + 1
             state.current_loss = loss.item()
 
-        if epoch % 20 == 0 or epoch == epochs - 1:
+        if epoch % 25 == 0 or epoch == epochs - 1:
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
-            generate_plot(model, X, y, t, window_size, loss.item(), epoch, slopes)
+            generate_plot(model, X, y, t, slope_window + lstm_seq_length, loss.item(), epoch, slopes)
             
-        time.sleep(0.02)
+        time.sleep(0.01)
 
     with state.lock:
         state.training_finished = True
 
-def generate_plot(model, X, y, t, window_size, loss, epoch, slopes):
+def generate_plot(model, X, y, t, offset, loss, epoch, slopes):
     model.eval()
     with torch.no_grad():
         predictions = model(X).numpy()
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
     
-    # Top Plot: Predictions vs Actual Amplitudes
-    # Note: X starts at index 0 of slopes, so the target y corresponds to index window_size of t
-    plot_t = t[window_size : window_size + len(predictions)]
-    ax1.plot(plot_t, y.numpy(), label='Actual Amplitude', alpha=0.4, color='gray')
-    ax1.plot(plot_t, predictions, label='LSTM Prediction (from Slopes)', color='red', linewidth=1.5)
-    ax1.set_title(f'Epoch {epoch} | Loss: {loss:.4f}')
+    # Prediction Plot
+    plot_t = t[offset : offset + len(predictions)]
+    ax1.plot(plot_t, y.numpy(), label='Actual Amplitude', alpha=0.3, color='teal')
+    ax1.plot(plot_t, predictions, label='Predicted (from 10pt Slopes)', color='darkorange', linewidth=2)
+    ax1.set_title(f'Best-Fit Slope LSTM | Epoch {epoch} | Loss: {loss:.6f}')
     ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    ax1.grid(True, linestyle='--', alpha=0.6)
     
-    # Bottom Plot: The Feature (Slopes)
-    # Just showing a snippet of the slopes to visualize the input "noise"
-    ax2.plot(plot_t, slopes[0:len(predictions)], label='Input Feature (Slope/Diff)', color='blue', alpha=0.6)
-    ax2.set_title('Input Features: Sequential Slopes ($y_t - y_{t-1}$)')
+    # Slope Feature Plot
+    ax2.plot(plot_t, slopes[:len(predictions)], label='Input: 10-pt Best-Fit Slope', color='purple', alpha=0.7)
+    ax2.set_ylabel('Slope Value')
     ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    ax2.grid(True, linestyle='--', alpha=0.6)
     
     plt.tight_layout()
     
@@ -136,43 +147,47 @@ def generate_plot(model, X, y, t, window_size, loss, epoch, slopes):
 @app.route('/')
 def dashboard():
     with state.lock:
-        status = "Finished" if state.training_finished else "Training..."
+        status = "Completed" if state.training_finished else "Processing..."
         epoch_str = f"{state.current_epoch} / {state.total_epochs}"
-        loss_str = f"{state.current_loss:.5f}"
+        loss_val = f"{state.current_loss:.6f}"
 
-    html = f"""
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Slope-Based LSTM Monitor</title>
+        <title>Regression Slope LSTM</title>
         <meta http-equiv="refresh" content="2">
         <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; padding: 20px; background: #eceff1; color: #37474f; }}
-            .card {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); max-width: 900px; margin: 0 auto; }}
-            img {{ max-width: 100%; height: auto; border-radius: 4px; margin-top: 20px; border: 1px solid #cfd8dc; }}
-            .stats {{ display: flex; justify-content: space-around; margin-bottom: 30px; border-bottom: 1px solid #eee; padding-bottom: 20px; }}
-            .val {{ font-size: 1.8em; font-weight: bold; color: #2196f3; }}
-            .label {{ color: #90a4ae; font-size: 0.85em; text-transform: uppercase; letter-spacing: 1px; }}
-            h1 {{ margin-top: 0; color: #263238; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 40px; color: #1c1e21; }}
+            .container {{ background: white; max-width: 1000px; margin: 0 auto; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #f0f2f5; padding-bottom: 20px; margin-bottom: 20px; }}
+            .stat-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }}
+            .stat-card {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #e9ecef; }}
+            .stat-label {{ font-size: 12px; text-transform: uppercase; color: #65676b; font-weight: 600; }}
+            .stat-value {{ font-size: 24px; font-weight: bold; color: #1877f2; }}
+            img {{ width: 100%; height: auto; border-radius: 8px; }}
+            .badge {{ background: #e7f3ff; color: #1877f2; padding: 4px 12px; border-radius: 20px; font-size: 14px; font-weight: 600; }}
         </style>
     </head>
     <body>
-        <div class="card">
-            <h1>Slope-Feature LSTM</h1>
-            <div class="stats">
-                <div class="stat-box"><div class="val">{status}</div><div class="label">Status</div></div>
-                <div class="stat-box"><div class="val">{epoch_str}</div><div class="label">Epoch</div></div>
-                <div class="stat-box"><div class="val">{loss_str}</div><div class="label">Loss</div></div>
+        <div class="container">
+            <div class="header">
+                <h1 style="margin:0">LSTM: Linear Regression Slopes</h1>
+                <span class="badge">{status}</span>
             </div>
-            <img src="/plot.png?t={time.time()}" alt="Generating visualization..." />
-            <p style="color: #78909c; font-size: 0.9em; margin-top: 20px;">
-                Using $\Delta y$ (Slope) as input to predict absolute $y$ (Amplitude).
+            <div class="stat-grid">
+                <div class="stat-card"><div class="stat-label">Progress</div><div class="stat-value">{epoch_str}</div></div>
+                <div class="stat-card"><div class="stat-label">Current MSE Loss</div><div class="stat-value">{loss_val}</div></div>
+                <div class="stat-card"><div class="stat-label">Slope Window</div><div class="stat-value">10 pts</div></div>
+            </div>
+            <img src="/plot.png?t={time.time()}" />
+            <p style="text-align:center; color:#65676b; font-size:14px; margin-top:20px;">
+                Inputs: Sequence of 20 slopes (each calculated via Linear Regression on 10 points). Target: Next amplitude.
             </p>
         </div>
     </body>
     </html>
     """
-    return html
 
 @app.route('/plot.png')
 def plot_image():
@@ -182,7 +197,7 @@ def plot_image():
             buf = io.BytesIO(state.latest_plot_buffer.getvalue())
     if buf:
         return send_file(buf, mimetype='image/png')
-    return Response("Not Ready", status=503)
+    return Response("Loading...", status=503)
 
 if __name__ == "__main__":
     training_thread = threading.Thread(target=train_model, daemon=True)
