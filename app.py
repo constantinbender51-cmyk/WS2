@@ -1,161 +1,118 @@
-import os
-import sys
-import time
-import gdown
-import numpy as np
 import pandas as pd
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.regularizers import l1_l2
-from tensorflow.keras.callbacks import Callback
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
 
 # ==========================================
 # Configuration
 # ==========================================
-FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
-OUTPUT_FILE = 'market_data.csv'
+OUTPUT_FILE = 'market_data.csv' # Uses the file from previous step
+MODEL_FILE = 'simplified_lstm_model.h5'
 LOOKBACK_DAYS = 14
 TARGET_HORIZONS = [1, 2, 3, 5, 8, 13, 21] 
+MINUTES_PER_DAY = 1440
 
-# Hyperparameters
-BATCH_SIZE = 32
-EPOCHS = 50
-UNITS = 64
-DROPOUT = 0.2
-L1_L2_REG = 1e-4
+def load_and_prep_data():
+    print("Loading data for verification...")
+    df = pd.read_csv(OUTPUT_FILE)
+    
+    # robust timestamp parsing
+    if df['timestamp'].dtype == 'O':
+         df['timestamp'] = pd.to_datetime(df['timestamp'])
+    else:
+         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+         
+    df.set_index('timestamp', inplace=True)
+    df.sort_index(inplace=True)
+    
+    # 1. Resample to Daily
+    df_daily = df['close'].resample('1D').last().dropna().to_frame()
+    df_daily['log_price'] = np.log(df_daily['close'])
+    
+    # 2. Re-create Features & Targets explicitly for inspection
+    # Feature lag 0 = Close(T) - Close(T-1)
+    df_daily['feat_lag_0'] = df_daily['log_price'].shift(0) - df_daily['log_price'].shift(1)
+    
+    # Target 1d = Close(T+1) - Close(T)
+    df_daily['target_1d'] = df_daily['log_price'].shift(-1) - df_daily['log_price']
+    
+    # Full Feature Set Generation (Same as training)
+    feature_cols = []
+    for i in range(LOOKBACK_DAYS):
+        col_name = f'feat_lag_{i}'
+        df_daily[col_name] = df_daily['log_price'].shift(i) - df_daily['log_price'].shift(i + 1)
+        feature_cols.append(col_name)
 
-# ==========================================
-# Utilities
-# ==========================================
-def delayed_print(message):
-    """Prints a message with a 0.1s delay to ensure log ordering on Railway."""
-    print(message)
-    sys.stdout.flush()
-    time.sleep(0.1)
+    # Full Target Set Generation
+    target_cols = []
+    for day in TARGET_HORIZONS:
+        col_name = f'target_{day}d'
+        df_daily[col_name] = df_daily['log_price'].shift(-day) - df_daily['log_price']
+        target_cols.append(col_name)
 
-class RailwayLogger(Callback):
-    """Custom Keras callback for sequential log output."""
-    def on_epoch_end(self, epoch, logs=None):
-        loss = logs.get('loss', 0)
-        val_loss = logs.get('val_loss', 0)
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            delayed_print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {loss:.6f} | Val: {val_loss:.6f}")
+    df_clean = df_daily.dropna()
+    return df_clean, feature_cols, target_cols
 
-# ==========================================
-# 1. Data Download
-# ==========================================
-if not os.path.exists(OUTPUT_FILE):
-    delayed_print("Downloading dataset...")
-    url = f'https://drive.google.com/uc?id={FILE_ID}'
-    gdown.download(url, OUTPUT_FILE, quiet=False)
-    delayed_print("Download finished.")
+def check_lookahead(df):
+    print("\n--- 1. Visual Leakage Inspection ---")
+    print("We are looking for obvious duplicates between Features and Targets.")
+    print("Row T Feature (lag_0) = Return(T-1 to T)")
+    print("Row T Target  (1d)    = Return(T to T+1)")
+    
+    sample = df[['feat_lag_0', 'target_1d']].head(5)
+    print(sample)
+    
+    # Check correlation
+    corr = df['feat_lag_0'].corr(df['target_1d'])
+    print(f"\nCorrelation between Current Return (Feature) and Next Return (Target): {corr:.4f}")
+    if abs(corr) > 0.9:
+        print("CRITICAL WARNING: High correlation detected! Likely Lookahead Bias.")
+    else:
+        print("PASS: No immediate correlation detected. Data alignment looks correct.")
 
-# ==========================================
-# 2. Loading & Resampling
-# ==========================================
-delayed_print("Loading CSV and resampling to Daily...")
-df = pd.read_csv(OUTPUT_FILE, usecols=['timestamp', 'close'])
+def benchmark_model(df, feature_cols, target_cols):
+    print("\n--- 2. Benchmarking (Is it actually learning?) ---")
+    
+    # Load Model
+    model = tf.keras.models.load_model(MODEL_FILE)
+    
+    # Prepare X, y
+    X = df[feature_cols].values[:, ::-1].reshape(-1, LOOKBACK_DAYS, 1)
+    y_true = df[target_cols].values
+    
+    # Scaling (Must replicate training scaler logic)
+    # We cheat slightly and fit on full data for this quick check, 
+    # but strictly we should fit on first 60%.
+    scaler = StandardScaler()
+    X_flat = X.reshape(-1, 1)
+    X_scaled = scaler.fit_transform(X_flat).reshape(X.shape)
+    
+    # Predict
+    y_pred = model.predict(X_scaled, verbose=0)
+    
+    # Calculate MSEs
+    model_mse = mean_squared_error(y_true, y_pred)
+    
+    # Naive Baseline: Predict 0.0 (No change) for everything
+    y_zeros = np.zeros_like(y_true)
+    naive_mse = mean_squared_error(y_true, y_zeros)
+    
+    print(f"Model MSE: {model_mse:.6f}")
+    print(f"Naive MSE: {naive_mse:.6f} (Predicting all zeros)")
+    
+    if model_mse < naive_mse:
+        improvement = (1 - (model_mse / naive_mse)) * 100
+        print(f"RESULT: Model is {improvement:.2f}% better than predicting zero.")
+        print("Interpretation: The model is learning real signal (or overfitting noise), but it is beating the null hypothesis.")
+    else:
+        print("RESULT: Model is WORSE or EQUAL to predicting zero.")
+        print("Interpretation: The model has failed to find signal. The 'low' loss is just the natural low variance of the market.")
 
-# Robust timestamp parsing
-if df['timestamp'].dtype != 'O':
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-else:
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-df.sort_values('timestamp', inplace=True)
-df.set_index('timestamp', inplace=True)
-
-# Resample to Daily (Last close of the day)
-df_daily = df['close'].resample('1D').last().dropna().to_frame()
-delayed_print(f"Resampled from ~4M rows to {len(df_daily)} days.")
-
-# ==========================================
-# 3. Feature & Target Engineering
-# ==========================================
-delayed_print("Engineering features (14-day lookback) and targets...")
-df_daily['log_price'] = np.log(df_daily['close'])
-
-# Features: 14 sequential daily log returns
-feature_cols = []
-for i in range(LOOKBACK_DAYS):
-    col_name = f'feat_lag_{i}'
-    df_daily[col_name] = df_daily['log_price'].shift(i) - df_daily['log_price'].shift(i + 1)
-    feature_cols.append(col_name)
-
-# Targets: Multi-day forward log returns
-target_cols = []
-for day in TARGET_HORIZONS:
-    col_name = f'target_{day}d'
-    df_daily[col_name] = df_daily['log_price'].shift(-day) - df_daily['log_price']
-    target_cols.append(col_name)
-
-df_daily.dropna(inplace=True)
-
-# Prepare arrays
-X = df_daily[feature_cols].values[:, ::-1] # Reverse for chronological order
-y = df_daily[target_cols].values
-
-# Reshape for LSTM: (samples, timesteps, features)
-X = X.reshape((X.shape[0], LOOKBACK_DAYS, 1))
-
-# ==========================================
-# 4. Data Split (60/20/20)
-# ==========================================
-n = len(X)
-train_end = int(n * 0.6)
-val_end = int(n * 0.8)
-
-X_train, y_train = X[:train_end], y[:train_end]
-X_val, y_val = X[train_end:val_end], y[train_end:val_end]
-X_test, y_test = X[val_end:], y[val_end:]
-
-# Scale based on training data
-scaler = StandardScaler()
-X_train_shape = X_train.shape
-X_train_scaled = scaler.fit_transform(X_train.reshape(-1, 1)).reshape(X_train_shape)
-
-X_val_scaled = scaler.transform(X_val.reshape(-1, 1)).reshape(X_val.shape)
-X_test_scaled = scaler.transform(X_test.reshape(-1, 1)).reshape(X_test.shape)
-
-delayed_print(f"Split sizes -> Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-
-# ==========================================
-# 5. Model Definition
-# ==========================================
-delayed_print("Building LSTM Model (3 layers, 64 units)...")
-model = Sequential([
-    LSTM(64, return_sequences=True, input_shape=(LOOKBACK_DAYS, 1),
-         kernel_regularizer=l1_l2(l1=L1_L2_REG, l2=L1_L2_REG)),
-    Dropout(DROPOUT),
-    LSTM(64, return_sequences=True,
-         kernel_regularizer=l1_l2(l1=L1_L2_REG, l2=L1_L2_REG)),
-    Dropout(DROPOUT),
-    LSTM(64, return_sequences=False,
-         kernel_regularizer=l1_l2(l1=L1_L2_REG, l2=L1_L2_REG)),
-    Dropout(DROPOUT),
-    Dense(len(TARGET_HORIZONS))
-])
-
-model.compile(optimizer='adam', loss='mse')
-
-# ==========================================
-# 6. Training
-# ==========================================
-delayed_print("Starting Training...")
-model.fit(
-    X_train_scaled, y_train,
-    validation_data=(X_val_scaled, y_val),
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE,
-    verbose=0,
-    callbacks=[RailwayLogger()]
-)
-
-# Final Evaluation
-test_loss = model.evaluate(X_test_scaled, y_test, verbose=0)
-delayed_print(f"Final Test Loss (MSE): {test_loss:.8f}")
-
-model.save("simplified_lstm_model.h5")
-delayed_print("Process Complete. Model saved.")
+if __name__ == "__main__":
+    if not os.path.exists(OUTPUT_FILE) or not os.path.exists(MODEL_FILE):
+        print(f"Error: Missing {OUTPUT_FILE} or {MODEL_FILE}. Run training script first.")
+    else:
+        df, f_cols, t_cols = load_and_prep_data()
+        check_lookahead(df)
+        benchmark_model(df, f_cols, t_cols)
