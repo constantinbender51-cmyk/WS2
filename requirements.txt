@@ -1,7 +1,5 @@
-streamlit
-pandas
-numpy
-tensorflow
-scikit-learn
-plotly
 gdown
+numpy
+pandas
+scikit-learn
+tensorflow
