@@ -121,8 +121,8 @@ def create_sequences(data, feature_cols, target_cols, seq_len):
 class TrendLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(TrendLSTM, self).__init__()
-        # ADJUSTMENT: Increased dropout from 0.5 to 0.6 for higher regularization
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.6)
+        # ADJUSTMENT 1: Increased dropout from 0.2 to 0.5
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.5)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.sigmoid = nn.Sigmoid()
         
@@ -177,7 +177,7 @@ def run_pipeline():
         model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols)).to(device)
         criterion = nn.BCELoss()
         
-        # ADJUSTMENT: Increased weight_decay from 1e-5 to 1e-4 for higher L2 regularization
+        # ADJUSTMENT 2: Added weight_decay for L2 regularization
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
         
         train_losses = []
