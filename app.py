@@ -178,7 +178,7 @@ def run_pipeline():
         criterion = nn.BCELoss()
         
         # ADJUSTMENT 2: Added weight_decay for L2 regularization
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
         
         train_losses = []
         val_losses = []
