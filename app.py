@@ -1,379 +1,362 @@
-import os
-import io
-import base64
-import threading
-import time
-import logging
-from flask import Flask, render_template_string, jsonify
-
-# Matplotlib backend for non-interactive environments (servers)
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-import gdown
+import streamlit as st
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import plotly.graph_objects as go
+import plotly.express as px
+import gdown
+import os
 
-# --- Configuration ---
-torch.manual_seed(42)
-np.random.seed(42)
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Railway LSTM Deployment",
+    page_icon="🚄",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-HORIZONS_DAYS = [1, 2, 3, 4, 5, 6, 7, 14, 30]
-LOOKBACK_SLOPES = [1] 
+# --- Custom CSS ---
+st.markdown("""
+<style>
+    .reportview-container { background: #0e1117; }
+    .main .block-container { padding-top: 2rem; }
+    h1 { color: #4da6ff; }
+    h2 { border-bottom: 1px solid #333; padding-bottom: 10px; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; }
+</style>
+""", unsafe_allow_html=True)
 
-SEQ_LEN = 24
-BATCH_SIZE = 64
-EPOCHS = 10
-FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
+# --- Helper Functions ---
 
-# --- FREQUENCY CONFIGURATION ---
-RESAMPLE_FREQ = '1h'      
-TRAINING_FREQ = '1d'      
-
-# --- Global State ---
-app = Flask(__name__)
-training_state = {
-    'status': 'idle', 
-    'progress': [],
-    'plot_image': None,
-    'error_msg': None
-}
-
-# --- Data & Model Functions ---
-
-def get_and_process_data():
-    log("Starting data download...")
-    url = f'https://drive.google.com/uc?id={FILE_ID}'
-    output_file = 'ohlcv_data.csv'
-
-    if not os.path.exists(output_file):
-        try:
-            gdown.download(url, output_file, quiet=False)
-        except Exception as e:
-            log(f"Download warning: {e}")
-
-    log("Loading and resampling data...")
+@st.cache_data
+def load_data(source_type, file_upload, url_input):
+    df = None
     try:
-        df = pd.read_csv(output_file)
-        df.columns = [c.lower().strip() for c in df.columns]
-        
-        date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
-        if not date_col:
-            raise ValueError("No date/time column found in CSV")
+        if source_type == "Upload CSV":
+            if file_upload is not None:
+                df = pd.read_csv(file_upload)
+        elif source_type == "Google Drive / URL":
+            if url_input:
+                if "drive.google.com" in url_input:
+                    output = 'downloaded_data.csv'
+                    # Quietly download
+                    gdown.download(url_input, output, quiet=True, fuzzy=True)
+                    df = pd.read_csv(output)
+                else:
+                    df = pd.read_csv(url_input)
+        elif source_type == "Generate Sample Data":
+            # Generate synthetic railway track temperature data
+            date_rng = pd.date_range(start='1/1/2024', end='1/08/2024', freq='T')
+            val = 20 + np.random.randn(len(date_rng)).cumsum() * 0.5 # Random walk
+            seasonality = np.sin(np.arange(len(date_rng)) * (2 * np.pi / (24*60))) * 10 # Daily cycle
+            df = pd.DataFrame({'timestamp': date_rng, 'sensor_value': val + seasonality})
             
-        df[date_col] = pd.to_datetime(df[date_col])
-        df = df.set_index(date_col).sort_index()
-        
-        log(f"Original data rows: {len(df)}")
-        df_resampled = df['close'].resample(RESAMPLE_FREQ).last().dropna().to_frame()
-        log(f"Resampled to Base Freq ({RESAMPLE_FREQ}). Rows: {len(df_resampled)}")
-        return df_resampled
+        return df
     except Exception as e:
-        log(f"Data processing error: {e}")
+        st.error(f"Error loading data: {e}")
         return None
 
-def calculate_rolling_slope_fast(series, window_size):
-    y = series.values
-    x = np.arange(window_size)
-    n = window_size
-    sum_x = x.sum()
-    sum_x2 = (x ** 2).sum()
-    delta = n * sum_x2 - sum_x ** 2
-    
-    if delta == 0:
-        return np.full(len(y), np.nan)
-    
-    sum_y = np.convolve(y, np.ones(n), 'valid')
-    sum_xy = np.convolve(y, x[::-1], 'valid')
-    
-    numerator = n * sum_xy - sum_x * sum_y
-    m = numerator / delta
-    
-    pad = np.full(n - 1, np.nan)
-    return np.concatenate([pad, m])
+def create_dataset(dataset, look_back=1):
+    X, Y = [], []
+    for i in range(len(dataset)-look_back-1):
+        a = dataset[i:(i+look_back), 0]
+        X.append(a)
+        Y.append(dataset[i + look_back, 0])
+    return np.array(X), np.array(Y)
 
-def get_rows_per_day():
-    if RESAMPLE_FREQ == '1h':
-        return 24
-    elif RESAMPLE_FREQ == '1d':
-        return 1
-    else:
-        return 1440 
+# --- Main Application Layout ---
 
-def feature_engineering(df):
-    log("Feature Engineering (Calculating Slopes on 1H data)...")
-    feature_data = pd.DataFrame(index=df.index)
-    rows_per_day = get_rows_per_day() 
+st.title("🚄 Railway Deployment LSTM Framework")
+st.markdown("Generative Time-Series Forecasting with Confidence Estimation")
+
+# --- Sidebar: Configuration ---
+with st.sidebar:
+    st.header("1. Data Configuration")
+    data_source = st.selectbox("Data Source", ["Generate Sample Data", "Upload CSV", "Google Drive / URL"])
     
-    for day in LOOKBACK_SLOPES:
-        window_size = day * rows_per_day
-        if len(df) > window_size:
-            feature_data[f'slope_{day}d'] = calculate_rolling_slope_fast(df['close'], window_size)
-            
-    log("Creating Targets...")
-    target_data = pd.DataFrame(index=df.index)
-    for h_days in HORIZONS_DAYS:
-        h_steps = h_days * rows_per_day
-        future_close = df['close'].shift(-h_steps)
-        target_data[f'target_{h_days}d'] = (future_close > df['close']).astype(int)
-        target_data.loc[df.index[-h_steps:], f'target_{h_days}d'] = np.nan
-
-    full_data = pd.concat([feature_data, target_data], axis=1)
-    log(f"Resampling to Training Frequency ({TRAINING_FREQ})...")
-    train_data = full_data.resample(TRAINING_FREQ).last().dropna()
-    return train_data
-
-def create_sequences(data, feature_cols, target_cols, seq_len):
-    X_vals = data[feature_cols].values
-    y_vals = data[target_cols].values
-    X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(X_vals[i : i+seq_len])
-        y.append(y_vals[i+seq_len])
-    return torch.FloatTensor(np.array(X)), torch.FloatTensor(np.array(y))
-
-class TrendLSTM(nn.Module):
-    # Model Capacity doubled (Layers: 4, Dim: 128)
-    def __init__(self, input_dim, hidden_dim=128, output_dim=9, num_layers=4):
-        super(TrendLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.6)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-        self.sigmoid = nn.Sigmoid()
+    uploaded_file = None
+    url_input = ""
+    
+    if data_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+    elif data_source == "Google Drive / URL":
+        url_input = st.text_input("Enter URL (Direct or GDrive share link)")
         
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :] 
-        out = self.fc(out)
-        return self.sigmoid(out)
+    st.header("2. Preprocessing")
+    resample_freq = st.number_input("Resample Frequency (Minutes)", min_value=1, value=15, step=1)
+    split_ratio = st.slider("Train/Validation Split", 0.5, 0.95, 0.8)
+    
+    st.header("3. Model Architecture")
+    n_layers = st.number_input("Number of LSTM Layers", 1, 5, 2)
+    units = st.number_input("Units per Layer", 10, 500, 50)
+    dropout_rate = st.slider("Dropout Rate", 0.0, 0.5, 0.2)
+    
+    st.header("4. Hyperparameters")
+    look_back = st.number_input("Lookback Window (Steps)", 1, 100, 12)
+    epochs = st.number_input("Epochs", 1, 200, 20)
+    batch_size = st.selectbox("Batch Size", [16, 32, 64, 128], index=1)
+    learning_rate = st.number_input("Learning Rate", 0.0001, 0.1, 0.001, format="%.4f")
 
-# --- Pipeline Logic ---
+    train_btn = st.button("🚀 Train Model")
 
-def log(message):
-    print(message)
-    training_state['progress'].append(message)
+# --- Main Content Area ---
 
-def run_pipeline():
+# 1. Load Data
+df = load_data(data_source, uploaded_file, url_input)
+
+if df is not None:
+    # Column Selection
+    cols = df.columns.tolist()
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        date_col = st.selectbox("Select Timestamp Column", cols, index=0 if 'timestamp' in cols else 0)
+    with c2:
+        target_col = st.selectbox("Select Target Variable", cols, index=1 if 'value' in cols or 'sensor_value' in cols else min(1, len(cols)-1))
+    
+    # Preprocessing
     try:
-        training_state['status'] = 'downloading'
-        df = get_and_process_data()
-        if df is None:
-            raise ValueError("Data could not be loaded")
-
-        training_state['status'] = 'processing'
-        data = feature_engineering(df)
-        log(f"Dataset Shape (Ready for Train): {data.shape}")
-
-        if len(data) < SEQ_LEN + BATCH_SIZE:
-             log(f"WARNING: Dataset has {len(data)} rows.")
-             if len(data) == 0:
-                 raise ValueError("Dataset is empty. Check NaN dropping.")
-             if len(data) < 50:
-                 raise ValueError(f"Dataset too small ({len(data)} rows) for training.")
-
-        # Split
-        n = len(data)
-        train_end = int(n * 0.6)
-        val_end = int(n * 0.8)
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(by=date_col)
+        df_resampled = df.set_index(date_col).resample(f'{resample_freq}T').mean().dropna()
         
-        feature_cols = [c for c in data.columns if 'slope' in c]
-        target_cols = [c for c in data.columns if 'target' in c]
-        
-        # Scale
-        scaler = StandardScaler()
-        scaler.fit(data.iloc[:train_end][feature_cols])
-        data[feature_cols] = scaler.transform(data[feature_cols])
-        
-        train_data = data.iloc[:train_end]
-        val_data = data.iloc[train_end:val_end]
-        test_data = data.iloc[val_end:]
-        
-        log("Generating Sequences...")
-        X_train, y_train = create_sequences(train_data, feature_cols, target_cols, SEQ_LEN)
-        X_val, y_val = create_sequences(val_data, feature_cols, target_cols, SEQ_LEN)
-        X_test, y_test = create_sequences(test_data, feature_cols, target_cols, SEQ_LEN)
-        
-        if len(X_train) == 0:
-            raise ValueError(f"Training set is empty. Rows: {len(train_data)}, SeqLen: {SEQ_LEN}")
-
-        train_loader = DataLoader(TensorDataset(X_train, y_train), shuffle=True, batch_size=BATCH_SIZE)
-        val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE)
-        
-        # Initialize Model with 128 dimensions and 4 layers
-        model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=128, num_layers=4, output_dim=len(target_cols)).to(device)
-        criterion = nn.BCELoss()
-        
-        optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
-        
-        train_losses = []
-        val_losses = []
-
-        training_state['status'] = 'training'
-        log(f"Starting Training on {device} (Layers: 4, Dim: 128) for {EPOCHS} epochs...")
-        
-        total_batches = len(train_loader)
-        
-        for epoch in range(EPOCHS):
-            model.train()
-            batch_loss = []
-            
-            for i, (X_batch, y_batch) in enumerate(train_loader):
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                optimizer.zero_grad()
-                y_pred = model(X_batch)
-                loss = criterion(y_pred, y_batch)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                batch_loss.append(loss.item())
+        st.subheader("Data Preview")
+        with st.expander("Raw Data vs Resampled Data", expanded=True):
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.dataframe(df_resampled.head(), height=250)
+                st.caption(f"Original: {len(df)} rows | Resampled: {len(df_resampled)} rows")
+            with col2:
+                fig_preview = px.line(df_resampled, y=target_col, title=f"{target_col} over Time ({resample_freq} min avg)")
+                fig_preview.update_layout(margin=dict(l=0,r=0,t=30,b=0), height=250)
+                st.plotly_chart(fig_preview, use_container_width=True)
                 
-                log_freq = 10 if total_batches > 10 else 1
-                if (i + 1) % log_freq == 0 or (i + 1) == total_batches:
-                    log(f"Epoch {epoch+1} | Batch {i+1}/{total_batches} | Loss: {loss.item():.4f}")
-            
-            # Validation
-            model.eval()
-            val_batch_loss = []
-            with torch.no_grad():
-                for X_v, y_v in val_loader:
-                    X_v, y_v = X_v.to(device), y_v.to(device)
-                    y_p = model(X_v)
-                    loss = criterion(y_p, y_v)
-                    val_batch_loss.append(loss.item())
-                    
-            avg_train = np.mean(batch_loss)
-            avg_val = np.mean(val_batch_loss) if val_batch_loss else 0
-            train_losses.append(avg_train)
-            val_losses.append(avg_val)
-            
-            log(f"FINISH EPOCH {epoch+1}/{EPOCHS} | Avg Train: {avg_train:.4f} | Avg Val: {avg_val:.4f}")
-
-        # Visualization
-        log("Generating Visualization...")
-        plt.style.use('dark_background')
-        fig = plt.figure(figsize=(14, 10))
-        
-        plt.subplot(2, 1, 1)
-        plt.plot(train_losses, label='Train Loss', color='cyan')
-        plt.plot(val_losses, label='Val Loss', color='orange')
-        plt.title('Training Metrics')
-        plt.legend()
-        plt.grid(alpha=0.2)
-        
-        # Preds
-        model.eval()
-        with torch.no_grad():
-            test_preds = model(X_test.to(device)).cpu().numpy()
-            y_test_cpu = y_test.numpy()
-        
-        pred_df = pd.DataFrame(test_preds, columns=target_cols)
-        actual_df = pd.DataFrame(y_test_cpu, columns=target_cols)
-        
-        plt.subplot(2, 1, 2)
-        subset = 200
-        
-        plt.plot(actual_df.iloc[:subset, 0], color='lime', alpha=0.3, linewidth=1, label='Actual 1D')
-        plt.plot(pred_df.iloc[:subset, 0], color='lime', linestyle='--', linewidth=1.5, label='Pred 1D Probability')
-        
-        plt.plot(actual_df.iloc[:subset, -1], color='magenta', alpha=0.3, linewidth=1, label='Actual 30D')
-        plt.plot(pred_df.iloc[:subset, -1], color='magenta', linestyle='--', linewidth=1.5, label='Pred 30D Probability')
-        
-        plt.title(f'Prediction Confidence (First {subset} Days)')
-        plt.ylabel('Probability (1=Up, 0=Down)')
-        plt.legend()
-        plt.grid(alpha=0.2)
-        plt.tight_layout()
-
-        img = io.BytesIO()
-        plt.savefig(img, format='png', bbox_inches='tight', facecolor='#121212')
-        img.seek(0)
-        plot_url = base64.b64encode(img.getvalue()).decode()
-        plt.close(fig)
-
-        training_state['plot_image'] = plot_url
-        training_state['status'] = 'complete'
-        log("Pipeline complete!")
-
     except Exception as e:
-        training_state['status'] = 'error'
-        training_state['error_msg'] = str(e)
-        log(f"CRITICAL ERROR: {e}")
+        st.error(f"Preprocessing Error: {e}. Please ensure the timestamp column is valid.")
+        st.stop()
+else:
+    st.info("Please select a data source to begin.")
+    st.stop()
 
-# --- Flask Routes ---
 
-@app.route('/status')
-def status():
-    return jsonify({
-        'status': training_state['status'],
-        'logs': training_state['progress'][-10:] 
-    })
-
-@app.route('/')
-def index():
-    if training_state['status'] == 'complete' and training_state['plot_image']:
-        html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Trend LSTM Results</title>
-            <style>
-                body { background-color: #121212; color: #ffffff; font-family: monospace; text-align: center; }
-                img { max-width: 95%; height: auto; border: 2px solid #333; border-radius: 8px; margin-top: 20px; }
-                .status { color: #00ff00; margin-bottom: 10px; }
-            </style>
-        </head>
-        <body>
-            <h1>Trend Prediction LSTM Results</h1>
-            <div class="status">Training Complete</div>
-            <img src="data:image/png;base64,{{ plot_url }}" alt="Chart">
-        </body>
-        </html>
-        """
-        return render_template_string(html, plot_url=training_state['plot_image'])
+# 2. Training Logic
+if train_btn:
+    st.divider()
+    st.subheader("Training Live Feed")
     
-    elif training_state['status'] == 'error':
-        return f"<h1>Error Occurred</h1><p>{training_state['error_msg']}</p>"
+    # Data Preparation
+    data_values = df_resampled[target_col].values.reshape(-1, 1)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    dataset = scaler.fit_transform(data_values)
+    
+    train_size = int(len(dataset) * split_ratio)
+    train, test = dataset[0:train_size,:], dataset[train_size:len(dataset),:]
+    
+    X_train, Y_train = create_dataset(train, look_back)
+    X_test, Y_test = create_dataset(test, look_back)
+    
+    # Reshape input to be [samples, time steps, features]
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+    X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+
+    # Model Building
+    model = Sequential()
+    for i in range(n_layers):
+        return_seq = True if i < n_layers - 1 else False
+        if i == 0:
+            model.add(LSTM(units, input_shape=(look_back, 1), return_sequences=return_seq))
+        else:
+            model.add(LSTM(units, return_sequences=return_seq))
+        model.add(Dropout(dropout_rate))
+    
+    model.add(Dense(1))
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    model.compile(loss='mean_squared_error', optimizer=optimizer)
+
+    # Custom Callback for Streamlit Live Updates
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    chart_placeholder = st.empty()
+    
+    class StreamlitCallback(tf.keras.callbacks.Callback):
+        def __init__(self):
+            self.history = {'loss': [], 'val_loss': []}
+            
+        def on_epoch_end(self, epoch, logs=None):
+            self.history['loss'].append(logs['loss'])
+            self.history['val_loss'].append(logs['val_loss'])
+            
+            # Update Progress
+            prog = (epoch + 1) / epochs
+            progress_bar.progress(prog)
+            status_text.text(f"Epoch {epoch+1}/{epochs} - Loss: {logs['loss']:.5f} - Val Loss: {logs['val_loss']:.5f}")
+            
+            # Live Chart Update
+            fig_loss = go.Figure()
+            fig_loss.add_trace(go.Scatter(y=self.history['loss'], mode='lines', name='Train Loss'))
+            fig_loss.add_trace(go.Scatter(y=self.history['val_loss'], mode='lines', name='Val Loss'))
+            fig_loss.update_layout(
+                title="Training Progress (Loss)", 
+                xaxis_title="Epoch", 
+                yaxis_title="MSE Loss",
+                height=300,
+                margin=dict(l=0,r=0,t=30,b=0)
+            )
+            chart_placeholder.plotly_chart(fig_loss, use_container_width=True)
+
+    # Train
+    with st.spinner('Training model...'):
+        history = model.fit(
+            X_train, Y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_test, Y_test),
+            verbose=0,
+            callbacks=[StreamlitCallback()]
+        )
+    
+    st.success("Training Complete!")
+    
+    # 3. Predictions & Evaluation
+    st.divider()
+    st.subheader("Model Evaluation & Forecasting")
+    
+    # Make predictions
+    train_predict = model.predict(X_train)
+    test_predict = model.predict(X_test)
+    
+    # Invert predictions
+    train_predict = scaler.inverse_transform(train_predict)
+    Y_train_inv = scaler.inverse_transform([Y_train])
+    test_predict = scaler.inverse_transform(test_predict)
+    Y_test_inv = scaler.inverse_transform([Y_test])
+    
+    # Metrics
+    mse = mean_squared_error(Y_test_inv[0], test_predict[:,0])
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(Y_test_inv[0], test_predict[:,0])
+    
+    # Metrics Display
+    m1, m2, m3 = st.columns(3)
+    m1.metric("RMSE", f"{rmse:.4f}")
+    m2.metric("MSE", f"{mse:.4f}")
+    m3.metric("MAE", f"{mae:.4f}")
+    
+    # Confidence Score / Interval Calculation
+    # We use the standard deviation of residuals on the test set to define a confidence band
+    residuals = Y_test_inv[0] - test_predict[:,0]
+    std_resid = np.std(residuals)
+    confidence_interval = 1.96 * std_resid  # 95% confidence assuming normal distribution of errors
+    
+    # Preparing Data for Final Plot
+    # Shift train predictions for plotting
+    train_plot_data = np.empty_like(dataset)
+    train_plot_data[:, :] = np.nan
+    train_plot_data[look_back:len(train_predict)+look_back, :] = train_predict
+    
+    # Shift test predictions for plotting
+    test_plot_data = np.empty_like(dataset)
+    test_plot_data[:, :] = np.nan
+    # Correct indexing for test data placement
+    test_start_idx = len(train_predict) + (look_back * 2) + 1
+    end_idx = min(len(dataset), test_start_idx + len(test_predict))
+    # We create a specific array for the test period to make plotting easier
+    
+    # Reconstruct DataFrame for Plotly
+    # We will plot the last N points to keep it readable, or full dataset
+    
+    full_original = scaler.inverse_transform(dataset)
+    
+    # Align dates
+    dates = df_resampled.index
+    
+    # Create a clean DataFrame for visualization
+    res_df = pd.DataFrame(index=dates)
+    res_df['Actual'] = full_original
+    
+    # Map predictions to timestamps
+    # Train
+    train_dates = dates[look_back : look_back + len(train_predict)]
+    train_series = pd.Series(train_predict.flatten(), index=train_dates)
+    
+    # Test
+    # The offset for test depends on the split
+    test_start = len(train) + look_back
+    if test_start < len(dates):
+        test_dates = dates[test_start : test_start + len(test_predict)]
+        test_series = pd.Series(test_predict.flatten(), index=test_dates)
+    
+        # Visualization
+        fig_res = go.Figure()
         
-    else:
-        html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Training Model...</title>
-            <meta http-equiv="refresh" content="3">
-            <style>
-                body { background-color: #121212; color: #00ff00; font-family: monospace; padding: 50px; }
-                .box { border: 1px solid #333; padding: 20px; max-width: 600px; margin: 0 auto; }
-                h1 { color: #ffffff; }
-            </style>
-        </head>
-        <body>
-            <div class="box">
-                <h1>System Training...</h1>
-                <p>Status: {{ status }}</p>
-                <hr style="border-color: #333;">
-                <h3>Live Logs:</h3>
-                <ul>
-                {% for log in logs %}
-                    <li>> {{ log }}</li>
-                {% endfor %}
-                </ul>
-                <p><i>Page will auto-refresh every 3 seconds until results are ready.</i></p>
-            </div>
-        </body>
-        </html>
-        """
-        return render_template_string(html, status=training_state['status'], logs=training_state['progress'][-15:])
+        # Actual Data
+        fig_res.add_trace(go.Scatter(
+            x=res_df.index, y=res_df['Actual'],
+            mode='lines', name='Actual Data',
+            line=dict(color='gray', width=1)
+        ))
+        
+        # Train Predictions
+        fig_res.add_trace(go.Scatter(
+            x=train_series.index, y=train_series.values,
+            mode='lines', name='Train Predictions',
+            line=dict(color='#3b82f6')
+        ))
+        
+        # Test Predictions & Confidence
+        fig_res.add_trace(go.Scatter(
+            x=test_series.index, y=test_series.values,
+            mode='lines', name='Test Predictions',
+            line=dict(color='#10b981')
+        ))
+        
+        # Confidence Band (Upper/Lower)
+        # Only for test data to show forecasting uncertainty
+        upper_bound = test_series.values + confidence_interval
+        lower_bound = test_series.values - confidence_interval
+        
+        fig_res.add_trace(go.Scatter(
+            x=test_series.index, 
+            y=upper_bound,
+            mode='lines',
+            line=dict(width=0),
+            showlegend=False,
+            name='Upper Confidence'
+        ))
+        
+        fig_res.add_trace(go.Scatter(
+            x=test_series.index, 
+            y=lower_bound,
+            mode='lines',
+            line=dict(width=0),
+            fill='tonexty', # Fill to upper bound
+            fillcolor='rgba(16, 185, 129, 0.2)',
+            showlegend=True,
+            name=f'95% Confidence (±{confidence_interval:.2f})'
+        ))
 
-threading.Thread(target=run_pipeline, daemon=True).start()
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+        fig_res.update_layout(
+            title="Railway Sequence Prediction",
+            xaxis_title="Timestamp",
+            yaxis_title=target_col,
+            height=600,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        st.plotly_chart(fig_res, use_container_width=True)
+        
+        # Prediction Table
+        with st.expander("View Detailed Prediction Data"):
+            results_table = pd.DataFrame({
+                "Timestamp": test_dates,
+                "Actual": Y_test_inv.flatten(),
+                "Predicted": test_predict.flatten(),
+                "Error": (Y_test_inv.flatten() - test_predict.flatten())
+            })
+            st.dataframe(results_table)
