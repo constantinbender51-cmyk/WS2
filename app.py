@@ -28,14 +28,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.ba
 
 HORIZONS_DAYS = [1, 2, 3, 4, 5, 6, 7, 14, 30]
 
-# IMPLEMENTATION 6: Sparse Slopes (Fibonacci sequence) to reduce collinearity
-LOOKBACK_SLOPES = [1, 2, 3, 5, 8, 13, 21, 30]
+# CHANGE 1: Single Feature Input
+# We only give the 1-day slope. The LSTM will use SEQ_LEN to "remember" the history 
+# and infer longer trends (3d, 7d, 30d) internally.
+LOOKBACK_SLOPES = [1] 
 
 SEQ_LEN = 24
-
-# IMPLEMENTATION 3: Change Resampling to 1 Day
-RESAMPLE_FREQ = '1d'
-
+RESAMPLE_FREQ = '1d' # Daily candles
 BATCH_SIZE = 64
 EPOCHS = 10
 FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
@@ -43,7 +42,7 @@ FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
 # --- Global State ---
 app = Flask(__name__)
 training_state = {
-    'status': 'idle', # idle, downloading, processing, training, complete, error
+    'status': 'idle', 
     'progress': [],
     'plot_image': None,
     'error_msg': None
@@ -70,7 +69,7 @@ def get_and_process_data():
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.set_index(date_col).sort_index()
         
-        # Resampling based on config
+        # Resampling to Daily
         df_resampled = df['close'].resample(RESAMPLE_FREQ).last().dropna().to_frame()
         return df_resampled
     except Exception as e:
@@ -100,15 +99,15 @@ def get_rows_per_day():
     elif RESAMPLE_FREQ == '1d':
         return 1
     else:
-        return 1440 # Default to minutes
+        return 1440 
 
 def feature_engineering(df):
     log("Feature Engineering (Calculating Slopes)...")
     feature_data = pd.DataFrame(index=df.index)
     
     rows_per_day = get_rows_per_day()
-    log(f"Rows per day calculated as: {rows_per_day}")
-
+    
+    # Only calculating slope_1d now
     for day in LOOKBACK_SLOPES:
         window_size = day * rows_per_day
         if len(df) > window_size:
@@ -137,7 +136,7 @@ def create_sequences(data, feature_cols, target_cols, seq_len):
 class TrendLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(TrendLSTM, self).__init__()
-        # Keeping Dropout at 0.6 as per previous instruction
+        # Dropout 0.6 kept for regularization
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.6)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.sigmoid = nn.Sigmoid()
@@ -165,8 +164,11 @@ def run_pipeline():
         data = feature_engineering(df)
         log(f"Dataset Shape: {data.shape}")
 
+        # Check for dataset size assuming 2 years of data (~730 rows)
         if len(data) < SEQ_LEN + BATCH_SIZE:
-             raise ValueError("Dataset too small after resampling/processing.")
+             log(f"WARNING: Dataset has {len(data)} rows. If this fails, ensure CSV has > 100 days of history.")
+             if len(data) < 50:
+                 raise ValueError(f"Dataset too small ({len(data)} rows) for training.")
 
         # Split
         n = len(data)
@@ -193,10 +195,11 @@ def run_pipeline():
         train_loader = DataLoader(TensorDataset(X_train, y_train), shuffle=True, batch_size=BATCH_SIZE)
         val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE)
         
+        # Model input_dim will now be 1
         model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols)).to(device)
         criterion = nn.BCELoss()
         
-        # IMPLEMENTATION 1: Reduced Learning Rate to 0.0001
+        # Keeping low LR and high weight decay for stability
         optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
         
         train_losses = []
@@ -206,6 +209,9 @@ def run_pipeline():
         log(f"Starting Training on {device} for {EPOCHS} epochs...")
         
         total_batches = len(train_loader)
+        if total_batches == 0:
+             raise ValueError("Not enough data to create even one batch. Check dataset size.")
+
         for epoch in range(EPOCHS):
             model.train()
             batch_loss = []
@@ -217,13 +223,13 @@ def run_pipeline():
                 loss = criterion(y_pred, y_batch)
                 loss.backward()
                 
-                # IMPLEMENTATION 2: Gradient Clipping
+                # Gradient Clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 optimizer.step()
                 batch_loss.append(loss.item())
                 
-                # Logging progress every 10 batches (or every batch if dataset is small)
+                # Logging
                 log_freq = 10 if total_batches > 10 else 1
                 if (i + 1) % log_freq == 0 or (i + 1) == total_batches:
                     log(f"Epoch {epoch+1} | Batch {i+1}/{total_batches} | Loss: {loss.item():.4f}")
@@ -239,7 +245,7 @@ def run_pipeline():
                     val_batch_loss.append(loss.item())
                     
             avg_train = np.mean(batch_loss)
-            avg_val = np.mean(val_batch_loss)
+            avg_val = np.mean(val_batch_loss) if val_batch_loss else 0
             train_losses.append(avg_train)
             val_losses.append(avg_val)
             
@@ -250,7 +256,6 @@ def run_pipeline():
         plt.style.use('dark_background')
         fig = plt.figure(figsize=(14, 10))
         
-        # Plot 1: Loss
         plt.subplot(2, 1, 1)
         plt.plot(train_losses, label='Train Loss', color='cyan')
         plt.plot(val_losses, label='Val Loss', color='orange')
@@ -258,7 +263,7 @@ def run_pipeline():
         plt.legend()
         plt.grid(alpha=0.2)
         
-        # Plot 2: Predictions
+        # Preds
         model.eval()
         with torch.no_grad():
             test_preds = model(X_test.to(device)).cpu().numpy()
@@ -278,13 +283,12 @@ def run_pipeline():
         plt.plot(actual_df.iloc[:subset, -1], color='magenta', alpha=0.3, linewidth=1, label='Actual 30D')
         plt.plot(pred_df.iloc[:subset, -1], color='magenta', linestyle='--', linewidth=1.5, label='Pred 30D Probability')
         
-        plt.title(f'Prediction Confidence (First {subset} Test Hours)')
+        plt.title(f'Prediction Confidence (First {subset} Days)')
         plt.ylabel('Probability (1=Up, 0=Down)')
         plt.legend()
         plt.grid(alpha=0.2)
         plt.tight_layout()
 
-        # Save to buffer
         img = io.BytesIO()
         plt.savefig(img, format='png', bbox_inches='tight', facecolor='#121212')
         img.seek(0)
@@ -306,7 +310,7 @@ def run_pipeline():
 def status():
     return jsonify({
         'status': training_state['status'],
-        'logs': training_state['progress'][-10:] # Return last 10 logs
+        'logs': training_state['progress'][-10:] 
     })
 
 @app.route('/')
@@ -336,7 +340,6 @@ def index():
         return f"<h1>Error Occurred</h1><p>{training_state['error_msg']}</p>"
         
     else:
-        # Refreshing loading page
         html = """
         <!DOCTYPE html>
         <html>
@@ -367,7 +370,6 @@ def index():
         """
         return render_template_string(html, status=training_state['status'], logs=training_state['progress'][-15:])
 
-# Start background training thread on import/start
 threading.Thread(target=run_pipeline, daemon=True).start()
 
 if __name__ == '__main__':
