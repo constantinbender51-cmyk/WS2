@@ -1,5 +1,4 @@
-gdown
 numpy
-pandas
-scikit-learn
-tensorflow
+torch
+matplotlib
+flask
