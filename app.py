@@ -27,9 +27,15 @@ np.random.seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 HORIZONS_DAYS = [1, 2, 3, 4, 5, 6, 7, 14, 30]
-LOOKBACK_SLOPES = range(1, 31)
+
+# IMPLEMENTATION 6: Sparse Slopes (Fibonacci sequence) to reduce collinearity
+LOOKBACK_SLOPES = [1, 2, 3, 5, 8, 13, 21, 30]
+
 SEQ_LEN = 24
-RESAMPLE_FREQ = '1h'
+
+# IMPLEMENTATION 3: Change Resampling to 1 Day
+RESAMPLE_FREQ = '1d'
+
 BATCH_SIZE = 64
 EPOCHS = 10
 FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
@@ -64,6 +70,7 @@ def get_and_process_data():
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.set_index(date_col).sort_index()
         
+        # Resampling based on config
         df_resampled = df['close'].resample(RESAMPLE_FREQ).last().dropna().to_frame()
         return df_resampled
     except Exception as e:
@@ -87,12 +94,22 @@ def calculate_rolling_slope_fast(series, window_size):
     pad = np.full(n - 1, np.nan)
     return np.concatenate([pad, m])
 
+def get_rows_per_day():
+    if RESAMPLE_FREQ == '1h':
+        return 24
+    elif RESAMPLE_FREQ == '1d':
+        return 1
+    else:
+        return 1440 # Default to minutes
+
 def feature_engineering(df):
     log("Feature Engineering (Calculating Slopes)...")
     feature_data = pd.DataFrame(index=df.index)
     
+    rows_per_day = get_rows_per_day()
+    log(f"Rows per day calculated as: {rows_per_day}")
+
     for day in LOOKBACK_SLOPES:
-        rows_per_day = 24 if RESAMPLE_FREQ == '1h' else 1440
         window_size = day * rows_per_day
         if len(df) > window_size:
             feature_data[f'slope_{day}d'] = calculate_rolling_slope_fast(df['close'], window_size)
@@ -100,7 +117,6 @@ def feature_engineering(df):
     log("Creating Targets...")
     target_data = pd.DataFrame(index=df.index)
     for h_days in HORIZONS_DAYS:
-        rows_per_day = 24 if RESAMPLE_FREQ == '1h' else 1440
         h_steps = h_days * rows_per_day
         future_close = df['close'].shift(-h_steps)
         target_data[f'target_{h_days}d'] = (future_close > df['close']).astype(int)
@@ -121,8 +137,8 @@ def create_sequences(data, feature_cols, target_cols, seq_len):
 class TrendLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(TrendLSTM, self).__init__()
-        # ADJUSTMENT 1: Increased dropout from 0.2 to 0.5
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.5)
+        # Keeping Dropout at 0.6 as per previous instruction
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.6)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.sigmoid = nn.Sigmoid()
         
@@ -148,6 +164,9 @@ def run_pipeline():
         training_state['status'] = 'processing'
         data = feature_engineering(df)
         log(f"Dataset Shape: {data.shape}")
+
+        if len(data) < SEQ_LEN + BATCH_SIZE:
+             raise ValueError("Dataset too small after resampling/processing.")
 
         # Split
         n = len(data)
@@ -177,8 +196,8 @@ def run_pipeline():
         model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols)).to(device)
         criterion = nn.BCELoss()
         
-        # ADJUSTMENT 2: Added weight_decay for L2 regularization
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+        # IMPLEMENTATION 1: Reduced Learning Rate to 0.0001
+        optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
         
         train_losses = []
         val_losses = []
@@ -186,18 +205,28 @@ def run_pipeline():
         training_state['status'] = 'training'
         log(f"Starting Training on {device} for {EPOCHS} epochs...")
         
+        total_batches = len(train_loader)
         for epoch in range(EPOCHS):
             model.train()
             batch_loss = []
             
-            for X_batch, y_batch in train_loader:
+            for i, (X_batch, y_batch) in enumerate(train_loader):
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 optimizer.zero_grad()
                 y_pred = model(X_batch)
                 loss = criterion(y_pred, y_batch)
                 loss.backward()
+                
+                # IMPLEMENTATION 2: Gradient Clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 batch_loss.append(loss.item())
+                
+                # Logging progress every 10 batches (or every batch if dataset is small)
+                log_freq = 10 if total_batches > 10 else 1
+                if (i + 1) % log_freq == 0 or (i + 1) == total_batches:
+                    log(f"Epoch {epoch+1} | Batch {i+1}/{total_batches} | Loss: {loss.item():.4f}")
             
             # Validation
             model.eval()
@@ -214,7 +243,7 @@ def run_pipeline():
             train_losses.append(avg_train)
             val_losses.append(avg_val)
             
-            log(f"Epoch {epoch+1}/{EPOCHS} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
+            log(f"FINISH EPOCH {epoch+1}/{EPOCHS} | Avg Train: {avg_train:.4f} | Avg Val: {avg_val:.4f}")
 
         # Visualization
         log("Generating Visualization...")
