@@ -1,9 +1,7 @@
-flask
-gunicorn
+streamlit
 pandas
 numpy
-matplotlib
-torch
-gdown
+tensorflow
 scikit-learn
-tqdm
+plotly
+gdown
