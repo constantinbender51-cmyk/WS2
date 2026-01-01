@@ -55,7 +55,7 @@ def train_model():
     # 1. Data Generation (Sine wave + Noise)
     N = 1000
     t = np.linspace(0, 100, N)
-    data = np.sin(t) + 0.1 * np.random.normal(size=N)
+    data = np.sin(t) + 0.2 * np.random.normal(size=N)
     
     # Prepare windowed data for LSTM
     window_size = 20
