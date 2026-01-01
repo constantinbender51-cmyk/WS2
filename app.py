@@ -61,11 +61,22 @@ else:
 # 2. Loading & Preprocessing
 # ==========================================
 delayed_print("Loading CSV into memory...")
-# Explicitly using the lowercase column names provided
+
+# Read CSV and explicitly parse timestamp to avoid it being treated as a numeric feature
+# The error was caused by the timestamp string remaining in the dataframe or index improperly
 df = pd.read_csv(OUTPUT_FILE, usecols=['timestamp', 'close'])
 
 delayed_print("Converting timestamps and sorting...")
-df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+# Check if timestamp is numeric (Unix) or string
+try:
+    if df['timestamp'].dtype == 'O': # Object/String
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    else:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+except Exception as e:
+    delayed_print(f"Timestamp conversion warning: {e}. Attempting default parsing...")
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+
 df.sort_values('timestamp', inplace=True)
 df.set_index('timestamp', inplace=True)
 
@@ -81,6 +92,8 @@ delayed_print(f"Data ready. Total rows: {len(df)}")
 # 3. Feature & Target Engineering
 # ==========================================
 delayed_print("Calculating log returns and sequences...")
+# Ensure close is float
+df['close'] = df['close'].astype(float)
 df['log_price'] = np.log(df['close'])
 
 # Generate 14 Daily Log Return Features (at 1-minute resolution)
@@ -88,7 +101,6 @@ feature_cols = []
 for i in range(LOOKBACK_DAYS):
     col_name = f'feat_lag_{i}'
     # Log return of the day ending at (t - i days)
-    # i.e., log_price(t - i*1440) - log_price(t - (i+1)*1440)
     df[col_name] = df['log_price'].shift(i * MINUTES_PER_DAY) - df['log_price'].shift((i + 1) * MINUTES_PER_DAY)
     feature_cols.append(col_name)
 
@@ -96,7 +108,6 @@ for i in range(LOOKBACK_DAYS):
 target_cols = []
 for day in TARGET_HORIZONS:
     col_name = f'target_{day}d'
-    # Future log return: log_price(t + day*1440) - log_price(t)
     df[col_name] = df['log_price'].shift(-day * MINUTES_PER_DAY) - df['log_price']
     target_cols.append(col_name)
 
@@ -104,14 +115,14 @@ for day in TARGET_HORIZONS:
 df.dropna(inplace=True)
 delayed_print(f"Samples after shifting: {len(df)}")
 
-# Prepare arrays
-X = df[feature_cols].values[:, ::-1] # Reverse to have oldest day first in sequence
-y = df[target_cols].values
+# Prepare arrays - explicitly select only feature/target columns to exclude index/strings
+X = df[feature_cols].values.astype(np.float32)[:, ::-1] # Reverse to have oldest day first
+y = df[target_cols].values.astype(np.float32)
 
 # Reshape for LSTM: (samples, timesteps, features)
 X = X.reshape((X.shape[0], LOOKBACK_DAYS, 1))
 
-# Scaling (Standardize based on Training data)
+# Scaling
 split_idx = int(len(X) * 0.9)
 scaler = StandardScaler()
 X_train_flat = X[:split_idx].reshape(-1, 1)
@@ -128,22 +139,18 @@ y_train, y_test = y[:split_idx], y[split_idx:]
 delayed_print("Compiling 3-layer LSTM Model...")
 
 model = Sequential([
-    # Layer 1
     LSTM(64, return_sequences=True, input_shape=(LOOKBACK_DAYS, 1),
          kernel_regularizer=l1_l2(l1=L1_L2_REG, l2=L1_L2_REG)),
     Dropout(DROPOUT),
     
-    # Layer 2
     LSTM(64, return_sequences=True,
          kernel_regularizer=l1_l2(l1=L1_L2_REG, l2=L1_L2_REG)),
     Dropout(DROPOUT),
     
-    # Layer 3
     LSTM(64, return_sequences=False,
          kernel_regularizer=l1_l2(l1=L1_L2_REG, l2=L1_L2_REG)),
     Dropout(DROPOUT),
     
-    # Output: 7 regression targets
     Dense(len(TARGET_HORIZONS))
 ])
 
@@ -160,7 +167,7 @@ model.fit(
     validation_data=(X_test, y_test),
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
-    verbose=0, # Controlled by custom logger
+    verbose=0,
     callbacks=[RailwayLogger()]
 )
 
