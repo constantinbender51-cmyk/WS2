@@ -1,119 +1,209 @@
-import pandas as pd
-import numpy as np
 import os
-import tensorflow as tf
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
+import io
+import time
+import threading
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib
+import matplotlib.pyplot as plt
+from flask import Flask, send_file, Response
 
-# ==========================================
-# Configuration
-# ==========================================
-OUTPUT_FILE = 'market_data.csv' # Uses the file from previous step
-MODEL_FILE = 'simplified_lstm_model.h5'
-LOOKBACK_DAYS = 14
-TARGET_HORIZONS = [1, 2, 3, 5, 8, 13, 21] 
-MINUTES_PER_DAY = 1440
+# --- Configuration & Setup ---
+# Force matplotlib to not use any Xwindow backend (headless mode)
+matplotlib.use('Agg') 
 
-def load_and_prep_data():
-    print("Loading data for verification...")
-    df = pd.read_csv(OUTPUT_FILE)
+app = Flask(__name__)
+
+# Global state to share data between Training Thread and Web Server
+class GlobalState:
+    def __init__(self):
+        self.current_epoch = 0
+        self.total_epochs = 0
+        self.current_loss = 0.0
+        self.latest_plot_buffer = None
+        self.training_finished = False
+        self.lock = threading.Lock()
+
+state = GlobalState()
+
+# --- Model Definition ---
+class SimpleLSTM(nn.Module):
+    def __init__(self, input_size=1, hidden_size=32, output_size=1):
+        super(SimpleLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        # Initialize hidden and cell states
+        h0 = torch.zeros(1, x.size(0), self.hidden_size)
+        c0 = torch.zeros(1, x.size(0), self.hidden_size)
+        
+        # Forward propagate LSTM
+        out, _ = self.lstm(x, (h0, c0))
+        
+        # Decode the hidden state of the last time step
+        out = self.fc(out[:, -1, :])
+        return out
+
+# --- Training Logic ---
+def train_model():
+    print("--- Starting Training Script ---")
     
-    # robust timestamp parsing
-    if df['timestamp'].dtype == 'O':
-         df['timestamp'] = pd.to_datetime(df['timestamp'])
+    # 1. Data Generation (Sine wave + Noise)
+    N = 1000
+    t = np.linspace(0, 100, N)
+    data = np.sin(t) + 0.1 * np.random.normal(size=N)
+    
+    # Prepare windowed data for LSTM
+    window_size = 20
+    X, y = [], []
+    for i in range(len(data) - window_size):
+        X.append(data[i:i+window_size])
+        y.append(data[i+window_size])
+    
+    X = torch.tensor(X, dtype=torch.float32).unsqueeze(-1) # (Samples, Window, Features)
+    y = torch.tensor(y, dtype=torch.float32).unsqueeze(-1)
+    
+    # 2. Setup Model
+    model = SimpleLSTM()
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    
+    epochs = 500
+    with state.lock:
+        state.total_epochs = epochs
+
+    # 3. Training Loop
+    for epoch in range(epochs):
+        model.train()
+        outputs = model(X)
+        loss = criterion(outputs, y)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # Update State
+        with state.lock:
+            state.current_epoch = epoch + 1
+            state.current_loss = loss.item()
+
+        # Visualization Step (Every 20 epochs to save resources)
+        if epoch % 20 == 0 or epoch == epochs - 1:
+            print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+            generate_plot(model, X, y, t, window_size, loss.item(), epoch)
+            
+        time.sleep(0.05) # Slight delay just to make the visualization observable in real-time
+
+    with state.lock:
+        state.training_finished = True
+    print("--- Training Finished ---")
+
+def generate_plot(model, X, y, t, window_size, loss, epoch):
+    """Generates a plot and saves it to the global buffer."""
+    model.eval()
+    with torch.no_grad():
+        predictions = model(X).numpy()
+    
+    fig, ax = plt.subplots(figsize=(10, 5))
+    
+    # Plot Actual
+    ax.plot(t[window_size:], y.numpy(), label='Actual (Noisy Sine)', alpha=0.5)
+    
+    # Plot Prediction
+    ax.plot(t[window_size:], predictions, label='LSTM Prediction', color='red', linewidth=2)
+    
+    ax.set_title(f'LSTM Training Progress - Epoch {epoch} - Loss: {loss:.4f}')
+    ax.legend()
+    ax.grid(True)
+    
+    # Save to memory buffer instead of disk
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig) # Close to free memory
+    
+    with state.lock:
+        state.latest_plot_buffer = buf
+
+# --- Web Server Logic ---
+@app.route('/')
+def dashboard():
+    """Simple HTML Dashboard that auto-refreshes the image."""
+    
+    with state.lock:
+        status = "Finished" if state.training_finished else "Training..."
+        epoch_str = f"{state.current_epoch} / {state.total_epochs}"
+        loss_str = f"{state.current_loss:.5f}"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Railway LSTM Monitor</title>
+        <meta http-equiv="refresh" content="2"> <style>
+            body {{ font-family: sans-serif; text-align: center; padding: 20px; background: #f4f4f4; }}
+            .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 800px; margin: 0 auto; }}
+            img {{ max-width: 100%; height: auto; border: 1px solid #ddd; }}
+            .stats {{ display: flex; justify-content: space-around; margin-bottom: 20px; }}
+            .stat-box {{ text-align: center; }}
+            .val {{ font-size: 1.5em; font-weight: bold; color: #333; }}
+            .label {{ color: #666; font-size: 0.9em; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>LSTM Training Monitor</h1>
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="val">{status}</div>
+                    <div class="label">Status</div>
+                </div>
+                <div class="stat-box">
+                    <div class="val">{epoch_str}</div>
+                    <div class="label">Epoch</div>
+                </div>
+                <div class="stat-box">
+                    <div class="val">{loss_str}</div>
+                    <div class="label">Current Loss</div>
+                </div>
+            </div>
+            
+            <h3>Live Visualization</h3>
+            <img src="/plot.png?t={time.time()}" alt="Waiting for first epoch..." />
+            <p><i>The page refreshes automatically every 2 seconds.</i></p>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route('/plot.png')
+def plot_image():
+    """Returns the raw image bytes from the global buffer."""
+    buf = None
+    with state.lock:
+        if state.latest_plot_buffer:
+            # We copy the buffer to avoid IO closed errors if writing happens simultaneously
+            buf = io.BytesIO(state.latest_plot_buffer.getvalue())
+    
+    if buf:
+        return send_file(buf, mimetype='image/png')
     else:
-         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-         
-    df.set_index('timestamp', inplace=True)
-    df.sort_index(inplace=True)
-    
-    # 1. Resample to Daily
-    df_daily = df['close'].resample('1D').last().dropna().to_frame()
-    df_daily['log_price'] = np.log(df_daily['close'])
-    
-    # 2. Re-create Features & Targets explicitly for inspection
-    # Feature lag 0 = Close(T) - Close(T-1)
-    df_daily['feat_lag_0'] = df_daily['log_price'].shift(0) - df_daily['log_price'].shift(1)
-    
-    # Target 1d = Close(T+1) - Close(T)
-    df_daily['target_1d'] = df_daily['log_price'].shift(-1) - df_daily['log_price']
-    
-    # Full Feature Set Generation (Same as training)
-    feature_cols = []
-    for i in range(LOOKBACK_DAYS):
-        col_name = f'feat_lag_{i}'
-        df_daily[col_name] = df_daily['log_price'].shift(i) - df_daily['log_price'].shift(i + 1)
-        feature_cols.append(col_name)
+        # Return a placeholder or 404 if not ready
+        return Response("Plot not ready", status=503)
 
-    # Full Target Set Generation
-    target_cols = []
-    for day in TARGET_HORIZONS:
-        col_name = f'target_{day}d'
-        df_daily[col_name] = df_daily['log_price'].shift(-day) - df_daily['log_price']
-        target_cols.append(col_name)
-
-    df_clean = df_daily.dropna()
-    return df_clean, feature_cols, target_cols
-
-def check_lookahead(df):
-    print("\n--- 1. Visual Leakage Inspection ---")
-    print("We are looking for obvious duplicates between Features and Targets.")
-    print("Row T Feature (lag_0) = Return(T-1 to T)")
-    print("Row T Target  (1d)    = Return(T to T+1)")
-    
-    sample = df[['feat_lag_0', 'target_1d']].head(5)
-    print(sample)
-    
-    # Check correlation
-    corr = df['feat_lag_0'].corr(df['target_1d'])
-    print(f"\nCorrelation between Current Return (Feature) and Next Return (Target): {corr:.4f}")
-    if abs(corr) > 0.9:
-        print("CRITICAL WARNING: High correlation detected! Likely Lookahead Bias.")
-    else:
-        print("PASS: No immediate correlation detected. Data alignment looks correct.")
-
-def benchmark_model(df, feature_cols, target_cols):
-    print("\n--- 2. Benchmarking (Is it actually learning?) ---")
-    
-    # Load Model
-    model = tf.keras.models.load_model(MODEL_FILE)
-    
-    # Prepare X, y
-    X = df[feature_cols].values[:, ::-1].reshape(-1, LOOKBACK_DAYS, 1)
-    y_true = df[target_cols].values
-    
-    # Scaling (Must replicate training scaler logic)
-    # We cheat slightly and fit on full data for this quick check, 
-    # but strictly we should fit on first 60%.
-    scaler = StandardScaler()
-    X_flat = X.reshape(-1, 1)
-    X_scaled = scaler.fit_transform(X_flat).reshape(X.shape)
-    
-    # Predict
-    y_pred = model.predict(X_scaled, verbose=0)
-    
-    # Calculate MSEs
-    model_mse = mean_squared_error(y_true, y_pred)
-    
-    # Naive Baseline: Predict 0.0 (No change) for everything
-    y_zeros = np.zeros_like(y_true)
-    naive_mse = mean_squared_error(y_true, y_zeros)
-    
-    print(f"Model MSE: {model_mse:.6f}")
-    print(f"Naive MSE: {naive_mse:.6f} (Predicting all zeros)")
-    
-    if model_mse < naive_mse:
-        improvement = (1 - (model_mse / naive_mse)) * 100
-        print(f"RESULT: Model is {improvement:.2f}% better than predicting zero.")
-        print("Interpretation: The model is learning real signal (or overfitting noise), but it is beating the null hypothesis.")
-    else:
-        print("RESULT: Model is WORSE or EQUAL to predicting zero.")
-        print("Interpretation: The model has failed to find signal. The 'low' loss is just the natural low variance of the market.")
-
+# --- Entry Point ---
 if __name__ == "__main__":
-    if not os.path.exists(OUTPUT_FILE) or not os.path.exists(MODEL_FILE):
-        print(f"Error: Missing {OUTPUT_FILE} or {MODEL_FILE}. Run training script first.")
-    else:
-        df, f_cols, t_cols = load_and_prep_data()
-        check_lookahead(df)
-        benchmark_model(df, f_cols, t_cols)
+    # 1. Start the Training in a Background Thread
+    training_thread = threading.Thread(target=train_model, daemon=True)
+    training_thread.start()
+    
+    # 2. Start the Web Server (Blocking, Main Thread)
+    # Railway provides the PORT environment variable
+    port = int(os.environ.get("PORT", 5000))
+    print(f"--- Starting Web Server on Port {port} ---")
+    app.run(host='0.0.0.0', port=port)
