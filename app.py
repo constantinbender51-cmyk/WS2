@@ -35,9 +35,8 @@ EPOCHS = 10
 FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
 
 # --- FREQUENCY CONFIGURATION ---
-# We calculate features on High Res (1h), but Train on Low Res (1d)
-RESAMPLE_FREQ = '1h'      # Base frequency for loading/slope calculation (prevents window=1 error)
-TRAINING_FREQ = '1d'      # Frequency for the LSTM steps
+RESAMPLE_FREQ = '1h'      
+TRAINING_FREQ = '1d'      
 
 # --- Global State ---
 app = Flask(__name__)
@@ -74,11 +73,7 @@ def get_and_process_data():
         df = df.set_index(date_col).sort_index()
         
         log(f"Original data rows: {len(df)}")
-        
-        # Resample to BASE frequency (1h) first. 
-        # This keeps high fidelity for slope calculation.
         df_resampled = df['close'].resample(RESAMPLE_FREQ).last().dropna().to_frame()
-        
         log(f"Resampled to Base Freq ({RESAMPLE_FREQ}). Rows: {len(df_resampled)}")
         return df_resampled
     except Exception as e:
@@ -86,9 +81,6 @@ def get_and_process_data():
         return None
 
 def calculate_rolling_slope_fast(series, window_size):
-    # REVERTED: Removed the "window_size < 2" check as requested.
-    # Since we are now using 1h data, 1 day window = 24 steps, so this is safe.
-    
     y = series.values
     x = np.arange(window_size)
     n = window_size
@@ -109,7 +101,6 @@ def calculate_rolling_slope_fast(series, window_size):
     return np.concatenate([pad, m])
 
 def get_rows_per_day():
-    # Returns rows per day based on the BASE frequency (1h)
     if RESAMPLE_FREQ == '1h':
         return 24
     elif RESAMPLE_FREQ == '1d':
@@ -120,13 +111,10 @@ def get_rows_per_day():
 def feature_engineering(df):
     log("Feature Engineering (Calculating Slopes on 1H data)...")
     feature_data = pd.DataFrame(index=df.index)
-    
-    rows_per_day = get_rows_per_day() # 24 for 1h
+    rows_per_day = get_rows_per_day() 
     
     for day in LOOKBACK_SLOPES:
         window_size = day * rows_per_day
-        # Window size is now 1 * 24 = 24. No div by zero error.
-        
         if len(df) > window_size:
             feature_data[f'slope_{day}d'] = calculate_rolling_slope_fast(df['close'], window_size)
             
@@ -136,21 +124,11 @@ def feature_engineering(df):
         h_steps = h_days * rows_per_day
         future_close = df['close'].shift(-h_steps)
         target_data[f'target_{h_days}d'] = (future_close > df['close']).astype(int)
-        
-        # Mask the end where we don't know the future
         target_data.loc[df.index[-h_steps:], f'target_{h_days}d'] = np.nan
 
-    # Combine
     full_data = pd.concat([feature_data, target_data], axis=1)
-    
-    log(f"Data shape before training resample: {full_data.shape}")
-    
-    # --- CRITICAL STEP: Downsample to Training Frequency (1d) ---
     log(f"Resampling to Training Frequency ({TRAINING_FREQ})...")
-    # We take the last value of the day. 
-    # Since slopes are rolling, the last value of the day represents the slope calculated over the previous 24h.
     train_data = full_data.resample(TRAINING_FREQ).last().dropna()
-    
     return train_data
 
 def create_sequences(data, feature_cols, target_cols, seq_len):
@@ -163,7 +141,8 @@ def create_sequences(data, feature_cols, target_cols, seq_len):
     return torch.FloatTensor(np.array(X)), torch.FloatTensor(np.array(y))
 
 class TrendLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
+    # Model Capacity doubled (Layers: 4, Dim: 128)
+    def __init__(self, input_dim, hidden_dim=128, output_dim=9, num_layers=4):
         super(TrendLSTM, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.6)
         self.fc = nn.Linear(hidden_dim, output_dim)
@@ -227,7 +206,8 @@ def run_pipeline():
         train_loader = DataLoader(TensorDataset(X_train, y_train), shuffle=True, batch_size=BATCH_SIZE)
         val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE)
         
-        model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols)).to(device)
+        # Initialize Model with 128 dimensions and 4 layers
+        model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=128, num_layers=4, output_dim=len(target_cols)).to(device)
         criterion = nn.BCELoss()
         
         optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
@@ -236,7 +216,7 @@ def run_pipeline():
         val_losses = []
 
         training_state['status'] = 'training'
-        log(f"Starting Training on {device} for {EPOCHS} epochs...")
+        log(f"Starting Training on {device} (Layers: 4, Dim: 128) for {EPOCHS} epochs...")
         
         total_batches = len(train_loader)
         
