@@ -31,7 +31,7 @@ LOOKBACK_SLOPES = range(1, 31)
 SEQ_LEN = 24
 RESAMPLE_FREQ = '1h'
 BATCH_SIZE = 64
-EPOCHS = 10  # Reduced slightly for faster web demo deployment
+EPOCHS = 10
 FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
 
 # --- Global State ---
@@ -43,7 +43,7 @@ training_state = {
     'error_msg': None
 }
 
-# --- Data & Model Functions (From your script) ---
+# --- Data & Model Functions ---
 
 def get_and_process_data():
     log("Starting data download...")
@@ -91,8 +91,6 @@ def feature_engineering(df):
     log("Feature Engineering (Calculating Slopes)...")
     feature_data = pd.DataFrame(index=df.index)
     
-    # Process slopes
-    # Note: tqdm removed here to avoid cluttering server logs, replaced with simple print
     for day in LOOKBACK_SLOPES:
         rows_per_day = 24 if RESAMPLE_FREQ == '1h' else 1440
         window_size = day * rows_per_day
@@ -123,7 +121,8 @@ def create_sequences(data, feature_cols, target_cols, seq_len):
 class TrendLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super(TrendLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2)
+        # ADJUSTMENT 1: Increased dropout from 0.2 to 0.5
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.5)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.sigmoid = nn.Sigmoid()
         
@@ -177,7 +176,9 @@ def run_pipeline():
         
         model = TrendLSTM(input_dim=len(feature_cols), hidden_dim=64, output_dim=len(target_cols)).to(device)
         criterion = nn.BCELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        # ADJUSTMENT 2: Added weight_decay for L2 regularization
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
         
         train_losses = []
         val_losses = []
@@ -341,5 +342,5 @@ def index():
 threading.Thread(target=run_pipeline, daemon=True).start()
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
