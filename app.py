@@ -25,7 +25,7 @@ TRAIN_SPLIT = 0.8     # Standard split for a larger dataset
 
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
-HIDDEN_DIM = 512
+HIDDEN_DIM = 1024
 NUM_LAYERS = 3
 DROPOUT = 0.2
 NUM_CLASSES = 3       
