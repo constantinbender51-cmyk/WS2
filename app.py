@@ -18,7 +18,7 @@ from sklearn.utils.class_weight import compute_class_weight
 torch.set_num_threads(12)         
 DEVICE = torch.device('cpu')      
 
-FILE_ID = '12Q2CI1Jbv3Sr-8S0pCnbNQ5EnhxpKFnk'
+FILE_ID = '1zmPWQo5MAxgyDyvaFTpf_NiqN2o6lswa'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 SEQ_LENGTH = 20
 TRAIN_SPLIT = 0.8     
