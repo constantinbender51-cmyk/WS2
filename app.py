@@ -10,19 +10,20 @@ import http.server
 import socketserver
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
 
 # ==========================================
 # 1. HYPERPARAMETERS & CONFIG
 # ==========================================
 # --- HARDWARE ---
-torch.set_num_threads(24)         # Use 24 cores for Matrix Math
-LOADER_WORKERS = 8                # Use 8 processes for fetching data
-DEVICE = torch.device('cpu')      # Keep CPU to avoid CUDA driver timeouts
+torch.set_num_threads(24)         
+LOADER_WORKERS = 8                
+DEVICE = torch.device('cpu')      
 
 # --- DATASET PARAMETERS ---
 FILE_ID = '1_2IDMRsQCalNn-SIT7nWvqbRMfI1ZFBb'
 DOWNLOAD_OUTPUT = 'market_data.csv'
-MAX_ROWS = None       # None = Full Dataset
+MAX_ROWS = None       
 SEQ_LENGTH = 60       
 TRAIN_SPLIT = 0.8     
 
@@ -30,19 +31,20 @@ TRAIN_SPLIT = 0.8
 INPUT_DIM = 1         
 HIDDEN_DIM = 128      
 NUM_LAYERS = 2        
-DROPOUT = 0.4
+DROPOUT = 0.5           # Increased to 0.5 for heavier regularization
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 256      
-EPOCHS = 20
+EPOCHS = 50             # Increased (Early Stopping will handle termination)
 LEARNING_RATE = 0.001
-MODEL_FILENAME = 'lstm_32core.pth'
+WEIGHT_DECAY = 1e-4     # L2 Regularization to penalize large weights
+PATIENCE = 7            # Stop if no improvement for 7 epochs
+MODEL_FILENAME = 'lstm_regularized.pth'
 
 def log(msg):
-    """Timestamped log with mandatory flush and small delay."""
+    """Timestamped log with mandatory flush."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-    time.sleep(0.1)
 
 # ==========================================
 # 2. DATA PIPELINE
@@ -61,12 +63,12 @@ def get_data():
     df = pd.read_csv(DOWNLOAD_OUTPUT)
     
     if MAX_ROWS is not None:
-        log(f"Truncating dataset to last {MAX_ROWS} rows.")
         df = df.tail(MAX_ROWS).copy()
     else:
         log(f"Using Full Dataset: {len(df)} rows.")
 
     log("Calculating Log Returns...")
+    # Add small epsilon to avoid log(0) if exists, though unlikely in price
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     
     label_map = {-1: 0, 0: 1, 1: 2}
@@ -104,13 +106,31 @@ def get_data():
 class LSTMClassifier(nn.Module):
     def __init__(self):
         super().__init__()
+        # LSTM Layer
         self.lstm = nn.LSTM(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
                             batch_first=True, dropout=DROPOUT)
+        
+        # Batch Normalization: Stabilizes inputs to the linear layer
+        self.bn = nn.BatchNorm1d(HIDDEN_DIM)
+        
+        # Dropout: Randomly zero out neurons to prevent co-adaptation
+        self.dropout = nn.Dropout(DROPOUT)
+        
+        # Final Classification Layer
         self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
         
     def forward(self, x):
+        # LSTM output: (batch, seq, hidden)
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
+        
+        # Take the last time step
+        out = out[:, -1, :]
+        
+        # Apply Batch Norm -> Activation -> Dropout -> FC
+        out = self.bn(out)
+        out = torch.relu(out) # Optional non-linearity
+        out = self.dropout(out)
+        out = self.fc(out)
         return out
 
 # ==========================================
@@ -118,31 +138,62 @@ class LSTMClassifier(nn.Module):
 # ==========================================
 if __name__ == "__main__":
     log("==========================================")
-    log(f" Starting High-Performance Training")
+    log(f" Starting Regularized Training")
     log(f" vCPUs Available: {os.cpu_count()}")
     log("==========================================")
     
     X, y = get_data()
     
+    # --- SPLIT ---
     split_idx = int(len(X) * TRAIN_SPLIT)
     
-    X_train = torch.from_numpy(X[:split_idx]).float()
-    y_train = torch.from_numpy(y[:split_idx]).long()
-    
-    X_test = torch.from_numpy(X[split_idx:]).float()
-    y_test = torch.from_numpy(y[split_idx:]).long()
+    X_train_np = X[:split_idx]
+    y_train_np = y[:split_idx]
+    X_test_np = X[split_idx:]
+    y_test_np = y[split_idx:]
+
+    # --- CALCULATE CLASS WEIGHTS ---
+    # This prevents the model from ignoring rare classes (Buy/Sell) in favor of Hold
+    class_weights = compute_class_weight(
+        class_weight='balanced', 
+        classes=np.unique(y_train_np), 
+        y=y_train_np
+    )
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(DEVICE)
+    log(f"Class Weights calculated: {class_weights}")
+
+    # --- TENSORS ---
+    X_train = torch.from_numpy(X_train_np).float()
+    y_train = torch.from_numpy(y_train_np).long()
+    X_test = torch.from_numpy(X_test_np).float()
+    y_test = torch.from_numpy(y_test_np).long()
     
     train_ds = TensorDataset(X_train, y_train)
     test_ds = TensorDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=LOADER_WORKERS)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=LOADER_WORKERS)
+    # Pin memory speeds up host-to-device transfer
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
+                              num_workers=LOADER_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                             num_workers=LOADER_WORKERS, pin_memory=True)
     
     model = LSTMClassifier().to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.CrossEntropyLoss()
     
-    log("Model Initialized. Starting Epochs...")
+    # Use AdamW (Decoupled Weight Decay) for better regularization
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    
+    # Scheduler: Reduce LR if validation loss plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+    
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    
+    # --- TRAINING LOOP WITH EARLY STOPPING ---
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    log("Model Initialized. Starting Training Loop...")
     
     for epoch in range(EPOCHS):
         start_time = time.time()
@@ -160,15 +211,16 @@ if __name__ == "__main__":
             out = model(bx)
             loss = criterion(out, by)
             loss.backward()
+            
+            # Gradient Clipping: Prevents "exploding gradients"
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             train_loss += loss.item()
             _, pred = torch.max(out, 1)
             train_correct += (pred == by).sum().item()
             train_total += by.size(0)
-            
-            if i > 0 and i % (len(train_loader) // 10 + 1) == 0:
-                print(f"\r[Ep {epoch+1} Train] {i}/{len(train_loader)} batches...", end="", flush=True)
 
         # --- VALIDATE ---
         model.eval()
@@ -177,7 +229,7 @@ if __name__ == "__main__":
         val_total = 0
         
         with torch.no_grad():
-            for i, (bx, by) in enumerate(test_loader):
+            for bx, by in test_loader:
                 bx, by = bx.to(DEVICE), by.to(DEVICE)
                 out = model(bx)
                 loss = criterion(out, by)
@@ -186,24 +238,35 @@ if __name__ == "__main__":
                 _, pred = torch.max(out, 1)
                 val_correct += (pred == by).sum().item()
                 val_total += by.size(0)
-                
-                if i > 0 and i % (len(test_loader) // 5 + 1) == 0:
-                     print(f"\r[Ep {epoch+1} Val]   {i}/{len(test_loader)} batches...", end="", flush=True)
 
-        time_taken = time.time() - start_time
+        # --- METRICS ---
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(test_loader)
         train_acc = 100 * train_correct / train_total
         val_acc = 100 * val_correct / val_total
+        time_taken = time.time() - start_time
         
-        print("") 
-        log(f"Epoch {epoch+1}/{EPOCHS} | Time: {time_taken:.1f}s")
-        log(f"  > Train Loss: {avg_train_loss:.4f} | Acc: {train_acc:.2f}%")
-        log(f"  > Val   Loss: {avg_val_loss:.4f} | Acc: {val_acc:.2f}%")
+        # --- LOGGING ---
+        print(f"Epoch {epoch+1:02d} | T: {time_taken:.1f}s | "
+              f"TrLoss: {avg_train_loss:.4f} TrAcc: {train_acc:.2f}% | "
+              f"ValLoss: {avg_val_loss:.4f} ValAcc: {val_acc:.2f}%")
+        
+        # --- SCHEDULER STEP ---
+        scheduler.step(avg_val_loss)
+        
+        # --- EARLY STOPPING CHECK ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), MODEL_FILENAME)
+            # print("  > Best model saved.")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                log(f"Early Stopping triggered at Epoch {epoch+1}")
+                break
 
-    log("Saving Model...")
-    torch.save(model.state_dict(), MODEL_FILENAME)
-    log("Complete.")
+    log(f"Training Complete. Best Validation Loss: {best_val_loss:.4f}")
 
     # ==========================================
     # 5. WEB SERVER FOR DOWNLOAD
@@ -213,10 +276,8 @@ if __name__ == "__main__":
     
     log("="*40)
     log(f"STARTING DOWNLOAD SERVER")
-    log(f"1. Go to your Railway Public URL")
-    log(f"2. Append /{MODEL_FILENAME} to download")
-    log(f"   Example: https://your-app.up.railway.app/{MODEL_FILENAME}")
-    log(f"Serving on 0.0.0.0:{PORT}...")
+    log(f"Serving file: {MODEL_FILENAME}")
+    log(f"URL: https://your-app.up.railway.app/{MODEL_FILENAME}")
     log("="*40)
     
     socketserver.TCPServer.allow_reuse_address = True
