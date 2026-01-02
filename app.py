@@ -24,21 +24,21 @@ DEVICE = torch.device('cpu')
 FILE_ID = '1_2IDMRsQCalNn-SIT7nWvqbRMfI1ZFBb'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 MAX_ROWS = None       
-SEQ_LENGTH = 60       
+SEQ_LENGTH = 30
 TRAIN_SPLIT = 0.8     
 
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
-HIDDEN_DIM = 128      
-NUM_LAYERS = 2        
-DROPOUT = 0.5           # High dropout for regularization
+HIDDEN_DIM = 64
+NUM_LAYERS = 1
+DROPOUT = 0.4           # High dropout for regularization
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 256      
-EPOCHS = 50             
+EPOCHS = 50    
 LEARNING_RATE = 0.001
-WEIGHT_DECAY = 1e-4     # L2 Regularization
+WEIGHT_DECAY = 1e-3     # L2 Regularization
 PATIENCE = 7            # Early stopping patience
 MODEL_FILENAME = 'lstm_regularized.pth'
 
