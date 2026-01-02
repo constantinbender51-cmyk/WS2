@@ -20,20 +20,20 @@ DEVICE = torch.device('cpu')
 
 FILE_ID = '12Q2CI1Jbv3Sr-8S0pCnbNQ5EnhxpKFnk'
 DOWNLOAD_OUTPUT = 'market_data.csv'
-SEQ_LENGTH = 10
+SEQ_LENGTH = 20
 TRAIN_SPLIT = 0.9     # Higher split because we are already focusing on a small subset
 
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
 HIDDEN_DIM = 256
-NUM_LAYERS = 2
+NUM_LAYERS = 3
 DROPOUT = 0.4     
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 512       # Reduced batch size for smaller dataset to maintain update frequency
 EPOCHS = 300           # Increased epochs for "extensive" training on the subset
-MAX_LR = 1e-3          # Slightly lower LR for stability on focused data
+MAX_LR = 1e-2         # Slightly lower LR for stability on focused data
 WEIGHT_DECAY = 1e-3
 MODEL_FILENAME = 'lstm_focused_realities.pth'
 
