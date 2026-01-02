@@ -25,15 +25,15 @@ TRAIN_SPLIT = 0.8     # Standard split for a larger dataset
 
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
-HIDDEN_DIM = 1024
+HIDDEN_DIM = 256
 NUM_LAYERS = 3
 DROPOUT = 0.2
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
-BATCH_SIZE = 1024      # Increased batch size for the larger "30 realities" dataset
+BATCH_SIZE = 4096      # Increased batch size for the larger "30 realities" dataset
 EPOCHS = 300         # Reduced epochs as we have more data per epoch now
-MAX_LR = 5e-3          # Adjusted LR for OneCycle
+MAX_LR = 1e-2          # Adjusted LR for OneCycle
 WEIGHT_DECAY = 1e-0
 MODEL_FILENAME = 'lstm_focused_30_realities.pth'
 
@@ -67,7 +67,7 @@ def get_focused_data():
     active_signals['regime_change'] = active_signals['signal'] != active_signals['signal'].shift(1)
     change_indices = active_signals.index[active_signals['regime_change']].tolist()
     
-    target_count = 30
+    target_count = 100
     if len(change_indices) < target_count:
         log(f"Warning: Only {len(change_indices)} realities found. Using all available.")
         start_idx = change_indices[0]
