@@ -32,9 +32,9 @@ NUM_CLASSES = 3
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 1024      # Increased batch size for the larger "30 realities" dataset
-EPOCHS = 3000         # Reduced epochs as we have more data per epoch now
+EPOCHS = 300         # Reduced epochs as we have more data per epoch now
 MAX_LR = 5e-3          # Adjusted LR for OneCycle
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 1e-0
 MODEL_FILENAME = 'lstm_focused_30_realities.pth'
 
 def log(msg):
