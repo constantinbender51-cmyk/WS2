@@ -31,9 +31,9 @@ TRAIN_SPLIT = 0.8
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
 # INCREASED: 12 is too small to capture market complexity
-HIDDEN_DIM = 64     
-NUM_LAYERS = 1
-DROPOUT = 0.2           
+HIDDEN_DIM = 128   
+NUM_LAYERS = 2
+DROPOUT = 0.2         
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
@@ -41,7 +41,7 @@ NUM_CLASSES = 3
 BATCH_SIZE = 4096      
 EPOCHS = 100            # Reduced epochs, we aim for faster convergence
 MAX_LR = 0.01           # Higher max LR for OneCycle
-WEIGHT_DECAY = 1e-4     
+WEIGHT_DECAY = 1e-1
 MODEL_FILENAME = 'lstm_optimized.pth'
 
 def log(msg):
