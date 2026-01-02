@@ -29,14 +29,14 @@ TRAIN_SPLIT = 0.8
 
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
-HIDDEN_DIM = 64
+HIDDEN_DIM = 512
 NUM_LAYERS = 1
 DROPOUT = 0.4           # High dropout for regularization
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 256      
-EPOCHS = 50    
+EPOCHS = 500
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-3     # L2 Regularization
 PATIENCE = 7            # Early stopping patience
