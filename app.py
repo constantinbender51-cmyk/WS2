@@ -31,7 +31,7 @@ TRAIN_SPLIT = 0.8
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
 # INCREASED: 12 is too small to capture market complexity
-HIDDEN_DIM = 128   
+HIDDEN_DIM = 256
 NUM_LAYERS = 2
 DROPOUT = 0.4     
 NUM_CLASSES = 3       
