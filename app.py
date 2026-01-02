@@ -20,7 +20,7 @@ LOADER_WORKERS = 8                # Use 8 processes for fetching data
 DEVICE = torch.device('cpu')      # Keep CPU to avoid CUDA driver timeouts
 
 # --- DATASET PARAMETERS ---
-FILE_ID = '1RreTtTTGZCRcLqk6Ixl85sJAu8izj8DW'
+FILE_ID = '1_2IDMRsQCalNn-SIT7nWvqbRMfI1ZFBb'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 MAX_ROWS = None       # None = Full Dataset
 SEQ_LENGTH = 60       
@@ -30,12 +30,12 @@ TRAIN_SPLIT = 0.8
 INPUT_DIM = 1         
 HIDDEN_DIM = 128      
 NUM_LAYERS = 2        
-DROPOUT = 0.2
+DROPOUT = 0.4
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 256      
-EPOCHS = 100
+EPOCHS = 20
 LEARNING_RATE = 0.001
 MODEL_FILENAME = 'lstm_32core.pth'
 
