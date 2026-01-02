@@ -21,7 +21,7 @@ torch.set_num_threads(12)
 DEVICE = torch.device('cpu')      
 
 # --- DATASET PARAMETERS ---
-FILE_ID = '1_2IDMRsQCalNn-SIT7nWvqbRMfI1ZFBb'
+FILE_ID = '1V_L9YS9RCYTXH1JVrjWW4EbQb3nQiE0A'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 MAX_ROWS = None       
 # INCREASED: Give the LSTM enough history to see a pattern
