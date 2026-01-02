@@ -21,19 +21,19 @@ DEVICE = torch.device('cpu')
 FILE_ID = '12Q2CI1Jbv3Sr-8S0pCnbNQ5EnhxpKFnk'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 SEQ_LENGTH = 20
-TRAIN_SPLIT = 0.8     # Standard split for a larger dataset
+TRAIN_SPLIT = 0.8     
 
 # --- MODEL PARAMETERS ---
-INPUT_DIM = 1         
+INPUT_DIM = 2          # Feature 1: Log Returns, Feature 2: Z-Scored Month
 HIDDEN_DIM = 256
 NUM_LAYERS = 3
 DROPOUT = 0.2
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
-BATCH_SIZE = 4096      # Increased batch size for the larger "30 realities" dataset
-EPOCHS = 300         # Reduced epochs as we have more data per epoch now
-MAX_LR = 1e-2          # Adjusted LR for OneCycle
+BATCH_SIZE = 4096      
+EPOCHS = 300         
+MAX_LR = 1e-2          
 WEIGHT_DECAY = 1e-0
 MODEL_FILENAME = 'lstm_focused_30_realities.pth'
 
@@ -79,31 +79,69 @@ def get_focused_data():
     # Slice the dataframe to include data from that point forward
     df = df.iloc[start_idx:].copy()
 
-    # Log returns
+    # 1. Log returns
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     
+    # 2. Month Z-Score Normalization
+    if 'month' not in df.columns:
+        log("Error: 'month' column not found in CSV.")
+        # Fallback to datetime just in case, but prioritize explicit column
+        if 'datetime' in df.columns:
+            log("Attempting to extract month from 'datetime' column...")
+            df['month'] = pd.to_datetime(df['datetime']).dt.month
+        else:
+            sys.exit(1)
+
+    month_mean = df['month'].mean()
+    month_std = df['month'].std()
+    
+    # Avoid division by zero
+    if month_std == 0: 
+        month_std = 1.0
+        
+    df['month_norm'] = (df['month'] - month_mean) / month_std
+    log(f"Month Stats: Mean={month_mean:.2f}, Std={month_std:.2f}")
+
     # Label Map
     label_map = {-1: 0, 0: 1, 1: 2}
     df['target_class'] = df['signal'].map(label_map)
     
     # Drop NaNs and Infs
-    df.dropna(subset=['log_ret', 'target_class'], inplace=True)
+    df.dropna(subset=['log_ret', 'target_class', 'month_norm'], inplace=True)
     df = df[~df.isin([np.nan, np.inf, -np.inf]).any(axis=1)]
     
-    data_val = df['log_ret'].values.reshape(-1, 1)
+    # --- Feature Assembly ---
+    # 1. Scale Log Returns (RobustScaler handles outliers well)
+    log_ret_vals = df['log_ret'].values.reshape(-1, 1)
+    scaler = RobustScaler()
+    log_ret_scaled = scaler.fit_transform(log_ret_vals)
+    
+    # 2. Get Normalized Month
+    month_scaled = df['month_norm'].values.reshape(-1, 1)
+    
+    # 3. Stack features: Shape (N, 2)
+    # Feature 0: log_ret (Robust Scaled)
+    # Feature 1: month (Z-Score Scaled)
+    data_val = np.hstack([log_ret_scaled, month_scaled])
+    
     labels_val = df['target_class'].values.astype(int)
     
-    log(f"Dataset Size after filtering for 30 realities: {len(df)} rows.")
-    log("Normalizing Features (RobustScaler)...")
-    scaler = RobustScaler()
-    data_val = scaler.fit_transform(data_val)
+    log(f"Dataset Size after filtering: {len(df)} rows.")
+    log(f"Features shape: {data_val.shape}")
     
     log(f"Generating Sequences (Length {SEQ_LENGTH})...")
     from numpy.lib.stride_tricks import sliding_window_view
     
-    # Efficient windowing for LSTM input
-    windows = sliding_window_view(data_val.flatten(), window_shape=SEQ_LENGTH)
-    X = windows.reshape(*windows.shape, 1)
+    # Create windows over the 0th axis (Time)
+    # sliding_window_view on shape (N, 2) with window_shape=SEQ_LENGTH, axis=0 
+    # results in shape (N-SEQ+1, 2, SEQ_LENGTH)
+    windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0) 
+    
+    # Transpose to get (Batch, Seq_Len, Features) -> (N, SEQ_LENGTH, 2)
+    X = windows.transpose(0, 2, 1)
+    
+    # Align labels (target is the label at the last step of the sequence)
+    # The window ends at index i + SEQ_LENGTH - 1. We want the target at that same end index.
     y = labels_val[SEQ_LENGTH-1:]
     
     min_len = min(len(X), len(y))
@@ -138,6 +176,7 @@ class LSTMClassifier(nn.Module):
 if __name__ == "__main__":
     log("==========================================")
     log(f" Starting Targeted 30-Reality Training")
+    log(f" Features: LogRet + Month(Z-Scored)")
     log("==========================================")
     
     X, y = get_focused_data()
