@@ -46,18 +46,18 @@ DOWNLOAD_OUTPUT = 'market_data.csv'
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Data Params
-SEQ_LENGTH = 60
-TRAIN_SPLIT = 0.8
+SEQ_LENGTH = 2
+TRAIN_SPLIT = 0.1
 
 # Model Params
 INPUT_DIM = 1
-HIDDEN_DIM = 64
+HIDDEN_DIM = 12
 NUM_LAYERS = 2
 DROPOUT = 0.2
 NUM_CLASSES = 3 
 
 # Training Params
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 EPOCHS = 10
 LEARNING_RATE = 0.001
 
