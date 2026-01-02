@@ -18,13 +18,13 @@ import itertools
 torch.set_num_threads(12)
 DEVICE = torch.device('cpu')
 
-FILE_ID = '1V_L9YS9RCYTXH1JVrjWW4EbQb3nQiE0A'
+FILE_ID = '1SagUdIPk-9nU1tlNAOqVAyILZV4Mflj0'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 TRAIN_SPLIT = 0.8
 BATCH_SIZE = 4096
 EPOCHS_PER_RUN = 30  # As requested: try first 30 epochs
 MAX_LR = 0.01
-WEIGHT_DECAY = 1e-1
+WEIGHT_DECAY = 1e-3
 
 # Define the Grid
 param_grid = {
