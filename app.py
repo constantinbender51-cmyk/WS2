@@ -31,15 +31,15 @@ TRAIN_SPLIT = 0.8
 INPUT_DIM = 1         
 HIDDEN_DIM = 128      
 NUM_LAYERS = 2        
-DROPOUT = 0.5           # Increased to 0.5 for heavier regularization
+DROPOUT = 0.5           # High dropout for regularization
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 256      
-EPOCHS = 50             # Increased (Early Stopping will handle termination)
+EPOCHS = 50             
 LEARNING_RATE = 0.001
-WEIGHT_DECAY = 1e-4     # L2 Regularization to penalize large weights
-PATIENCE = 7            # Stop if no improvement for 7 epochs
+WEIGHT_DECAY = 1e-4     # L2 Regularization
+PATIENCE = 7            # Early stopping patience
 MODEL_FILENAME = 'lstm_regularized.pth'
 
 def log(msg):
@@ -128,7 +128,7 @@ class LSTMClassifier(nn.Module):
         
         # Apply Batch Norm -> Activation -> Dropout -> FC
         out = self.bn(out)
-        out = torch.relu(out) # Optional non-linearity
+        out = torch.relu(out) 
         out = self.dropout(out)
         out = self.fc(out)
         return out
@@ -153,7 +153,6 @@ if __name__ == "__main__":
     y_test_np = y[split_idx:]
 
     # --- CALCULATE CLASS WEIGHTS ---
-    # This prevents the model from ignoring rare classes (Buy/Sell) in favor of Hold
     class_weights = compute_class_weight(
         class_weight='balanced', 
         classes=np.unique(y_train_np), 
@@ -183,8 +182,9 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
     # Scheduler: Reduce LR if validation loss plateaus
+    # REMOVED verbose=True to fix TypeError
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        optimizer, mode='min', factor=0.5, patience=3
     )
     
     criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
@@ -212,7 +212,7 @@ if __name__ == "__main__":
             loss = criterion(out, by)
             loss.backward()
             
-            # Gradient Clipping: Prevents "exploding gradients"
+            # Gradient Clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -246,10 +246,13 @@ if __name__ == "__main__":
         val_acc = 100 * val_correct / val_total
         time_taken = time.time() - start_time
         
+        # Get current Learning Rate manually
+        current_lr = optimizer.param_groups[0]['lr']
+        
         # --- LOGGING ---
-        print(f"Epoch {epoch+1:02d} | T: {time_taken:.1f}s | "
-              f"TrLoss: {avg_train_loss:.4f} TrAcc: {train_acc:.2f}% | "
-              f"ValLoss: {avg_val_loss:.4f} ValAcc: {val_acc:.2f}%")
+        print(f"Epoch {epoch+1:02d} | T: {time_taken:.1f}s | LR: {current_lr:.6f}")
+        print(f"  > TrLoss: {avg_train_loss:.4f} TrAcc: {train_acc:.2f}%")
+        print(f"  > ValLoss: {avg_val_loss:.4f} ValAcc: {val_acc:.2f}%")
         
         # --- SCHEDULER STEP ---
         scheduler.step(avg_val_loss)
@@ -259,7 +262,6 @@ if __name__ == "__main__":
             best_val_loss = avg_val_loss
             patience_counter = 0
             torch.save(model.state_dict(), MODEL_FILENAME)
-            # print("  > Best model saved.")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
