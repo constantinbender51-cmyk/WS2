@@ -34,8 +34,8 @@ NUM_CLASSES = 3
 BATCH_SIZE = 4096      
 EPOCHS = 300         
 MAX_LR = 1e-2          
-WEIGHT_DECAY = 1e-0
-MODEL_FILENAME = 'gru_full_dataset.pth' # Updated filename to reflect full data usage
+WEIGHT_DECAY = 1e-4
+MODEL_FILENAME = 'gru_full_dataset.pth'
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -53,25 +53,41 @@ def get_focused_data():
             log(f"Download Error: {e}")
             sys.exit(1)
 
+    # Read CSV
     df = pd.read_csv(DOWNLOAD_OUTPUT)
-    log(f"Raw data loaded. Shape: {df.shape}")
+    
+    # Normalize column names to lowercase to be safe
+    df.columns = df.columns.str.strip().str.lower()
+    log(f"Raw data loaded. Shape: {df.shape}. Columns: {df.columns.tolist()}")
 
-    # --- LOGIC UPDATE: Use Full Dataset ---
-    # We bypass the "Last 100 Realities" filter to ensure we get all data.
-    # The previous logic was slicing the data too aggressively.
+    # --- Feature Engineering ---
     
-    # 1. Log returns
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    # 1. Determine Price Column for Log Returns
+    # User specified 'value', but we check for 'close' as fallback
+    if 'value' in df.columns:
+        price_col = 'value'
+    elif 'close' in df.columns:
+        price_col = 'close'
+    else:
+        log("CRITICAL ERROR: Could not find 'value' or 'close' column for price data.")
+        sys.exit(1)
+
+    log(f"Using column '{price_col}' for return calculations.")
     
-    # 2. Month Z-Score Normalization
+    # Calculate Log Returns
+    # log(price_t / price_t-1)
+    df['log_ret'] = np.log(df[price_col] / df[price_col].shift(1))
+    
+    # 2. Month Processing
     if 'month' not in df.columns:
+        # Fallback if 'month' is missing but 'datetime' exists
         if 'datetime' in df.columns:
-            # log("Attempting to extract month from 'datetime' column...")
             df['month'] = pd.to_datetime(df['datetime']).dt.month
         else:
-            log("Warning: No 'month' or 'datetime' column. Defaulting month to 0.")
+            log("Warning: No 'month' column found. Defaulting to 0.")
             df['month'] = 0
 
+    # Z-Score Normalization for Month
     month_mean = df['month'].mean()
     month_std = df['month'].std()
     
@@ -81,19 +97,26 @@ def get_focused_data():
     df['month_norm'] = (df['month'] - month_mean) / month_std
     log(f"Month Stats: Mean={month_mean:.2f}, Std={month_std:.2f}")
 
-    # Label Map
+    # 3. Label Map (Signal)
+    if 'signal' not in df.columns:
+        log("CRITICAL ERROR: No 'signal' column found.")
+        sys.exit(1)
+
+    # Map signals: -1 -> 0, 0 -> 1, 1 -> 2
     label_map = {-1: 0, 0: 1, 1: 2}
     df['target_class'] = df['signal'].map(label_map)
     
-    # Drop NaNs and Infs
+    # Drop NaNs created by shift() or bad data
     df.dropna(subset=['log_ret', 'target_class', 'month_norm'], inplace=True)
     df = df[~df.isin([np.nan, np.inf, -np.inf]).any(axis=1)]
     
     # --- Feature Assembly ---
+    # Feature 1: Robust Scaled Log Returns
     log_ret_vals = df['log_ret'].values.reshape(-1, 1)
     scaler = RobustScaler()
     log_ret_scaled = scaler.fit_transform(log_ret_vals)
     
+    # Feature 2: Z-Scored Month
     month_scaled = df['month_norm'].values.reshape(-1, 1)
     
     # Stack features: Shape (N, 2)
@@ -103,11 +126,25 @@ def get_focused_data():
     log(f"Dataset Size after filtering: {len(df)} rows.")
     log(f"Features shape: {data_val.shape}")
     
+    # Generate Sequences
     log(f"Generating Sequences (Length {SEQ_LENGTH})...")
     from numpy.lib.stride_tricks import sliding_window_view
     
+    # sliding_window_view creates shape (Num_Windows, Window_Size, Features)
     windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0) 
+    
+    # Ensure dimensions are (Batch, Seq_Len, Features)
+    # The default behavior of sliding_window_view on 2D array:
+    # Input (N, F) -> Output (N - W + 1, W, F) is automatic if we don't mess up axes.
+    # Actually, for 2D input (N, F), sliding_window_view(x, w, axis=0) results in (N-w+1, F, w).
+    # We need (N-w+1, w, F).
+    
+    windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0)
+    # Current shape: (N_samples, Features, Seq_Len) -> e.g. (X, 2, 20)
+    # We want: (N_samples, Seq_Len, Features) -> (X, 20, 2)
     X = windows.transpose(0, 2, 1)
+    
+    # Align labels (taking the label at the end of the sequence)
     y = labels_val[SEQ_LENGTH-1:]
     
     min_len = min(len(X), len(y))
@@ -128,7 +165,8 @@ class GRUClassifier(nn.Module):
     def forward(self, x):
         # Input shape: (Batch, Seq, Feature)
         out, _ = self.gru(x)
-        # GRU returns (output, hidden), we use last timestep of output
+        # GRU returns (output, hidden). Output is (Batch, Seq, Hidden)
+        # We take the last time step
         out = out[:, -1, :] 
         out = self.bn(out)
         out = torch.relu(out)
@@ -142,30 +180,39 @@ class GRUClassifier(nn.Module):
 if __name__ == "__main__":
     log("==========================================")
     log(f" Starting Full Dataset GRU Training")
-    log(f" Features: LogRet + Month(Z-Scored)")
+    log(f" Features: LogRet(from 'value') + Month(Z-Scored)")
     log("==========================================")
     
     X, y = get_focused_data()
     
     # Train/Test Split
     split_idx = int(len(X) * TRAIN_SPLIT)
-    X_train, y_train = torch.tensor(X[:split_idx], dtype=torch.float32), torch.tensor(y[:split_idx], dtype=torch.long)
-    X_test, y_test = torch.tensor(X[split_idx:], dtype=torch.float32), torch.tensor(y[split_idx:], dtype=torch.long)
+    
+    # Convert to Tensor
+    X_train = torch.tensor(X[:split_idx], dtype=torch.float32)
+    y_train = torch.tensor(y[:split_idx], dtype=torch.long)
+    X_test = torch.tensor(X[split_idx:], dtype=torch.float32)
+    y_test = torch.tensor(y[split_idx:], dtype=torch.long)
 
-    # Class Weights for Imbalance
+    # Class Weights for Imbalance handling
     unique_classes = np.unique(y[:split_idx])
     class_weights = compute_class_weight('balanced', classes=unique_classes, y=y[:split_idx])
     weights_tensor = torch.zeros(NUM_CLASSES).to(DEVICE)
     for i, cls in enumerate(unique_classes):
         weights_tensor[cls] = class_weights[i]
+        
+    log(f"Class Weights: {weights_tensor}")
 
     # Dataloaders
     train_ds = TensorDataset(X_train, y_train)
     test_ds = TensorDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
-                              num_workers=4, pin_memory=True, persistent_workers=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    # Check if we have enough data for the batch size
+    actual_batch_size = min(BATCH_SIZE, len(train_ds))
+    
+    train_loader = DataLoader(train_ds, batch_size=actual_batch_size, shuffle=True, 
+                              num_workers=0) # num_workers=0 is safer for simple scripts/CPU
+    test_loader = DataLoader(test_ds, batch_size=actual_batch_size, shuffle=False)
     
     # Instantiate GRU Model
     model = GRUClassifier().to(DEVICE)
@@ -229,7 +276,7 @@ if __name__ == "__main__":
 
     log(f"Training Complete. Best Val Accuracy: {best_acc:.2f}%")
     
-    # Server logic for deployment environment
+    # Server logic for deployment environment (Keep-Alive)
     PORT = int(os.environ.get("PORT", 8080))
     log(f"Serving on port {PORT}...")
     with socketserver.TCPServer(("0.0.0.0", PORT), http.server.SimpleHTTPRequestHandler) as httpd:
