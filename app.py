@@ -15,12 +15,12 @@ FILE_ID = '1RreTtTTGZCRcLqk6Ixl85sJAu8izj8DW'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 
 # Data Params
-SEQ_LENGTH = 2       # Number of time steps to look back
-TRAIN_SPLIT = 0.1     # 80% training, 20% validation
+SEQ_LENGTH = 60       # Number of time steps to look back
+TRAIN_SPLIT = 0.8     # 80% training, 20% validation
 
 # Model Params
 INPUT_DIM = 1         # Using 1 feature: Log Returns
-HIDDEN_DIM = 32       # Neurons in LSTM hidden layer
+HIDDEN_DIM = 64       # Neurons in LSTM hidden layer
 NUM_LAYERS = 2        # Number of stacked LSTM layers
 DROPOUT = 0.2         # Dropout probability
 NUM_CLASSES = 3       # Classes: 0, 1, 2 (mapped from -1, 0, 1)
