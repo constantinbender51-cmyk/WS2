@@ -35,13 +35,13 @@ BATCH_SIZE = 4096
 EPOCHS = 300         
 MAX_LR = 1e-2          
 WEIGHT_DECAY = 1e-0
-MODEL_FILENAME = 'gru_focused_100_realities.pth' # Updated filename to 100
+MODEL_FILENAME = 'gru_full_dataset.pth' # Updated filename to reflect full data usage
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 2. DATA PIPELINE (Focus on Last 100 Realities)
+# 2. DATA PIPELINE (Full Dataset)
 # ==========================================
 def get_focused_data():
     if not os.path.exists(DOWNLOAD_OUTPUT):
@@ -54,44 +54,23 @@ def get_focused_data():
             sys.exit(1)
 
     df = pd.read_csv(DOWNLOAD_OUTPUT)
-    
-    # --- LOGIC: Filter for last 100 "Realities" ---
-    # Filter for rows where a signal is present
-    active_signals = df[df['signal'] != 0].copy()
-    
-    if len(active_signals) == 0:
-        log("No active signals found in data.")
-        sys.exit(1)
+    log(f"Raw data loaded. Shape: {df.shape}")
 
-    # Detect transitions in the signal to identify unique regimes (trees)
-    active_signals['regime_change'] = active_signals['signal'] != active_signals['signal'].shift(1)
-    change_indices = active_signals.index[active_signals['regime_change']].tolist()
+    # --- LOGIC UPDATE: Use Full Dataset ---
+    # We bypass the "Last 100 Realities" filter to ensure we get all data.
+    # The previous logic was slicing the data too aggressively.
     
-    # Updated target count to 100
-    target_count = 100
-    
-    if len(change_indices) < target_count:
-        log(f"Warning: Only {len(change_indices)} realities found. Using all available.")
-        start_idx = change_indices[0]
-    else:
-        # Take the start index of the 100th-to-last reality
-        start_idx = change_indices[-target_count]
-        log(f"Focusing on the last {target_count} realities starting at index {start_idx}")
-
-    # Slice the dataframe to include data from that point forward
-    df = df.iloc[start_idx:].copy()
-
     # 1. Log returns
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     
     # 2. Month Z-Score Normalization
     if 'month' not in df.columns:
-        log("Error: 'month' column not found in CSV.")
         if 'datetime' in df.columns:
-            log("Attempting to extract month from 'datetime' column...")
+            # log("Attempting to extract month from 'datetime' column...")
             df['month'] = pd.to_datetime(df['datetime']).dt.month
         else:
-            sys.exit(1)
+            log("Warning: No 'month' or 'datetime' column. Defaulting month to 0.")
+            df['month'] = 0
 
     month_mean = df['month'].mean()
     month_std = df['month'].std()
@@ -162,7 +141,7 @@ class GRUClassifier(nn.Module):
 # ==========================================
 if __name__ == "__main__":
     log("==========================================")
-    log(f" Starting Targeted 100-Reality GRU Training")
+    log(f" Starting Full Dataset GRU Training")
     log(f" Features: LogRet + Month(Z-Scored)")
     log("==========================================")
     
