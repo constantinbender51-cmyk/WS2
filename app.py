@@ -20,13 +20,13 @@ DEVICE = torch.device('cpu')
 
 FILE_ID = '12Q2CI1Jbv3Sr-8S0pCnbNQ5EnhxpKFnk'
 DOWNLOAD_OUTPUT = 'market_data.csv'
-SEQ_LENGTH = 10
+SEQ_LENGTH = 20
 TRAIN_SPLIT = 0.8     # Standard split for a larger dataset
 
 # --- MODEL PARAMETERS ---
 INPUT_DIM = 1         
-HIDDEN_DIM = 256
-NUM_LAYERS = 2
+HIDDEN_DIM = 512
+NUM_LAYERS = 3
 DROPOUT = 0.4     
 NUM_CLASSES = 3       
 
