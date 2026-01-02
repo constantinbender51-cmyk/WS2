@@ -35,13 +35,13 @@ BATCH_SIZE = 4096
 EPOCHS = 300         
 MAX_LR = 1e-2          
 WEIGHT_DECAY = 1e-0
-MODEL_FILENAME = 'lstm_focused_30_realities.pth'
+MODEL_FILENAME = 'gru_focused_100_realities.pth' # Updated filename to 100
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 2. DATA PIPELINE (Focus on Last 30 Realities)
+# 2. DATA PIPELINE (Focus on Last 100 Realities)
 # ==========================================
 def get_focused_data():
     if not os.path.exists(DOWNLOAD_OUTPUT):
@@ -55,7 +55,7 @@ def get_focused_data():
 
     df = pd.read_csv(DOWNLOAD_OUTPUT)
     
-    # --- LOGIC: Filter for last 30 "Realities" ---
+    # --- LOGIC: Filter for last 100 "Realities" ---
     # Filter for rows where a signal is present
     active_signals = df[df['signal'] != 0].copy()
     
@@ -67,12 +67,14 @@ def get_focused_data():
     active_signals['regime_change'] = active_signals['signal'] != active_signals['signal'].shift(1)
     change_indices = active_signals.index[active_signals['regime_change']].tolist()
     
+    # Updated target count to 100
     target_count = 100
+    
     if len(change_indices) < target_count:
         log(f"Warning: Only {len(change_indices)} realities found. Using all available.")
         start_idx = change_indices[0]
     else:
-        # Take the start index of the 30th-to-last reality
+        # Take the start index of the 100th-to-last reality
         start_idx = change_indices[-target_count]
         log(f"Focusing on the last {target_count} realities starting at index {start_idx}")
 
@@ -85,7 +87,6 @@ def get_focused_data():
     # 2. Month Z-Score Normalization
     if 'month' not in df.columns:
         log("Error: 'month' column not found in CSV.")
-        # Fallback to datetime just in case, but prioritize explicit column
         if 'datetime' in df.columns:
             log("Attempting to extract month from 'datetime' column...")
             df['month'] = pd.to_datetime(df['datetime']).dt.month
@@ -95,7 +96,6 @@ def get_focused_data():
     month_mean = df['month'].mean()
     month_std = df['month'].std()
     
-    # Avoid division by zero
     if month_std == 0: 
         month_std = 1.0
         
@@ -111,19 +111,14 @@ def get_focused_data():
     df = df[~df.isin([np.nan, np.inf, -np.inf]).any(axis=1)]
     
     # --- Feature Assembly ---
-    # 1. Scale Log Returns (RobustScaler handles outliers well)
     log_ret_vals = df['log_ret'].values.reshape(-1, 1)
     scaler = RobustScaler()
     log_ret_scaled = scaler.fit_transform(log_ret_vals)
     
-    # 2. Get Normalized Month
     month_scaled = df['month_norm'].values.reshape(-1, 1)
     
-    # 3. Stack features: Shape (N, 2)
-    # Feature 0: log_ret (Robust Scaled)
-    # Feature 1: month (Z-Score Scaled)
+    # Stack features: Shape (N, 2)
     data_val = np.hstack([log_ret_scaled, month_scaled])
-    
     labels_val = df['target_class'].values.astype(int)
     
     log(f"Dataset Size after filtering: {len(df)} rows.")
@@ -132,37 +127,29 @@ def get_focused_data():
     log(f"Generating Sequences (Length {SEQ_LENGTH})...")
     from numpy.lib.stride_tricks import sliding_window_view
     
-    # Create windows over the 0th axis (Time)
-    # sliding_window_view on shape (N, 2) with window_shape=SEQ_LENGTH, axis=0 
-    # results in shape (N-SEQ+1, 2, SEQ_LENGTH)
     windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0) 
-    
-    # Transpose to get (Batch, Seq_Len, Features) -> (N, SEQ_LENGTH, 2)
     X = windows.transpose(0, 2, 1)
-    
-    # Align labels (target is the label at the last step of the sequence)
-    # The window ends at index i + SEQ_LENGTH - 1. We want the target at that same end index.
     y = labels_val[SEQ_LENGTH-1:]
     
     min_len = min(len(X), len(y))
     return X[:min_len], y[:min_len]
 
 # ==========================================
-# 3. MODEL
+# 3. MODEL (GRU)
 # ==========================================
-class LSTMClassifier(nn.Module):
+class GRUClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
-                            batch_first=True, dropout=DROPOUT)
+        self.gru = nn.GRU(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
+                          batch_first=True, dropout=DROPOUT)
         self.bn = nn.BatchNorm1d(HIDDEN_DIM)
         self.dropout = nn.Dropout(DROPOUT)
         self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
         
     def forward(self, x):
         # Input shape: (Batch, Seq, Feature)
-        out, _ = self.lstm(x)
-        # Final hidden state for classification
+        out, _ = self.gru(x)
+        # GRU returns (output, hidden), we use last timestep of output
         out = out[:, -1, :] 
         out = self.bn(out)
         out = torch.relu(out)
@@ -175,7 +162,7 @@ class LSTMClassifier(nn.Module):
 # ==========================================
 if __name__ == "__main__":
     log("==========================================")
-    log(f" Starting Targeted 30-Reality Training")
+    log(f" Starting Targeted 100-Reality GRU Training")
     log(f" Features: LogRet + Month(Z-Scored)")
     log("==========================================")
     
@@ -201,7 +188,8 @@ if __name__ == "__main__":
                               num_workers=4, pin_memory=True, persistent_workers=True)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
     
-    model = LSTMClassifier().to(DEVICE)
+    # Instantiate GRU Model
+    model = GRUClassifier().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss(weight=weights_tensor)
 
