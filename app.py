@@ -27,12 +27,12 @@ TRAIN_SPLIT = 0.8     # Standard split for a larger dataset
 INPUT_DIM = 1         
 HIDDEN_DIM = 512
 NUM_LAYERS = 3
-DROPOUT = 0.4     
+DROPOUT = 0.8   
 NUM_CLASSES = 3       
 
 # --- TRAINING PARAMETERS ---
 BATCH_SIZE = 1024      # Increased batch size for the larger "30 realities" dataset
-EPOCHS = 150           # Reduced epochs as we have more data per epoch now
+EPOCHS = 300         # Reduced epochs as we have more data per epoch now
 MAX_LR = 5e-3          # Adjusted LR for OneCycle
 WEIGHT_DECAY = 1e-2
 MODEL_FILENAME = 'lstm_focused_30_realities.pth'
