@@ -21,7 +21,7 @@ torch.set_num_threads(12)
 DEVICE = torch.device('cpu')      
 
 # --- DATASET PARAMETERS ---
-FILE_ID = '1SagUdIPk-9nU1tlNAOqVAyILZV4Mflj0'
+FILE_ID = '12Q2CI1Jbv3Sr-8S0pCnbNQ5EnhxpKFnk'
 DOWNLOAD_OUTPUT = 'market_data.csv'
 MAX_ROWS = None       
 # INCREASED: Give the LSTM enough history to see a pattern
@@ -39,7 +39,7 @@ NUM_CLASSES = 3
 # --- TRAINING PARAMETERS ---
 # INCREASED: Massive batch size to saturate 32 vCPUs
 BATCH_SIZE = 4096      
-EPOCHS = 15            # Reduced epochs, we aim for faster convergence
+EPOCHS = 100            # Reduced epochs, we aim for faster convergence
 MAX_LR = 0.01           # Higher max LR for OneCycle
 WEIGHT_DECAY = 1e-3
 MODEL_FILENAME = 'lstm_optimized.pth'
