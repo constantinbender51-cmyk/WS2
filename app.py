@@ -1,320 +1,260 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import numpy as np
+import tensorflow as tf
+import requests
 import random
 import string
-import requests
-import time
 import os
-import sys
-import base64
-import json
-import multiprocessing
-import math
-from torch.utils.data import Dataset, DataLoader
 
-# ==========================================
-# 1. CONFIGURATION (STABILITY MODE)
-# ==========================================
-torch.set_num_threads(4)
+# Ensure reproducible results
+seed = 42
+np.random.seed(seed)
+tf.random.set_seed(seed)
+random.seed(seed)
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"⚙️ Running on: CUDA ({torch.cuda.get_device_name(0)})")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("⚙️ Running on: MPS (Apple Silicon)")
-else:
-    device = torch.device("cpu")
-    print(f"⚙️ Running on: CPU")
+def download_word_list(url):
+    print(f"Downloading word list from {url}...")
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        text = response.text
+        # Filter for purely alphabetic words to keep vocab simple
+        words = [w.strip().lower() for w in text.splitlines() if w.strip().isalpha()]
+        print(f"Loaded {len(words)} words.")
+        return words
+    except Exception as e:
+        print(f"Error downloading: {e}")
+        # Fallback to a small list if download fails (for safety)
+        return ["hello", "world", "python", "neural", "network", "coding", "intelligence"]
 
-# Hyperparameters
-HIDDEN_SIZE = 256
-EMBEDDING_SIZE = 128
-LEARNING_RATE = 0.001     
-GRADIENT_CLIP = 1.0       # Tighter clip for stability
-MAX_LENGTH = 20
-TARGET_DATASET_SIZE = 300000 
-BATCH_SIZE = 256 
-N_EPOCHS = 5
-
-# Vocabulary
-ALL_CHARS = string.ascii_lowercase
-SOS_token = 0
-EOS_token = 1
-PAD_token = 2
-char_to_index = {"SOS": 0, "EOS": 1, "PAD": 2}
-index_to_char = {0: "SOS", 1: "EOS", 2: "PAD"}
-for c in ALL_CHARS:
-    if c not in char_to_index:
-        idx = len(char_to_index)
-        char_to_index[c] = idx
-        index_to_char[idx] = c
-VOCAB_SIZE = len(char_to_index)
-
-# ==========================================
-# 2. DATASET & GENERATION
-# ==========================================
-def inject_noise(word):
-    if len(word) < 3: return word
+def generate_misspelling(word):
+    """Introduces a single error: insert, delete, or swap."""
     chars = list(word)
-    error_type = random.randint(0, 3)
-    idx = random.randint(0, len(chars) - 1)
+    if not chars: return word
     
-    if error_type == 0: 
-        chars.insert(idx, random.choice(string.ascii_lowercase))
-    elif error_type == 1: 
-        if len(chars) > 2: del chars[idx]
-    elif error_type == 2: 
-        if idx < len(chars) - 1: chars[idx], chars[idx+1] = chars[idx+1], chars[idx]
-    elif error_type == 3: 
-        chars[idx] = random.choice(string.ascii_lowercase)
+    op = random.choice(['insert', 'delete', 'swap'])
+    
+    if op == 'insert':
+        # Insert a random letter at a random position
+        pos = random.randint(0, len(chars))
+        char = random.choice(string.ascii_lowercase)
+        chars.insert(pos, char)
+    
+    elif op == 'delete':
+        # Delete a random character
+        if len(chars) > 1:
+            pos = random.randint(0, len(chars) - 1)
+            del chars[pos]
+            
+    elif op == 'swap':
+        # Swap two adjacent characters
+        if len(chars) > 1:
+            pos = random.randint(0, len(chars) - 2)
+            chars[pos], chars[pos+1] = chars[pos+1], chars[pos]
+            
     return "".join(chars)
 
-def generate_chunk(args):
-    words_chunk, num_typos = args
-    pairs = []
-    for word in words_chunk:
-        pairs.append((word, word)) 
-        for _ in range(num_typos): 
-            pairs.append((inject_noise(word), word))
-    return pairs
-
-class SpellingDataset(Dataset):
-    def __init__(self, raw_data):
-        self.data = raw_data
-    def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        inp_word, target_word = self.data[idx]
-        return (self.word_to_tensor(inp_word), self.word_to_tensor(target_word))
-
-    def word_to_tensor(self, word):
-        indexes = [char_to_index.get(c, PAD_token) for c in word]
-        indexes.append(EOS_token)
-        if len(indexes) < MAX_LENGTH:
-            indexes += [PAD_token] * (MAX_LENGTH - len(indexes))
-        else:
-            indexes = indexes[:MAX_LENGTH]
-        return torch.tensor(indexes, dtype=torch.long)
-
-# ==========================================
-# 3. MODEL ARCHITECTURE (STABLE)
-# ==========================================
-def init_weights(m):
-    """Initialize weights to prevent NaN start"""
-    for name, param in m.named_parameters():
-        if 'weight' in name:
-            nn.init.normal_(param.data, mean=0, std=0.01)
-        else:
-            nn.init.constant_(param.data, 0)
-
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(EncoderRNN, self).__init__()
-        self.embedding = nn.Embedding(input_size, EMBEDDING_SIZE)
-        self.gru = nn.GRU(EMBEDDING_SIZE, hidden_size, batch_first=True)
-        self.apply(init_weights) # Init weights
-
-    def forward(self, input):
-        embedded = self.embedding(input) 
-        output, hidden = self.gru(embedded)
-        return output, hidden
-
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size):
-        super(DecoderRNN, self).__init__()
-        self.embedding = nn.Embedding(output_size, EMBEDDING_SIZE)
-        self.gru = nn.GRU(EMBEDDING_SIZE, hidden_size, batch_first=True)
-        self.out = nn.Linear(hidden_size, output_size)
-        # NOTE: Removed LogSoftmax. We output raw logits for CrossEntropyLoss
-        self.apply(init_weights) # Init weights
-
-    def forward(self, input, hidden):
-        output = self.embedding(input)
-        output = torch.relu(output)
-        output, hidden = self.gru(output, hidden)
-        output = self.out(output[:, 0]) # Raw logits
-        return output, hidden
-
-# ==========================================
-# 4. GITHUB UTILS
-# ==========================================
-def get_pat_from_env():
-    if not os.path.exists(".env"): return None
-    try:
-        with open(".env", "r") as f:
-            for line in f:
-                if "PAT" in line and "=" in line:
-                    return line.split("=", 1)[1].strip().strip('"\'')
-    except: pass
-    return None
-
-def upload_to_github(file_path, token):
-    OWNER = "constantinbender51-cmyk"
-    REPO = "Models"
-    FILE_NAME = os.path.basename(file_path)
-    API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_NAME}"
+def create_dataset(words, num_samples=500000):
+    print(f"Generating {num_samples} misspelled-correct pairs...")
+    inputs = []
+    targets = []
     
-    print(f"\n🚀 Uploading {FILE_NAME} to GitHub...")
-    with open(file_path, "rb") as f: content = base64.b64encode(f.read()).decode("utf-8")
+    # We use a set for target texts to include start/end tokens later
+    # Input: "helo"
+    # Target Input (Decoder): "\t" + "hello"
+    # Target Output (Label): "hello" + "\n"
     
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-    
-    try:
-        r_check = requests.get(API_URL, headers=headers)
-        sha = r_check.json().get("sha") if r_check.status_code == 200 else None
-    except: sha = None
-    
-    data = {"message": f"Update Model: {FILE_NAME}", "content": content}
-    if sha: data["sha"] = sha
+    for _ in range(num_samples):
+        word = random.choice(words)
+        misspelled = generate_misspelling(word)
         
-    r = requests.put(API_URL, headers=headers, data=json.dumps(data))
-    if r.status_code in [200, 201]: print(f"✅ Upload successful: {r.json().get('html_url')}")
-    else: print(f"❌ Upload failed: {r.status_code} {r.text}")
-
-# ==========================================
-# 5. MAIN PIPELINE
-# ==========================================
-def main():
-    # --- STEP 1: DOWNLOAD ---
-    print("\n[1/4] Downloading Vocabulary...")
-    url = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
-    try:
-        r = requests.get(url, timeout=10)
-        clean_words = [w.strip().lower() for w in r.text.splitlines() if w.isalpha() and len(w) >= 3]
-    except:
-        clean_words = []
-    
-    clean_words.extend(["mouse", "lock", "local", "harry", "hurry"])
-    clean_words = list(set(clean_words))
-    vocab_len = len(clean_words)
-    print(f"✅ Vocabulary Base: {vocab_len} words")
-
-    # --- STEP 2: DATA GEN ---
-    num_cores = multiprocessing.cpu_count()
-    gen_cores = min(num_cores, 8) 
-    
-    pairs_per_word = math.ceil(TARGET_DATASET_SIZE / vocab_len)
-    typos_per_word = max(1, pairs_per_word - 1)
-    
-    print(f"\n[2/4] Generating Data ({gen_cores} cores)...")
-    
-    chunk_size = vocab_len // gen_cores
-    chunks = []
-    for i in range(0, vocab_len, chunk_size):
-        chunks.append((clean_words[i:i + chunk_size], typos_per_word))
-    
-    with multiprocessing.Pool(processes=gen_cores) as pool:
-        results = pool.map(generate_chunk, chunks)
-    
-    training_data = [item for sublist in results for item in sublist]
-    random.shuffle(training_data)
-    if len(training_data) > TARGET_DATASET_SIZE:
-        training_data = training_data[:TARGET_DATASET_SIZE]
-    
-    print(f"✅ Generated {len(training_data)} pairs.")
-
-    # --- STEP 3: TRAINING (STABLE LOSS) ---
-    print(f"\n[3/4] Training (Batch Size: {BATCH_SIZE})...")
-    
-    dataset = SpellingDataset(training_data)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-
-    encoder = EncoderRNN(VOCAB_SIZE, HIDDEN_SIZE).to(device)
-    decoder = DecoderRNN(HIDDEN_SIZE, VOCAB_SIZE).to(device)
-    
-    enc_opt = optim.Adam(encoder.parameters(), lr=LEARNING_RATE)
-    dec_opt = optim.Adam(decoder.parameters(), lr=LEARNING_RATE)
-    
-    # FIX: CrossEntropyLoss is numerically stable for Raw Logits
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_token)
-
-    for epoch in range(N_EPOCHS):
-        total_loss = 0
-        batches_count = 0
+        inputs.append(misspelled)
+        targets.append(word)
         
-        for i, (input_tensor, target_tensor) in enumerate(dataloader):
-            input_tensor = input_tensor.to(device)
-            target_tensor = target_tensor.to(device)
-            
-            enc_opt.zero_grad()
-            dec_opt.zero_grad()
-            
-            _, hidden = encoder(input_tensor)
-            
-            dec_input = torch.tensor([[SOS_token]] * input_tensor.size(0), device=device)
-            dec_hidden = hidden
-            
-            loss = 0
-            use_tf = True if random.random() < 0.5 else False
-            
-            for t in range(MAX_LENGTH):
-                dec_out, dec_hidden = decoder(dec_input, dec_hidden)
-                
-                # loss += criterion(logits, target_class_index)
-                if t < target_tensor.size(1):
-                     loss += criterion(dec_out, target_tensor[:, t])
-                
-                if use_tf:
-                    if t < target_tensor.size(1):
-                        dec_input = target_tensor[:, t].unsqueeze(1)
-                else:
-                    _, topi = dec_out.topk(1)
-                    dec_input = topi
-            
-            loss.backward()
-            
-            # Clip Gradients to prevent NaN
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), GRADIENT_CLIP)
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), GRADIENT_CLIP)
-            
-            enc_opt.step()
-            dec_opt.step()
-            
-            total_loss += loss.item()
-            batches_count += 1
-            
-            if i % 100 == 0:
-                avg_loss = total_loss / (batches_count if batches_count > 0 else 1)
-                print(f"Epoch {epoch+1} | Batch {i}/{len(dataloader)} | Avg Loss: {avg_loss/MAX_LENGTH:.4f}")
+    return inputs, targets
 
-    # --- STEP 4: SAVE & UPLOAD ---
-    save_path = "spelling_model.pth"
-    torch.save({'encoder': encoder.state_dict(), 'decoder': decoder.state_dict()}, save_path)
-    print(f"\n[4/4] Model saved locally to {save_path}")
+# --- Main Execution ---
 
-    pat = get_pat_from_env()
-    if pat: 
-        upload_to_github(save_path, pat)
-    else:
-        print("⚠️  Skipping Upload: .env file missing or PAT not found.")
+# 1. Load Data
+url = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
+clean_words = download_word_list(url)
 
-    # --- TEST ---
-    def predict(word):
-        encoder.eval()
-        decoder.eval()
-        with torch.no_grad():
-            inp = dataset.word_to_tensor(word.lower()).unsqueeze(0).to(device)
-            _, hidden = encoder(inp)
-            dec_input = torch.tensor([[SOS_token]], device=device)
-            res = []
-            for _ in range(MAX_LENGTH):
-                out, hidden = decoder(dec_input, hidden)
-                
-                # Since we use CrossEntropyLoss now, output is raw logits.
-                # Use Softmax to get probabilities, or just topk on logits (same result)
-                _, topi = out.topk(1)
-                
-                if topi.item() == EOS_token: break
-                res.append(index_to_char[topi.item()])
-                dec_input = topi
-            return "".join(res)
+# 2. Create 500k pairs
+input_texts, target_texts = create_dataset(clean_words, num_samples=500000)
 
-    print("\n--- TEST RESULTS ---")
-    for w in ["Mouses", "Loc", "Harry", "intelgnec"]:
-        print(f"Input: {w:<10} -> Correction: {predict(w).title()}")
+# 3. Vectorization logic
+# Define valid characters
+characters = sorted(list(string.ascii_lowercase))
+num_encoder_tokens = len(characters) + 1 # +1 for padding/unknown if needed, though we restrict to ascii
+num_decoder_tokens = len(characters) + 3 # +1 pad, +1 start '\t', +1 end '\n'
 
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    main()
+# Add start and end tokens to targets for the decoder
+target_texts_input = ['\t' + text for text in target_texts]
+target_texts_output = [text + '\n' for text in target_texts]
+
+# Determine max lengths
+max_encoder_seq_length = max([len(txt) for txt in input_texts])
+max_decoder_seq_length = max([len(txt) for txt in target_texts_output])
+
+print(f"Max Encoder Length: {max_encoder_seq_length}")
+print(f"Max Decoder Length: {max_decoder_seq_length}")
+
+# Token dictionaries
+input_token_index = {char: i+1 for i, char in enumerate(characters)} # 0 reserved for padding
+target_token_index = {char: i+2 for i, char in enumerate(characters)}
+target_token_index['\t'] = 1 # Start token
+target_token_index['\n'] = 0 # End token (and padding logic usually uses 0, but we will mask)
+# Actually, standard keras padding uses 0. Let's adjust.
+# Encoder: 0=pad, 1..26=a-z
+# Decoder: 0=pad, 1=start, 2=end, 3..28=a-z
+
+input_token_index = {char: i+1 for i, char in enumerate(characters)}
+reverse_input_char_index = {i: char for char, i in input_token_index.items()}
+
+target_token_index = {'\t': 1, '\n': 2}
+for i, char in enumerate(characters):
+    target_token_index[char] = i + 3
+reverse_target_char_index = {i: char for char, i in target_token_index.items()}
+
+num_encoder_tokens = len(input_token_index) + 1
+num_decoder_tokens = len(target_token_index) + 1
+
+print("Vectorizing data...")
+encoder_input_data = np.zeros((len(input_texts), max_encoder_seq_length), dtype="float32")
+decoder_input_data = np.zeros((len(input_texts), max_decoder_seq_length), dtype="float32")
+decoder_target_data = np.zeros((len(input_texts), max_decoder_seq_length, num_decoder_tokens), dtype="float32")
+
+for i, (input_text, target_text, target_out) in enumerate(zip(input_texts, target_texts, target_texts_output)):
+    # Encoder Input
+    for t, char in enumerate(input_text):
+        if char in input_token_index:
+            encoder_input_data[i, t] = input_token_index[char]
+    
+    # Decoder Input (Teacher Forcing: input is previous correct char)
+    decoder_input_text = '\t' + target_text
+    for t, char in enumerate(decoder_input_text):
+        if t < max_decoder_seq_length:
+            if char in target_token_index:
+                decoder_input_data[i, t] = target_token_index[char]
+    
+    # Decoder Target (One-hot encoded for softmax)
+    # Offset by 1 from input (predict next char)
+    for t, char in enumerate(target_out):
+        if t < max_decoder_seq_length:
+            if char in target_token_index:
+                decoder_target_data[i, t, target_token_index[char]] = 1.0
+
+# 3. Train GRU Encoder-Decoder
+latent_dim = 128 # Hidden layer size
+
+# Encoder
+encoder_inputs = tf.keras.Input(shape=(None,))
+encoder_embedding = tf.keras.layers.Embedding(num_encoder_tokens, latent_dim, mask_zero=True)(encoder_inputs)
+encoder_gru = tf.keras.layers.GRU(latent_dim, return_state=True)
+encoder_outputs, state_h = encoder_gru(encoder_embedding)
+
+# Decoder
+decoder_inputs = tf.keras.Input(shape=(None,))
+decoder_embedding = tf.keras.layers.Embedding(num_decoder_tokens, latent_dim, mask_zero=True)(decoder_inputs)
+decoder_gru = tf.keras.layers.GRU(latent_dim, return_sequences=True, return_state=True)
+decoder_outputs, _ = decoder_gru(decoder_embedding, initial_state=state_h)
+decoder_dense = tf.keras.layers.Dense(num_decoder_tokens, activation="softmax")
+decoder_outputs = decoder_dense(decoder_outputs)
+
+model = tf.keras.Model([encoder_inputs, decoder_inputs], decoder_outputs)
+
+model.compile(
+    optimizer="adam",
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+print("Training model (this may take a moment)...")
+# Using a small batch size and 1 epoch for demonstration speed on CPU
+# Increase epochs for better accuracy
+batch_size = 128
+epochs = 5 
+
+# Train on a subset if needed, but request asked for 500k pairs. 
+# We will train on all, but keep epochs low.
+model.fit(
+    [encoder_input_data, decoder_input_data],
+    decoder_target_data,
+    batch_size=batch_size,
+    epochs=epochs,
+    validation_split=0.2,
+    verbose=1
+)
+
+# 4. Inference Setup
+# To decode, we need separate models to step through the sequence manually
+
+# Encoder Model
+encoder_model = tf.keras.Model(encoder_inputs, state_h)
+
+# Decoder Model
+decoder_state_input_h = tf.keras.Input(shape=(latent_dim,))
+decoder_inputs_single = tf.keras.Input(shape=(None,)) # One char at a time
+decoder_emb_single = decoder_embedding(decoder_inputs_single)
+decoder_outputs_single, state_h_single = decoder_gru(decoder_emb_single, initial_state=decoder_state_input_h)
+decoder_outputs_single = decoder_dense(decoder_outputs_single)
+decoder_model = tf.keras.Model(
+    [decoder_inputs_single, decoder_state_input_h],
+    [decoder_outputs_single, state_h_single]
+)
+
+def decode_sequence(input_seq):
+    # Encode the input as state vectors.
+    states_value = encoder_model.predict(input_seq, verbose=0)
+
+    # Generate empty target sequence of length 1.
+    target_seq = np.zeros((1, 1))
+    # Populate the first character of target sequence with the start character.
+    target_seq[0, 0] = target_token_index['\t']
+
+    # Sampling loop
+    stop_condition = False
+    decoded_sentence = ""
+    
+    while not stop_condition:
+        output_tokens, h = decoder_model.predict([target_seq, states_value], verbose=0)
+
+        # Sample a token
+        sampled_token_index = np.argmax(output_tokens[0, -1, :])
+        
+        # Handle unknown token case
+        if sampled_token_index in reverse_target_char_index:
+            sampled_char = reverse_target_char_index[sampled_token_index]
+        else:
+            sampled_char = ''
+            
+        if sampled_char == '\n' or len(decoded_sentence) > max_decoder_seq_length:
+            stop_condition = True
+        else:
+            decoded_sentence += sampled_char
+
+        # Update the target sequence (of length 1).
+        target_seq = np.zeros((1, 1))
+        target_seq[0, 0] = sampled_token_index
+
+        # Update states
+        states_value = h
+
+    return decoded_sentence
+
+# 5. Prompt 5 Misspelled Words
+test_words = ["compputer", "scienc", "intellgence", "mashine", "languag"]
+print("\n--- Testing Model ---")
+
+for word in test_words:
+    # Vectorize input
+    input_seq = np.zeros((1, max_encoder_seq_length), dtype="float32")
+    for t, char in enumerate(word):
+        if char in input_token_index:
+            input_seq[0, t] = input_token_index[char]
+            
+    corrected = decode_sequence(input_seq)
+    print(f"Input: {word:15} -> Predicted: {corrected}")
+
+print("\nDone.")
