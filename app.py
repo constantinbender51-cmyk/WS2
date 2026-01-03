@@ -12,7 +12,7 @@ DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/
 NUM_WORDS_TO_LOAD = 100       # How many words from the top of the list to train on
 AUGMENTATIONS_PER_WORD = 50   # How many misspelled versions to generate per word
 VALIDATION_SPLIT = 0.1        # Portion of data to use for validation
-BATCH_SIZE = 64
+BATCH_SIZE = 512
 EPOCHS = 30
 EMBEDDING_DIM = 64
 GRU_UNITS = 128
@@ -20,9 +20,9 @@ PADDING_BUFFER = 2            # Extra space in sequence length for insertions
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
-DROPOUT_RATE = 0.3            # Probability of dropping a unit
-L1_REG = 1e-5                 # L1 regularization factor
-L2_REG = 1e-4                 # L2 regularization factor
+DROPOUT_RATE = 0.4            # Probability of dropping a unit
+L1_REG = 1e-4                 # L1 regularization factor
+L2_REG = 1e-3                 # L2 regularization factor
 
 # Set seeds for reproducibility
 np.random.seed(RANDOM_SEED)
