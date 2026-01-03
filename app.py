@@ -6,63 +6,76 @@ from tensorflow.keras.layers import Dense, GRU, TimeDistributed, Bidirectional, 
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import random
 
-# 1. Download and Prepare Data
-url = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
-print(f"Downloading data from {url}...")
+# --- CONFIGURATION & PARAMETERS ---
+DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
+NUM_WORDS_TO_LOAD = 100       # How many words from the top of the list to train on
+AUGMENTATIONS_PER_WORD = 50   # How many misspelled versions to generate per word
+VALIDATION_SPLIT = 0.1        # Portion of data to use for validation
+BATCH_SIZE = 64
+EPOCHS = 30
+EMBEDDING_DIM = 64
+GRU_UNITS = 128
+PADDING_BUFFER = 2            # Extra space in sequence length for insertions
+RANDOM_SEED = 42
+
+# Set seeds for reproducibility
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+# --- 1. DATA LOADING ---
+print(f"Downloading data from {DATA_URL}...")
 try:
-    response = requests.get(url)
+    response = requests.get(DATA_URL)
     response.raise_for_status()
     all_words = response.text.splitlines()
 except Exception as e:
     print(f"Error downloading data: {e}")
-    # Fallback for demonstration if download fails
-    all_words = ["the", "of", "and", "to", "in", "a", "is", "that", "for", "it"] * 10 
+    # Fallback dataset
+    all_words = ["the", "of", "and", "to", "in", "a", "is", "that", "for", "it"] * 10
 
-# Take the first 100 words
-words = [w.strip().lower() for w in all_words[:100] if w.strip()]
+# Filter and select top words
+words = [w.strip().lower() for w in all_words[:NUM_WORDS_TO_LOAD] if w.strip()]
 print(f"Training on first {len(words)} words.")
 
-# 2. Data Preprocessing & Noise Injection
-# Create a character set including a padding token
+# --- 2. PREPROCESSING & NOISE INJECTION ---
+# Create character mappings
 chars = sorted(list(set("".join(words) + "abcdefghijklmnopqrstuvwxyz")))
 char_to_int = {c: i + 1 for i, c in enumerate(chars)} # +1 for padding (0)
 int_to_char = {i + 1: c for i, c in enumerate(chars)}
 vocab_size = len(chars) + 1
 
-# Determine max length for padding
-max_len = max([len(w) for w in words]) + 2 # +2 buffer for insertions
+# Determine max sequence length
+max_len = max([len(w) for w in words]) + PADDING_BUFFER
 
 def add_noise(word):
     """Introduces random spelling errors (substitution, deletion, insertion)."""
     if len(word) < 2: return word
-    word = list(word)
+    word_list = list(word)
     mutation = random.choice(['sub', 'del', 'ins', 'swap'])
-    
-    idx = random.randint(0, len(word) - 1)
+    idx = random.randint(0, len(word_list) - 1)
     
     if mutation == 'sub':
-        word[idx] = random.choice(chars)
+        word_list[idx] = random.choice(chars)
     elif mutation == 'del':
-        del word[idx]
-    elif mutation == 'ins' and len(word) < max_len:
-        word.insert(idx, random.choice(chars))
-    elif mutation == 'swap' and idx < len(word) - 1:
-        word[idx], word[idx+1] = word[idx+1], word[idx]
+        del word_list[idx]
+    elif mutation == 'ins' and len(word_list) < max_len:
+        word_list.insert(idx, random.choice(chars))
+    elif mutation == 'swap' and idx < len(word_list) - 1:
+        word_list[idx], word_list[idx+1] = word_list[idx+1], word_list[idx]
         
-    return "".join(word)
+    return "".join(word_list)
 
 # Generate synthetic training data
-# We expand the dataset by creating multiple noisy versions of the 100 words
-num_augmentations = 50
 X_raw = []
 y_raw = []
 
 for word in words:
-    # Add the word itself (identity mapping)
+    # Add the clean word (identity mapping)
     X_raw.append(word)
     y_raw.append(word)
     # Add noisy versions
-    for _ in range(num_augmentations):
+    for _ in range(AUGMENTATIONS_PER_WORD):
         X_raw.append(add_noise(word))
         y_raw.append(word)
 
@@ -72,42 +85,43 @@ def encode_sequence(seq_list, max_len):
     return pad_sequences(encoded, maxlen=max_len, padding='post')
 
 X_train = encode_sequence(X_raw, max_len)
-y_train = encode_sequence(y_raw, max_len)
+y_train_seq = encode_sequence(y_raw, max_len)
 
-# One-hot encode targets for the Dense layer (sparse_categorical_crossentropy is also an option)
-# but explicitly expanding dims is clearer for shape understanding here.
-y_train = tf.keras.utils.to_categorical(y_train, num_classes=vocab_size)
+# One-hot encode targets
+y_train = tf.keras.utils.to_categorical(y_train_seq, num_classes=vocab_size)
 
 print(f"Dataset shape: X={X_train.shape}, y={y_train.shape}")
 
-# 3. Build the GRU Model
-# Simple Sequence-to-Sequence approach using TimeDistributed Dense layer
-# Note: A real production system would use an Encoder-Decoder with Attention.
-# This architecture assumes input and output length are aligned (handled by padding).
+# --- 3. MODEL ARCHITECTURE ---
 model = Sequential([
-    Embedding(input_dim=vocab_size, output_dim=64, input_length=max_len, mask_zero=True),
-    Bidirectional(GRU(128, return_sequences=True)),
-    GRU(128, return_sequences=True),
+    Embedding(input_dim=vocab_size, output_dim=EMBEDDING_DIM, input_length=max_len, mask_zero=True),
+    Bidirectional(GRU(GRU_UNITS, return_sequences=True)),
+    GRU(GRU_UNITS, return_sequences=True),
     TimeDistributed(Dense(vocab_size, activation='softmax'))
 ])
 
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 model.summary()
 
-# Train
-print("Training model (this may take a moment)...")
-model.fit(X_train, y_train, epochs=30, batch_size=64, verbose=1, validation_split=0.1)
+# --- 4. TRAINING ---
+print("Starting training...")
+model.fit(
+    X_train, 
+    y_train, 
+    epochs=EPOCHS, 
+    batch_size=BATCH_SIZE, 
+    verbose=1, 
+    validation_split=VALIDATION_SPLIT
+)
 
-# 4. Inference Function
+# --- 5. INFERENCE & TESTING ---
 def correct_spelling(word_list):
     encoded = encode_sequence(word_list, max_len)
     predictions = model.predict(encoded, verbose=0)
     
     corrected_words = []
     for i, pred in enumerate(predictions):
-        # Argmax to get the most likely character index
         predicted_indices = np.argmax(pred, axis=-1)
-        # Convert back to characters
         result = ""
         for idx in predicted_indices:
             if idx != 0: # Skip padding
@@ -115,18 +129,15 @@ def correct_spelling(word_list):
         corrected_words.append(result)
     return corrected_words
 
-# 5. Test Prompt
-# Generate 5 misspelled words from the top 100 list manually or randomly
-# For clarity, let's pick 5 known words from the list and mess them up
-test_targets = [words[0], words[10], words[20], words[30], words[50]] 
+print("\n--- Testing Model with 5 Generated Misspelled Words ---")
+
+# Pick 5 random words from our training vocabulary to distort
+test_targets = random.sample(words, 5)
 misspelled_inputs = [add_noise(w) for w in test_targets]
 
-# Or hardcode specific test cases if they match the vocabulary
-# Note: The model only knows the first 100 words.
-hardcoded_tests = ["thier", "abut", "wich", "peopel", "firt"] # Examples that might resemble top 100 words
-
-print("\n--- Testing Model ---")
 corrections = correct_spelling(misspelled_inputs)
 
+print(f"{'Input (Misspelled)':<20} | {'Prediction':<20} | {'Target':<20}")
+print("-" * 66)
 for wrong, correct_pred, target in zip(misspelled_inputs, corrections, test_targets):
-    print(f"Input: {wrong:<15} -> Pred: {correct_pred:<15} (Target: {target})")
+    print(f"{wrong:<20} | {correct_pred:<20} | {target:<20}")
