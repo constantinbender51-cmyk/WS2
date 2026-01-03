@@ -28,7 +28,7 @@ EMBEDDING_DIM = 256
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
-L1_REG = 1e-1
+L1_REG = 1e-2
 L2_REG = 1e-4
 
 # Special Tokens
