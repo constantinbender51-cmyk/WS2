@@ -17,11 +17,11 @@ load_dotenv()
 
 # --- CONFIGURATION & PARAMETERS ---
 DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
-NUM_WORDS_TO_LOAD = 100       # How many words from the top of the list to train on
+NUM_WORDS_TO_LOAD = 50       # How many words from the top of the list to train on
 AUGMENTATIONS_PER_WORD = 400   # How many misspelled versions to generate per word
 VALIDATION_SPLIT = 0.1        # Portion of data to use for validation
 BATCH_SIZE = 4096
-EPOCHS = 45
+EPOCHS = 20
 EMBEDDING_DIM = 64
 GRU_UNITS = 128
 PADDING_BUFFER = 2            # Extra space in sequence length for insertions
