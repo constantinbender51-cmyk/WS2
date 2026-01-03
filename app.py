@@ -111,7 +111,7 @@ print(f"Dataset shape: X={X_train.shape}, y={y_train.shape}")
 reg = l1_l2(l1=L1_REG, l2=L2_REG)
 
 model = Sequential([
-    Embedding(input_dim=vocab_size, output_dim=EMBEDDING_DIM, input_length=max_len, mask_zero=True),
+    Embedding(input_dim=vocab_size, output_dim=EMBEDDING_DIM, input_length=max_len),
     Dropout(DROPOUT_RATE),
     
     Bidirectional(GRU(GRU_UNITS, return_sequences=True, kernel_regularizer=reg)),
