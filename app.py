@@ -36,7 +36,7 @@ SOS_TOKEN = '\t' # Start of Sequence
 EOS_TOKEN = '\n' # End of Sequence
 
 # Regularization
-DROPOUT_RATE = 0.2
+DROPOUT_RATE = 0.3
 
 # Set seeds
 np.random.seed(RANDOM_SEED)
