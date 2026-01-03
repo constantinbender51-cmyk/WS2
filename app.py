@@ -19,11 +19,11 @@ load_dotenv()
 # --- CONFIGURATION & PARAMETERS ---
 DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
 NUM_WORDS_TO_LOAD = 100       # Reverted to 100
-AUGMENTATIONS_PER_WORD = 100   
+AUGMENTATIONS_PER_WORD = 200   
 VALIDATION_SPLIT = 0.2
 BATCH_SIZE = 512              # Changed to 512
 EPOCHS = 20                   # Increased epochs for autoregressive convergence
-LATENT_DIM = 256              # Internal state size
+LATENT_DIM = 512              # Internal state size
 EMBEDDING_DIM = 128
 RANDOM_SEED = 42
 
