@@ -20,9 +20,9 @@ PADDING_BUFFER = 2            # Extra space in sequence length for insertions
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
-DROPOUT_RATE = 0.4            # Probability of dropping a unit
-L1_REG = 1e-4                 # L1 regularization factor
-L2_REG = 1e-3                 # L2 regularization factor
+DROPOUT_RATE = 0.5         # Probability of dropping a unit
+L1_REG = 1e-3          # L1 regularization factor
+L2_REG = 1e-2                 # L2 regularization factor
 
 # Set seeds for reproducibility
 np.random.seed(RANDOM_SEED)
