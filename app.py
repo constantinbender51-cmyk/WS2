@@ -15,9 +15,12 @@ from torch.utils.data import Dataset, DataLoader
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-# Set CPU threads to utilize all vCPUs effectively for tensor operations
+# FIX: Prevent thread explosion. 
+# When using multiprocessing, we must keep internal OMP threads low.
+torch.set_num_threads(1) 
+
+# Get core count
 num_cores = multiprocessing.cpu_count()
-torch.set_num_threads(num_cores)
 
 # Hardware Acceleration
 if torch.cuda.is_available():
@@ -28,16 +31,16 @@ elif torch.backends.mps.is_available():
     print("⚙️ Running on: MPS (Apple Silicon)")
 else:
     device = torch.device("cpu")
-    print(f"⚙️ Running on: CPU ({num_cores} threads)")
+    print(f"⚙️ Running on: CPU ({num_cores} cores)")
 
 # Hyperparameters
 HIDDEN_SIZE = 256
 EMBEDDING_SIZE = 128
 LEARNING_RATE = 0.005
-MAX_LENGTH = 20 # Pad all words to this length
-TARGET_DATASET_SIZE = 500000 # Increased size since we have compute power
-BATCH_SIZE = 512 # Process 512 words in parallel
-N_EPOCHS = 3 # Train more since it's faster
+MAX_LENGTH = 20
+TARGET_DATASET_SIZE = 500000 
+BATCH_SIZE = 512
+N_EPOCHS = 3 
 
 # Vocabulary
 ALL_CHARS = string.ascii_lowercase
@@ -121,11 +124,7 @@ class EncoderRNN(nn.Module):
         self.gru = nn.GRU(EMBEDDING_SIZE, hidden_size, batch_first=True)
 
     def forward(self, input):
-        # input shape: (batch_size, max_length)
         embedded = self.embedding(input) 
-        # embedded shape: (batch_size, max_length, embedding_size)
-        
-        # We pass the entire sequence to GRU at once (Vectorized)
         output, hidden = self.gru(embedded)
         return output, hidden
 
@@ -138,11 +137,10 @@ class DecoderRNN(nn.Module):
         self.softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, input, hidden):
-        # input shape: (batch_size, 1) -> Single character step
         output = self.embedding(input)
         output = torch.relu(output)
         output, hidden = self.gru(output, hidden)
-        output = self.softmax(self.out(output[:, 0])) # Squeeze time dim
+        output = self.softmax(self.out(output[:, 0])) 
         return output, hidden
 
 # ==========================================
@@ -194,17 +192,19 @@ def main():
     print(f"✅ Vocabulary: {len(clean_words)} words")
 
     # --- STEP 2: PARALLEL DATA GEN ---
-    print(f"\n[2/4] Generating Data using {num_cores} cores...")
+    # Use max 8 processes for data gen to stay well within limits
+    # even on 32 core machines, 8-16 is often the sweet spot for IO bound tasks
+    gen_cores = min(num_cores, 16) 
+    print(f"\n[2/4] Generating Data using {gen_cores} processes...")
     start_gen = time.time()
     
-    # Split words into chunks for each core
-    chunk_size = len(clean_words) // num_cores
+    chunk_size = len(clean_words) // gen_cores
     chunks = [clean_words[i:i + chunk_size] for i in range(0, len(clean_words), chunk_size)]
     
-    with multiprocessing.Pool(processes=num_cores) as pool:
+    # Use 'spawn' if needed, but default pool is usually fast enough if threads are controlled
+    with multiprocessing.Pool(processes=gen_cores) as pool:
         results = pool.map(generate_chunk, chunks)
     
-    # Flatten list
     training_data = [item for sublist in results for item in sublist]
     random.shuffle(training_data)
     training_data = training_data[:TARGET_DATASET_SIZE]
@@ -215,12 +215,17 @@ def main():
     print(f"\n[3/4] Training (Batch Size: {BATCH_SIZE})...")
     
     dataset = SpellingDataset(training_data)
+    
+    # Safe worker count: usually 4-8 is plenty for feeding GPU/CPU
+    safe_workers = min(num_cores, 4) 
+    
     dataloader = DataLoader(
         dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=min(num_cores, 8), # Avoid overhead of too many workers
-        pin_memory=True if device.type == 'cuda' else False
+        num_workers=safe_workers,
+        pin_memory=True if device.type == 'cuda' else False,
+        persistent_workers=True if safe_workers > 0 else False
     )
 
     encoder = EncoderRNN(VOCAB_SIZE, HIDDEN_SIZE).to(device)
@@ -228,12 +233,11 @@ def main():
     
     enc_opt = optim.Adam(encoder.parameters(), lr=LEARNING_RATE)
     dec_opt = optim.Adam(decoder.parameters(), lr=LEARNING_RATE)
-    criterion = nn.NLLLoss(ignore_index=PAD_token) # Ignore padding in loss
+    criterion = nn.NLLLoss(ignore_index=PAD_token)
 
     start_train = time.time()
     
     for epoch in range(N_EPOCHS):
-        total_loss = 0
         for i, (input_tensor, target_tensor) in enumerate(dataloader):
             input_tensor = input_tensor.to(device)
             target_tensor = target_tensor.to(device)
@@ -241,10 +245,8 @@ def main():
             enc_opt.zero_grad()
             dec_opt.zero_grad()
             
-            # Encoder (Vectorized full sequence)
             _, hidden = encoder(input_tensor)
             
-            # Decoder (Step by step with batching)
             dec_input = torch.tensor([[SOS_token]] * input_tensor.size(0), device=device)
             dec_hidden = hidden
             
@@ -254,8 +256,6 @@ def main():
             for t in range(MAX_LENGTH):
                 dec_out, dec_hidden = decoder(dec_input, dec_hidden)
                 
-                # Get target for this time step across batch
-                # Check if we passed the length of targets (simple safe guard)
                 if t < target_tensor.size(1):
                     loss += criterion(dec_out, target_tensor[:, t])
                 
@@ -270,8 +270,6 @@ def main():
             enc_opt.step()
             dec_opt.step()
             
-            total_loss += loss.item()
-            
             if i % 100 == 0:
                 print(f"Epoch {epoch+1} | Batch {i}/{len(dataloader)} | Loss: {loss.item()/MAX_LENGTH:.4f}")
 
@@ -282,11 +280,9 @@ def main():
     torch.save({'encoder': encoder.state_dict(), 'decoder': decoder.state_dict()}, save_path)
     print(f"\n[4/4] Model saved to {save_path}")
 
-    # GitHub Upload
     pat = get_pat_from_env()
     if pat: upload_to_github(save_path, pat)
 
-    # Test
     def predict(word):
         encoder.eval()
         decoder.eval()
@@ -308,5 +304,5 @@ def main():
         print(f"{w} -> {predict(w).title()}")
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support() # Windows support
+    multiprocessing.freeze_support()
     main()
