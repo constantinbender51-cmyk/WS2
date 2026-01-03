@@ -21,10 +21,10 @@ DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/
 NUM_WORDS_TO_LOAD = 100       # Reverted to 100
 AUGMENTATIONS_PER_WORD = 200   
 VALIDATION_SPLIT = 0.2
-BATCH_SIZE = 512              # Changed to 512
-EPOCHS = 20                   # Increased epochs for autoregressive convergence
+BATCH_SIZE = 1024              # Changed to 512
+EPOCHS = 10                 # Increased epochs for autoregressive convergence
 LATENT_DIM = 512              # Internal state size
-EMBEDDING_DIM = 128
+EMBEDDING_DIM = 256
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
