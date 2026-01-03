@@ -18,14 +18,18 @@ load_dotenv()
 
 # --- CONFIGURATION & PARAMETERS ---
 DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
-NUM_WORDS_TO_LOAD = 100       # Increased slightly for better context
+NUM_WORDS_TO_LOAD = 100       # Reverted to 100
 AUGMENTATIONS_PER_WORD = 100   
 VALIDATION_SPLIT = 0.2
-BATCH_SIZE = 512             # Adjusted for dual-input complexity
+BATCH_SIZE = 512              # Changed to 512
 EPOCHS = 20                   # Increased epochs for autoregressive convergence
 LATENT_DIM = 256              # Internal state size
 EMBEDDING_DIM = 128
 RANDOM_SEED = 42
+
+# Regularization Hyperparameters
+L1_REG = 1e-5
+L2_REG = 1e-4
 
 # Special Tokens
 SOS_TOKEN = '\t' # Start of Sequence
@@ -116,12 +120,15 @@ print(f"Decoder Target Shape: {decoder_target_one_hot.shape}")
 
 # --- 3. MODEL ARCHITECTURE (Seq2Seq) ---
 
+# Define Regularizer
+reg = l1_l2(l1=L1_REG, l2=L2_REG)
+
 # --- Encoder ---
 encoder_inputs = Input(shape=(None,), name="Encoder_Input")
 encoder_embedding = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Encoder_Embedding")(encoder_inputs)
 encoder_dropout = Dropout(DROPOUT_RATE)(encoder_embedding)
 # return_state=True to get the internal state vectors (h, c)
-encoder_lstm = LSTM(LATENT_DIM, return_state=True, dropout=DROPOUT_RATE, name="Encoder_LSTM")
+encoder_lstm = LSTM(LATENT_DIM, return_state=True, dropout=DROPOUT_RATE, kernel_regularizer=reg, name="Encoder_LSTM")
 encoder_outputs, state_h, state_c = encoder_lstm(encoder_dropout)
 # We discard `encoder_outputs` and only keep the states.
 encoder_states = [state_h, state_c]
@@ -132,9 +139,9 @@ decoder_embedding = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="D
 decoder_dropout = Dropout(DROPOUT_RATE)(decoder_embedding)
 # return_sequences=True to output the whole sequence
 # return_state=True is needed for inference later, though ignored during training
-decoder_lstm = LSTM(LATENT_DIM, return_sequences=True, return_state=True, dropout=DROPOUT_RATE, name="Decoder_LSTM")
+decoder_lstm = LSTM(LATENT_DIM, return_sequences=True, return_state=True, dropout=DROPOUT_RATE, kernel_regularizer=reg, name="Decoder_LSTM")
 decoder_outputs, _, _ = decoder_lstm(decoder_dropout, initial_state=encoder_states)
-decoder_dense = Dense(vocab_size, activation='softmax', name="Decoder_Output")
+decoder_dense = Dense(vocab_size, activation='softmax', kernel_regularizer=reg, name="Decoder_Output")
 decoder_outputs = decoder_dense(decoder_outputs)
 
 # --- Define Training Model ---
