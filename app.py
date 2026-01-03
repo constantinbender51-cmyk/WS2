@@ -6,6 +6,14 @@ from tensorflow.keras.layers import Dense, GRU, TimeDistributed, Bidirectional, 
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.regularizers import l1_l2
 import random
+import matplotlib.pyplot as plt
+import os
+import base64
+from dotenv import load_dotenv
+from datetime import datetime
+
+# Load environment variables (specifically PAT)
+load_dotenv()
 
 # --- CONFIGURATION & PARAMETERS ---
 DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
@@ -15,14 +23,14 @@ VALIDATION_SPLIT = 0.1        # Portion of data to use for validation
 BATCH_SIZE = 512
 EPOCHS = 300
 EMBEDDING_DIM = 64
-GRU_UNITS = 128
+GRU_UNITS = 1024
 PADDING_BUFFER = 2            # Extra space in sequence length for insertions
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
-DROPOUT_RATE = 0.5       # Probability of dropping a unite
-L1_REG = 1e-3          # L1 regularization factor
-L2_REG = 1e-2                 # L2 regularization factor
+DROPOUT_RATE = 0.3            # Probability of dropping a unit
+L1_REG = 1e-5                 # L1 regularization factor
+L2_REG = 1e-4                 # L2 regularization factor
 
 # Set seeds for reproducibility
 np.random.seed(RANDOM_SEED)
@@ -120,7 +128,7 @@ model.summary()
 
 # --- 4. TRAINING ---
 print("Starting training...")
-model.fit(
+history = model.fit(
     X_train, 
     y_train, 
     epochs=EPOCHS, 
@@ -129,7 +137,66 @@ model.fit(
     validation_split=VALIDATION_SPLIT
 )
 
-# --- 5. INFERENCE & TESTING ---
+# --- 5. PLOTTING & GITHUB UPLOAD ---
+def upload_plot_to_github(history):
+    print("\n--- Generating and Uploading Plot ---")
+    
+    # Generate Plot
+    plt.figure(figsize=(6, 4))
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.title('Model Loss Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Save locally first (Low Resolution as requested)
+    filename = f"val_loss_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    plt.savefig(filename, dpi=50) # Low DPI for low resolution
+    plt.close()
+    print(f"Plot saved locally as {filename}")
+
+    # Prepare for Upload
+    repo_owner = "constantinbender51-cmyk"
+    repo_name = "models"
+    github_token = os.getenv("PAT")
+    
+    if not github_token:
+        print("Error: PAT not found in .env file (key: PAT). Skipping upload.")
+        return
+
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{filename}"
+    
+    # Read file and encode to base64
+    with open(filename, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json"
+    }
+    
+    payload = {
+        "message": f"Upload validation loss plot {filename}",
+        "content": encoded_string
+    }
+
+    # Upload via API
+    print(f"Uploading to {api_url}...")
+    try:
+        response = requests.put(api_url, json=payload, headers=headers)
+        if response.status_code in [200, 201]:
+            print("Upload successful!")
+        else:
+            print(f"Upload failed: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Error uploading to GitHub: {e}")
+
+# Trigger the upload
+upload_plot_to_github(history)
+
+# --- 6. INFERENCE & TESTING ---
 def correct_spelling(word_list):
     encoded = encode_sequence(word_list, max_len)
     predictions = model.predict(encoded, verbose=0)
