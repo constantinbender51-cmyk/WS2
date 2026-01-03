@@ -7,6 +7,8 @@ import requests
 import time
 import os
 import sys
+import base64
+import json
 
 # ==========================================
 # 1. CONFIGURATION
@@ -26,8 +28,8 @@ HIDDEN_SIZE = 256
 EMBEDDING_SIZE = 128
 LEARNING_RATE = 0.005
 MAX_LENGTH = 20
-TARGET_DATASET_SIZE = 200000 # Reduced slightly for speed, still effective
-N_EPOCHS = 1 # We iterate through the dataset once
+TARGET_DATASET_SIZE = 200000 
+N_EPOCHS = 1 
 
 # Vocabulary
 ALL_CHARS = string.ascii_lowercase
@@ -122,7 +124,73 @@ def evaluate(encoder, decoder, word):
         return "".join(decoded_chars)
 
 # ==========================================
-# 4. MAIN PIPELINE
+# 4. GITHUB UPLOAD LOGIC
+# ==========================================
+def get_pat_from_env():
+    """Reads PAT from .env file manually to avoid dependencies"""
+    env_path = ".env"
+    if not os.path.exists(env_path):
+        print("⚠️  .env file not found.")
+        return None
+    
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                # Basic parsing for PAT=...
+                if "PAT" in line and "=" in line:
+                    key, value = line.split("=", 1)
+                    if key.strip() == "PAT":
+                        return value.strip().strip('"').strip("'")
+    except Exception as e:
+        print(f"⚠️  Error reading .env: {e}")
+    return None
+
+def upload_to_github(file_path, token):
+    """Uploads file to GitHub using the contents API"""
+    OWNER = "constantinbender51-cmyk"
+    REPO = "Models"
+    FILE_NAME = os.path.basename(file_path)
+    API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_NAME}"
+    
+    print(f"\n🚀 Uploading {FILE_NAME} to GitHub ({OWNER}/{REPO})...")
+
+    # 1. Read and Encode File
+    with open(file_path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json"
+    }
+
+    # 2. Check if file exists (we need the SHA to update it)
+    sha = None
+    r_check = requests.get(API_URL, headers=headers)
+    if r_check.status_code == 200:
+        sha = r_check.json().get("sha")
+        print("ℹ️  File exists, performing update...")
+    
+    # 3. Upload Payload
+    data = {
+        "message": f"Update AI Model: {FILE_NAME}",
+        "content": content
+    }
+    if sha:
+        data["sha"] = sha
+        
+    # 4. Perform Request
+    r = requests.put(API_URL, headers=headers, data=json.dumps(data))
+    
+    if r.status_code in [200, 201]:
+        print("✅ Upload successful!")
+        print(f"🔗 Link: {r.json().get('html_url')}")
+    else:
+        print(f"❌ Upload failed: {r.status_code}")
+        print(r.text)
+
+# ==========================================
+# 5. MAIN PIPELINE
 # ==========================================
 def main():
     # --- STEP 1: DOWNLOAD DATA ---
@@ -139,7 +207,6 @@ def main():
     # --- STEP 2: PREPARE DATASET ---
     print("\n[2/4] Generating Synthetic Typos...")
     training_data = []
-    # Create target size dataset
     pairs_needed = TARGET_DATASET_SIZE // len(clean_words)
     for word in clean_words:
         training_data.append((word, word)) # Identity
@@ -198,8 +265,8 @@ def main():
 
     print(f"✅ Training Complete ({time.time() - start_time:.0f}s).")
 
-    # --- STEP 4: SAVE & PREDICT ---
-    print("\n[4/4] Saving and Testing...")
+    # --- STEP 4: SAVE, PREDICT & UPLOAD ---
+    print("\n[4/4] Saving, Testing & Uploading...")
     
     # Save Logic
     save_path = "spelling_model.pth"
@@ -207,9 +274,14 @@ def main():
         'encoder': encoder.state_dict(),
         'decoder': decoder.state_dict()
     }, save_path)
-    
     print(f"💾 Model saved locally to: {os.path.abspath(save_path)}")
-    print("ℹ️  To share: Upload this file to Google Drive/S3 to create a public link.")
+
+    # GitHub Upload Logic
+    pat = get_pat_from_env()
+    if pat:
+        upload_to_github(save_path, pat)
+    else:
+        print("⚠️  Skipping GitHub upload: 'PAT' not found in .env file.")
 
     # Inference on specific prompts
     test_words = ["Mouses", "Loc", "Harry"]
