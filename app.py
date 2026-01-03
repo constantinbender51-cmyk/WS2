@@ -13,14 +13,14 @@ NUM_WORDS_TO_LOAD = 100       # How many words from the top of the list to train
 AUGMENTATIONS_PER_WORD = 50   # How many misspelled versions to generate per word
 VALIDATION_SPLIT = 0.1        # Portion of data to use for validation
 BATCH_SIZE = 512
-EPOCHS = 30
+EPOCHS = 300
 EMBEDDING_DIM = 64
 GRU_UNITS = 128
 PADDING_BUFFER = 2            # Extra space in sequence length for insertions
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
-DROPOUT_RATE = 0.4        # Probability of dropping a unite
+DROPOUT_RATE = 0.5       # Probability of dropping a unite
 L1_REG = 1e-3          # L1 regularization factor
 L2_REG = 1e-2                 # L2 regularization factor
 
