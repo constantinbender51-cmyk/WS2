@@ -1,283 +1,293 @@
-import time
-import sys
 import os
-import gdown
-import pandas as pd
-import numpy as np
 import torch
 import torch.nn as nn
-import http.server
-import socketserver
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import RobustScaler
-from sklearn.utils.class_weight import compute_class_weight
+import torch.optim as optim
+import random
+import string
+import requests
+import re
+import time
+from bs4 import BeautifulSoup
+from flask import Flask, request, jsonify, render_template_string
 
 # ==========================================
-# 1. OPTIMIZED CONFIG
+# 1. CONFIGURATION
 # ==========================================
-torch.set_num_threads(12)         
-DEVICE = torch.device('cpu')      
+app = Flask(__name__)
+device = torch.device("cpu") # Use CPU for web deployment reliability
 
-FILE_ID = '1zmPWQo5MAxgyDyvaFTpf_NiqN2o6lswa'
-DOWNLOAD_OUTPUT = 'market_data.csv'
-SEQ_LENGTH = 20
-TRAIN_SPLIT = 0.8     
+# Model Hyperparameters
+HIDDEN_SIZE = 128
+EMBEDDING_SIZE = 64
+LEARNING_RATE = 0.005
+MAX_LENGTH = 20
+# Training for 25,000 iterations ensures it boots in < 60s for Railway
+N_ITERATIONS = 25000 
 
-# --- MODEL PARAMETERS ---
-INPUT_DIM = 2          # Feature 1: Log Returns, Feature 2: Z-Scored Month
-HIDDEN_DIM = 256
-NUM_LAYERS = 3
-DROPOUT = 0.2
-NUM_CLASSES = 3       
+# Character Dictionary
+ALL_CHARS = string.ascii_lowercase
+SOS_token = 0
+EOS_token = 1
+PAD_token = 2
+char_to_index = {"SOS": 0, "EOS": 1, "PAD": 2}
+index_to_char = {0: "SOS", 1: "EOS", 2: "PAD"}
+for c in ALL_CHARS:
+    if c not in char_to_index:
+        idx = len(char_to_index)
+        char_to_index[c] = idx
+        index_to_char[idx] = c
+VOCAB_SIZE = len(char_to_index)
 
-# --- TRAINING PARAMETERS ---
-BATCH_SIZE = 4096      
-EPOCHS = 300         
-MAX_LR = 1e-2          
-WEIGHT_DECAY = 1e-4
-MODEL_FILENAME = 'gru_full_dataset.pth'
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+# Global Model Variables (populated on startup)
+encoder = None
+decoder = None
 
 # ==========================================
-# 2. DATA PIPELINE (Full Dataset)
+# 2. MODEL CLASSES
 # ==========================================
-def get_focused_data():
-    if not os.path.exists(DOWNLOAD_OUTPUT):
-        log(f"Downloading data from ID: {FILE_ID}...")
-        try:
-            url = f'https://drive.google.com/uc?id={FILE_ID}'
-            gdown.download(url, DOWNLOAD_OUTPUT, quiet=False, fuzzy=True)
-        except Exception as e:
-            log(f"Download Error: {e}")
-            sys.exit(1)
+class EncoderRNN(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(EncoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(input_size, EMBEDDING_SIZE)
+        self.gru = nn.GRU(EMBEDDING_SIZE, hidden_size)
 
-    # Read CSV
-    df = pd.read_csv(DOWNLOAD_OUTPUT)
-    
-    # Normalize column names to lowercase to be safe
-    df.columns = df.columns.str.strip().str.lower()
-    log(f"Raw data loaded. Shape: {df.shape}. Columns: {df.columns.tolist()}")
+    def forward(self, input, hidden):
+        embedded = self.embedding(input).view(1, 1, -1)
+        output, hidden = self.gru(embedded, hidden)
+        return output, hidden
 
-    # --- Feature Engineering ---
-    
-    # 1. Determine Price Column for Log Returns
-    # User specified 'value', but we check for 'close' as fallback
-    if 'value' in df.columns:
-        price_col = 'value'
-    elif 'close' in df.columns:
-        price_col = 'close'
-    else:
-        log("CRITICAL ERROR: Could not find 'value' or 'close' column for price data.")
-        sys.exit(1)
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=device)
 
-    log(f"Using column '{price_col}' for return calculations.")
-    
-    # Calculate Log Returns
-    # log(price_t / price_t-1)
-    df['log_ret'] = np.log(df[price_col] / df[price_col].shift(1))
-    
-    # 2. Month Processing
-    if 'month' not in df.columns:
-        # Fallback if 'month' is missing but 'datetime' exists
-        if 'datetime' in df.columns:
-            df['month'] = pd.to_datetime(df['datetime']).dt.month
-        else:
-            log("Warning: No 'month' column found. Defaulting to 0.")
-            df['month'] = 0
+class DecoderRNN(nn.Module):
+    def __init__(self, hidden_size, output_size):
+        super(DecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(output_size, EMBEDDING_SIZE)
+        self.gru = nn.GRU(EMBEDDING_SIZE, hidden_size)
+        self.out = nn.Linear(hidden_size, output_size)
+        self.softmax = nn.LogSoftmax(dim=1)
 
-    # Z-Score Normalization for Month
-    month_mean = df['month'].mean()
-    month_std = df['month'].std()
+    def forward(self, input, hidden):
+        output = self.embedding(input).view(1, 1, -1)
+        output = torch.relu(output)
+        output, hidden = self.gru(output, hidden)
+        output = self.softmax(self.out(output[0]))
+        return output, hidden
+
+    def initHidden(self):
+        return torch.zeros(1, 1, self.hidden_size, device=device)
+
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
+def tensor_from_word(word):
+    indexes = [char_to_index[char] for char in word if char in char_to_index]
+    indexes.append(EOS_token)
+    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
+
+def inject_noise(word):
+    if len(word) < 3: return word
+    chars = list(word)
+    error_type = random.randint(0, 3)
+    idx = random.randint(0, len(chars) - 1)
     
-    if month_std == 0: 
-        month_std = 1.0
+    if error_type == 0: # Insert
+        chars.insert(idx, random.choice(ALL_CHARS))
+    elif error_type == 1: # Delete
+        if len(chars) > 2: del chars[idx]
+    elif error_type == 2: # Swap
+        if idx < len(chars) - 1: chars[idx], chars[idx+1] = chars[idx+1], chars[idx]
+    elif error_type == 3: # Replace
+        chars[idx] = random.choice(ALL_CHARS)
+    return "".join(chars)
+
+def evaluate_word(word):
+    with torch.no_grad():
+        input_tensor = tensor_from_word(word)
+        input_length = input_tensor.size()[0]
+        encoder_hidden = encoder.initHidden()
+        for ei in range(input_length):
+            _, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+
+        decoder_input = torch.tensor([[SOS_token]], device=device)
+        decoder_hidden = encoder_hidden
+        decoded_chars = []
+
+        for di in range(MAX_LENGTH):
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+            _, topi = decoder_output.data.topk(1)
+            if topi.item() == EOS_token: break
+            decoded_chars.append(index_to_char[topi.item()])
+            decoder_input = topi.squeeze().detach()
+        return "".join(decoded_chars)
+
+# ==========================================
+# 4. TRAINING & STARTUP
+# ==========================================
+def setup_and_train():
+    global encoder, decoder
+    print("--- STARTUP: Downloading Vocabulary ---")
+    
+    # Download words
+    clean_words = ["apple", "banana", "computer", "python", "neural"] # Fallback
+    try:
+        url = "https://www.top10000words.com/english/top-10000-english-words"
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            text = soup.get_text()
+            # Get top 1000 words to ensure training is fast for demo
+            clean_words = list(set(re.findall(r'\b[a-z]{3,}\b', text.lower())))[:1000]
+            print(f"Downloaded {len(clean_words)} words.")
+    except Exception as e:
+        print(f"Using fallback list due to error: {e}")
+
+    # Generate Data
+    training_pairs = []
+    for word in clean_words:
+        training_pairs.append((word, word))
+        for _ in range(5):
+            training_pairs.append((inject_noise(word), word))
+
+    # Init Models
+    print("--- STARTUP: Initializing Models ---")
+    encoder = EncoderRNN(VOCAB_SIZE, HIDDEN_SIZE).to(device)
+    decoder = DecoderRNN(HIDDEN_SIZE, VOCAB_SIZE).to(device)
+    enc_opt = optim.Adam(encoder.parameters(), lr=LEARNING_RATE)
+    dec_opt = optim.Adam(decoder.parameters(), lr=LEARNING_RATE)
+    criterion = nn.NLLLoss()
+
+    # Train Loop
+    print(f"--- STARTUP: Training on {len(training_pairs)} pairs for {N_ITERATIONS} iterations ---")
+    for i in range(1, N_ITERATIONS + 1):
+        pair = random.choice(training_pairs)
+        input_tensor = tensor_from_word(pair[0])
+        target_tensor = tensor_from_word(pair[1])
+
+        enc_hidden = encoder.initHidden()
+        enc_opt.zero_grad()
+        dec_opt.zero_grad()
+
+        loss = 0
+        input_len = input_tensor.size(0)
+        target_len = target_tensor.size(0)
+
+        for ei in range(input_len):
+            _, enc_hidden = encoder(input_tensor[ei], enc_hidden)
+
+        dec_input = torch.tensor([[SOS_token]], device=device)
+        dec_hidden = enc_hidden
+
+        # Teacher forcing 50%
+        use_tf = True if random.random() < 0.5 else False
         
-    df['month_norm'] = (df['month'] - month_mean) / month_std
-    log(f"Month Stats: Mean={month_mean:.2f}, Std={month_std:.2f}")
-
-    # 3. Label Map (Signal)
-    if 'signal' not in df.columns:
-        log("CRITICAL ERROR: No 'signal' column found.")
-        sys.exit(1)
-
-    # Map signals: -1 -> 0, 0 -> 1, 1 -> 2
-    label_map = {-1: 0, 0: 1, 1: 2}
-    df['target_class'] = df['signal'].map(label_map)
-    
-    # Drop NaNs created by shift() or bad data
-    df.dropna(subset=['log_ret', 'target_class', 'month_norm'], inplace=True)
-    df = df[~df.isin([np.nan, np.inf, -np.inf]).any(axis=1)]
-    
-    # --- Feature Assembly ---
-    # Feature 1: Robust Scaled Log Returns
-    log_ret_vals = df['log_ret'].values.reshape(-1, 1)
-    scaler = RobustScaler()
-    log_ret_scaled = scaler.fit_transform(log_ret_vals)
-    
-    # Feature 2: Z-Scored Month
-    month_scaled = df['month_norm'].values.reshape(-1, 1)
-    
-    # Stack features: Shape (N, 2)
-    data_val = np.hstack([log_ret_scaled, month_scaled])
-    labels_val = df['target_class'].values.astype(int)
-    
-    log(f"Dataset Size after filtering: {len(df)} rows.")
-    log(f"Features shape: {data_val.shape}")
-    
-    # Generate Sequences
-    log(f"Generating Sequences (Length {SEQ_LENGTH})...")
-    from numpy.lib.stride_tricks import sliding_window_view
-    
-    # sliding_window_view creates shape (Num_Windows, Window_Size, Features)
-    windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0) 
-    
-    # Ensure dimensions are (Batch, Seq_Len, Features)
-    # The default behavior of sliding_window_view on 2D array:
-    # Input (N, F) -> Output (N - W + 1, W, F) is automatic if we don't mess up axes.
-    # Actually, for 2D input (N, F), sliding_window_view(x, w, axis=0) results in (N-w+1, F, w).
-    # We need (N-w+1, w, F).
-    
-    windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0)
-    # Current shape: (N_samples, Features, Seq_Len) -> e.g. (X, 2, 20)
-    # We want: (N_samples, Seq_Len, Features) -> (X, 20, 2)
-    X = windows.transpose(0, 2, 1)
-    
-    # Align labels (taking the label at the end of the sequence)
-    y = labels_val[SEQ_LENGTH-1:]
-    
-    min_len = min(len(X), len(y))
-    return X[:min_len], y[:min_len]
-
-# ==========================================
-# 3. MODEL (GRU)
-# ==========================================
-class GRUClassifier(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.gru = nn.GRU(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
-                          batch_first=True, dropout=DROPOUT)
-        self.bn = nn.BatchNorm1d(HIDDEN_DIM)
-        self.dropout = nn.Dropout(DROPOUT)
-        self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
+        for di in range(target_len):
+            dec_out, dec_hidden = decoder(dec_input, dec_hidden)
+            loss += criterion(dec_out, target_tensor[di])
+            if use_tf:
+                dec_input = target_tensor[di]
+            else:
+                _, topi = dec_out.topk(1)
+                dec_input = topi.squeeze().detach()
+                if dec_input.item() == EOS_token: break
         
-    def forward(self, x):
-        # Input shape: (Batch, Seq, Feature)
-        out, _ = self.gru(x)
-        # GRU returns (output, hidden). Output is (Batch, Seq, Hidden)
-        # We take the last time step
-        out = out[:, -1, :] 
-        out = self.bn(out)
-        out = torch.relu(out)
-        out = self.dropout(out)
-        out = self.fc(out)
-        return out
+        loss.backward()
+        enc_opt.step()
+        dec_opt.step()
+
+        if i % 5000 == 0:
+            print(f"Iteration {i}/{N_ITERATIONS} complete.")
+
+    print("--- STARTUP: Training Complete. Server Ready. ---")
 
 # ==========================================
-# 4. MAIN EXECUTION
+# 5. FLASK WEB SERVER
 # ==========================================
+
+# Run training immediately when script loads
+setup_and_train()
+
+# HTML Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Spelling Corrector</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+        h1 { margin-bottom: 1.5rem; color: #1a1a1a; font-size: 1.5rem; }
+        input { width: 100%; padding: 12px; margin-bottom: 1rem; border: 2px solid #e1e4e8; border-radius: 8px; font-size: 1rem; box-sizing: border-box; transition: 0.2s; }
+        input:focus { border-color: #3b82f6; outline: none; }
+        button { background: #3b82f6; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 1rem; cursor: pointer; width: 100%; font-weight: 600; transition: 0.2s; }
+        button:hover { background: #2563eb; }
+        #result { margin-top: 1.5rem; font-size: 1.25rem; min-height: 1.5rem; font-weight: 500; }
+        .original { color: #ef4444; text-decoration: line-through; margin-right: 10px; }
+        .corrected { color: #10b981; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>AI Spelling Corrector</h1>
+        <input type="text" id="wordInput" placeholder="Type a misspelled word..." autocomplete="off">
+        <button onclick="correctWord()">Auto Correct</button>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        async function correctWord() {
+            const word = document.getElementById('wordInput').value;
+            const resultDiv = document.getElementById('result');
+            
+            if (!word) return;
+            
+            resultDiv.innerHTML = '<span style="color:#666">Thinking...</span>';
+            
+            try {
+                const response = await fetch('/predict', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({word: word})
+                });
+                const data = await response.json();
+                
+                resultDiv.innerHTML = `
+                    <span class="original">${word}</span>
+                    <span class="corrected">${data.corrected}</span>
+                `;
+            } catch (e) {
+                resultDiv.innerText = "Error connecting to server.";
+            }
+        }
+        
+        // Allow Enter key
+        document.getElementById('wordInput').addEventListener('keypress', function (e) {
+            if (e.key === 'Enter') correctWord();
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.json
+    word = data.get('word', '').lower().strip()
+    if not word:
+        return jsonify({'corrected': ''})
+    
+    correction = evaluate_word(word)
+    return jsonify({'corrected': correction})
+
 if __name__ == "__main__":
-    log("==========================================")
-    log(f" Starting Full Dataset GRU Training")
-    log(f" Features: LogRet(from 'value') + Month(Z-Scored)")
-    log("==========================================")
-    
-    X, y = get_focused_data()
-    
-    # Train/Test Split
-    split_idx = int(len(X) * TRAIN_SPLIT)
-    
-    # Convert to Tensor
-    X_train = torch.tensor(X[:split_idx], dtype=torch.float32)
-    y_train = torch.tensor(y[:split_idx], dtype=torch.long)
-    X_test = torch.tensor(X[split_idx:], dtype=torch.float32)
-    y_test = torch.tensor(y[split_idx:], dtype=torch.long)
-
-    # Class Weights for Imbalance handling
-    unique_classes = np.unique(y[:split_idx])
-    class_weights = compute_class_weight('balanced', classes=unique_classes, y=y[:split_idx])
-    weights_tensor = torch.zeros(NUM_CLASSES).to(DEVICE)
-    for i, cls in enumerate(unique_classes):
-        weights_tensor[cls] = class_weights[i]
-        
-    log(f"Class Weights: {weights_tensor}")
-
-    # Dataloaders
-    train_ds = TensorDataset(X_train, y_train)
-    test_ds = TensorDataset(X_test, y_test)
-    
-    # Check if we have enough data for the batch size
-    actual_batch_size = min(BATCH_SIZE, len(train_ds))
-    
-    train_loader = DataLoader(train_ds, batch_size=actual_batch_size, shuffle=True, 
-                              num_workers=0) # num_workers=0 is safer for simple scripts/CPU
-    test_loader = DataLoader(test_ds, batch_size=actual_batch_size, shuffle=False)
-    
-    # Instantiate GRU Model
-    model = GRUClassifier().to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
-    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-
-    # OneCycleLR Scheduler
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=MAX_LR,
-        steps_per_epoch=len(train_loader),
-        epochs=EPOCHS,
-        pct_start=0.3
-    )
-    
-    log(f"Beginning training on {len(X_train)} samples for {EPOCHS} epochs.")
-    
-    best_acc = 0
-    for epoch in range(EPOCHS):
-        start_time = time.time()
-        model.train()
-        train_loss = 0
-        
-        for bx, by in train_loader:
-            bx, by = bx.to(DEVICE), by.to(DEVICE)
-            optimizer.zero_grad()
-            out = model(bx)
-            loss = criterion(out, by)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            train_loss += loss.item()
-
-        # Evaluation
-        model.eval()
-        val_loss = 0
-        val_correct = 0
-        with torch.no_grad():
-            for bx, by in test_loader:
-                bx, by = bx.to(DEVICE), by.to(DEVICE)
-                out = model(bx)
-                val_loss += criterion(out, by).item()
-                val_correct += (out.argmax(1) == by).sum().item()
-
-        time_taken = time.time() - start_time
-        val_acc = 100 * val_correct / len(test_ds) if len(test_ds) > 0 else 0
-        
-        # Periodic Logging
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            avg_train_loss = train_loss / len(train_loader)
-            avg_val_loss = val_loss / len(test_loader)
-            print(f"Ep {epoch+1:03d} | T: {time_taken:.2f}s | "
-                  f"TLoss: {avg_train_loss:.4f} | "
-                  f"VLoss: {avg_val_loss:.4f} | VAcc: {val_acc:.2f}%")
-        
-        # Save Best Model
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), MODEL_FILENAME)
-
-    log(f"Training Complete. Best Val Accuracy: {best_acc:.2f}%")
-    
-    # Server logic for deployment environment (Keep-Alive)
-    PORT = int(os.environ.get("PORT", 8080))
-    log(f"Serving on port {PORT}...")
-    with socketserver.TCPServer(("0.0.0.0", PORT), http.server.SimpleHTTPRequestHandler) as httpd:
-        httpd.serve_forever()
+    # Railway provides PORT via environment variable
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
