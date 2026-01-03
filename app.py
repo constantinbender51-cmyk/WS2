@@ -28,8 +28,8 @@ EMBEDDING_DIM = 256
 RANDOM_SEED = 42
 
 # Regularization Hyperparameters
-L1_REG = 1e-5
-L2_REG = 1e-3
+L1_REG = 1e-1
+L2_REG = 1e-4
 
 # Special Tokens
 SOS_TOKEN = '\t' # Start of Sequence
