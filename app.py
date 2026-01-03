@@ -23,7 +23,7 @@ VALIDATION_SPLIT = 0.1        # Portion of data to use for validation
 BATCH_SIZE = 4096
 EPOCHS = 300
 EMBEDDING_DIM = 64
-GRU_UNITS = 1024
+GRU_UNITS = 128
 PADDING_BUFFER = 2            # Extra space in sequence length for insertions
 RANDOM_SEED = 42
 
