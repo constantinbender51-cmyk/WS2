@@ -1,5 +1,3 @@
-gdown
-pandas
-numpy
 torch
-scikit-learn
+flask
+beautifulsoup4
