@@ -125,22 +125,34 @@ reg = l1_l2(l1=L1_REG, l2=L2_REG)
 
 # --- Encoder ---
 encoder_inputs = Input(shape=(None,), name="Encoder_Input")
-encoder_embedding = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Encoder_Embedding")(encoder_inputs)
+
+# Separate definition from call to reuse layer later
+enc_emb_layer = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Encoder_Embedding")
+encoder_embedding = enc_emb_layer(encoder_inputs)
+
 encoder_dropout = Dropout(DROPOUT_RATE)(encoder_embedding)
+
 # return_state=True to get the internal state vectors (h, c)
 encoder_lstm = LSTM(LATENT_DIM, return_state=True, dropout=DROPOUT_RATE, kernel_regularizer=reg, name="Encoder_LSTM")
 encoder_outputs, state_h, state_c = encoder_lstm(encoder_dropout)
+
 # We discard `encoder_outputs` and only keep the states.
 encoder_states = [state_h, state_c]
 
 # --- Decoder ---
 decoder_inputs = Input(shape=(None,), name="Decoder_Input")
-decoder_embedding = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Decoder_Embedding")(decoder_inputs)
+
+# Separate definition from call to reuse layer later in inference
+dec_emb_layer = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Decoder_Embedding")
+decoder_embedding = dec_emb_layer(decoder_inputs)
+
 decoder_dropout = Dropout(DROPOUT_RATE)(decoder_embedding)
+
 # return_sequences=True to output the whole sequence
 # return_state=True is needed for inference later, though ignored during training
 decoder_lstm = LSTM(LATENT_DIM, return_sequences=True, return_state=True, dropout=DROPOUT_RATE, kernel_regularizer=reg, name="Decoder_LSTM")
 decoder_outputs, _, _ = decoder_lstm(decoder_dropout, initial_state=encoder_states)
+
 decoder_dense = Dense(vocab_size, activation='softmax', kernel_regularizer=reg, name="Decoder_Output")
 decoder_outputs = decoder_dense(decoder_outputs)
 
@@ -172,10 +184,15 @@ decoder_state_input_h = Input(shape=(LATENT_DIM,))
 decoder_state_input_c = Input(shape=(LATENT_DIM,))
 decoder_states_inputs = [decoder_state_input_h, decoder_state_input_c]
 
-dec_emb2 = decoder_embedding(decoder_inputs) # Reuse training embedding layer
-dec_outputs2, state_h2, state_c2 = decoder_lstm(dec_emb2, initial_state=decoder_states_inputs) # Reuse LSTM
+# Reuse the embedding layer defined above (dec_emb_layer), not the tensor
+dec_emb2 = dec_emb_layer(decoder_inputs) 
+
+# Reuse the LSTM layer
+dec_outputs2, state_h2, state_c2 = decoder_lstm(dec_emb2, initial_state=decoder_states_inputs)
 decoder_states2 = [state_h2, state_c2]
-decoder_outputs2 = decoder_dense(dec_outputs2) # Reuse Dense layer
+
+# Reuse the Dense layer
+decoder_outputs2 = decoder_dense(dec_outputs2)
 
 decoder_model = Model(
     [decoder_inputs] + decoder_states_inputs,
