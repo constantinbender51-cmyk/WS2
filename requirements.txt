@@ -1,6 +1,5 @@
 numpy
 tensorflow
-keras
 requests
 matplotlib
 python-dotenv
