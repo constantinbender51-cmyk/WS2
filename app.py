@@ -2,8 +2,9 @@ import numpy as np
 import requests
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, GRU, TimeDistributed, Bidirectional, Embedding
+from tensorflow.keras.layers import Dense, GRU, TimeDistributed, Bidirectional, Embedding, Dropout
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.regularizers import l1_l2
 import random
 
 # --- CONFIGURATION & PARAMETERS ---
@@ -17,6 +18,11 @@ EMBEDDING_DIM = 64
 GRU_UNITS = 128
 PADDING_BUFFER = 2            # Extra space in sequence length for insertions
 RANDOM_SEED = 42
+
+# Regularization Hyperparameters
+DROPOUT_RATE = 0.3            # Probability of dropping a unit
+L1_REG = 1e-5                 # L1 regularization factor
+L2_REG = 1e-4                 # L2 regularization factor
 
 # Set seeds for reproducibility
 np.random.seed(RANDOM_SEED)
@@ -93,11 +99,20 @@ y_train = tf.keras.utils.to_categorical(y_train_seq, num_classes=vocab_size)
 print(f"Dataset shape: X={X_train.shape}, y={y_train.shape}")
 
 # --- 3. MODEL ARCHITECTURE ---
+# Added Dropout and Regularization to combat overfitting
+reg = l1_l2(l1=L1_REG, l2=L2_REG)
+
 model = Sequential([
     Embedding(input_dim=vocab_size, output_dim=EMBEDDING_DIM, input_length=max_len, mask_zero=True),
-    Bidirectional(GRU(GRU_UNITS, return_sequences=True)),
-    GRU(GRU_UNITS, return_sequences=True),
-    TimeDistributed(Dense(vocab_size, activation='softmax'))
+    Dropout(DROPOUT_RATE),
+    
+    Bidirectional(GRU(GRU_UNITS, return_sequences=True, kernel_regularizer=reg)),
+    Dropout(DROPOUT_RATE),
+    
+    GRU(GRU_UNITS, return_sequences=True, kernel_regularizer=reg),
+    Dropout(DROPOUT_RATE),
+    
+    TimeDistributed(Dense(vocab_size, activation='softmax', kernel_regularizer=reg))
 ])
 
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
