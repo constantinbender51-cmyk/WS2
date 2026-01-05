@@ -1,312 +1,256 @@
-import numpy as np
-import requests
-import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, Embedding, Dropout
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.regularizers import l1_l2
-import random
-import matplotlib.pyplot as plt
 import os
+import sys
+import json
+import time
 import base64
-from dotenv import load_dotenv
+import requests
+import random
+import urllib.request
 from datetime import datetime
+from collections import Counter, defaultdict
+import pandas as pd
 
-# Load environment variables (specifically PAT)
-load_dotenv()
-
-# --- CONFIGURATION & PARAMETERS ---
-DATA_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/refs/heads/master/20k.txt"
-NUM_WORDS_TO_LOAD = 100       # Reverted to 100
-AUGMENTATIONS_PER_WORD = 50
-VALIDATION_SPLIT = 0.2
-BATCH_SIZE = 64  # Changed to 512
-EPOCHS = 10                 # Increased epochs for autoregressive convergence
-LATENT_DIM = 256              # Internal state size
-EMBEDDING_DIM = 128
-RANDOM_SEED = 42
-
-# Regularization Hyperparameters
-L1_REG = 1e-5
-L2_REG = 1e-4
-
-# Special Tokens
-SOS_TOKEN = '\t' # Start of Sequence
-EOS_TOKEN = '\n' # End of Sequence
-
-# Regularization
-DROPOUT_RATE = 0.3
-
-# Set seeds
-np.random.seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
-
-# --- 1. DATA LOADING ---
-print(f"Downloading data from {DATA_URL}...")
+# --- CONFIGURATION ---
 try:
-    response = requests.get(DATA_URL)
-    response.raise_for_status()
-    all_words = response.text.splitlines()
-except Exception as e:
-    print(f"Error downloading: {e}. Using fallback.")
-    all_words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"] * 20
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-# Select words
-words = [w.strip().lower() for w in all_words[:NUM_WORDS_TO_LOAD] if w.strip()]
-print(f"Training on first {len(words)} words.")
+GITHUB_PAT = os.getenv("PAT")
+REPO_OWNER = "constantinbender51-cmyk"
+REPO_NAME = "Models"
+GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
 
-# --- 2. PREPROCESSING & TOKENIZATION ---
+ASSETS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", 
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"
+]
 
-# Create vocabulary including special tokens
-chars = sorted(list(set("".join(words) + "abcdefghijklmnopqrstuvwxyz" + SOS_TOKEN + EOS_TOKEN)))
-char_to_int = {c: i for i, c in enumerate(chars)} # 0 is now a valid index for a character
-int_to_char = {i: c for i, c in enumerate(chars)}
-vocab_size = len(chars)
+# Base timeframe download
+BASE_INTERVAL = "15m" 
+START_DATE = "2020-01-01"
 
-# Determine max sequence length (add space for SOS/EOS)
-max_len = max([len(w) for w in words]) + 4
+# Resampling Targets
+TIMEFRAMES = {
+    "15m": None,
+    "30m": "30min",
+    "60m": "1h",
+    "240m": "4h",
+    "1d": "1D"
+}
 
-def add_noise(word):
-    """Introduces noise for the encoder input."""
-    if len(word) < 2: return word
-    word_list = list(word)
-    mutation = random.choice(['sub', 'del', 'ins', 'swap', 'none']) # Added 'none' for identity mapping
-    idx = random.randint(0, len(word_list) - 1)
+# --- 1. DATA FETCHING ---
+
+def get_binance_data(symbol, start_str=START_DATE):
+    print(f"\n[{symbol}] Fetching raw {BASE_INTERVAL} data from {start_str}...")
+    start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
+    end_ts = int(time.time() * 1000)
+    all_candles = []
+    current_start = start_ts
     
-    if mutation == 'sub':
-        word_list[idx] = random.choice(chars[:26]) # Only letters
-    elif mutation == 'del':
-        del word_list[idx]
-    elif mutation == 'ins' and len(word_list) < max_len:
-        word_list.insert(idx, random.choice(chars[:26]))
-    elif mutation == 'swap' and idx < len(word_list) - 1:
-        word_list[idx], word_list[idx+1] = word_list[idx+1], word_list[idx]
+    while current_start < end_ts:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={BASE_INTERVAL}&startTime={current_start}&limit=1000"
+        try:
+            with urllib.request.urlopen(url) as response:
+                data = json.loads(response.read().decode())
+                if not data: break
+                batch = [(int(c[6]), float(c[4])) for c in data]
+                all_candles.extend(batch)
+                current_start = data[-1][6] + 1
+        except Exception as e:
+            print(f"Error fetching: {e}")
+            break
+            
+    print(f"[{symbol}] Downloaded {len(all_candles)} raw candles.")
+    return all_candles
+
+def resample_prices(raw_data, target_freq):
+    if target_freq is None: return [x[1] for x in raw_data]
+    df = pd.DataFrame(raw_data, columns=['timestamp', 'price'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    resampled = df['price'].resample(target_freq).last().dropna()
+    return resampled.tolist()
+
+# --- 2. CORE STRATEGY LOGIC (FIXED) ---
+
+def get_bucket(price, bucket_size):
+    if price >= 0: return (int(price) // bucket_size) + 1
+    else: return (int(price + 1) // bucket_size) - 1
+
+def train_models(train_buckets, seq_len):
+    abs_map = defaultdict(Counter)
+    der_map = defaultdict(Counter)
+    
+    for i in range(len(train_buckets) - seq_len):
+        # 1. Absolute Sequence (Length = seq_len)
+        a_seq = tuple(train_buckets[i : i + seq_len])
+        a_succ = train_buckets[i + seq_len]
+        abs_map[a_seq][a_succ] += 1
         
-    return "".join(word_list)
-
-# Prepare lists for Encoder Input, Decoder Input, and Decoder Target
-encoder_input_data = []
-decoder_input_data = []
-decoder_target_data = []
-
-print("Generating synthetic data...")
-for word in words:
-    for _ in range(AUGMENTATIONS_PER_WORD):
-        # 1. Encoder Input: The noisy word
-        noisy_word = add_noise(word)
-        encoder_input_data.append([char_to_int[c] for c in noisy_word])
+        # 2. Derivative Sequence (Length = seq_len - 1)
+        # FIX: We start at i+1 to perform internal diffs only (buckets[i+1] - buckets[i])
+        # This removes the dependency on "lookback" data outside the sequence window.
+        d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i + 1, i + seq_len))
         
-        # 2. Decoder Input: SOS + correct word
-        dec_in = [char_to_int[SOS_TOKEN]] + [char_to_int[c] for c in word]
-        decoder_input_data.append(dec_in)
+        d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
+        der_map[d_seq][d_succ] += 1
+            
+    return abs_map, der_map
+
+def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val, all_vals, all_changes):
+    if model_type == "Absolute":
+        if a_seq in abs_map: return abs_map[a_seq].most_common(1)[0][0]
+        return random.choice(all_vals)
         
-        # 3. Decoder Target: correct word + EOS
-        dec_target = [char_to_int[c] for c in word] + [char_to_int[EOS_TOKEN]]
-        decoder_target_data.append(dec_target)
+    elif model_type == "Derivative":
+        if d_seq in der_map: pred_change = der_map[d_seq].most_common(1)[0][0]
+        else: pred_change = random.choice(all_changes)
+        return last_val + pred_change
+        
+    elif model_type == "Combined":
+        abs_cand = abs_map.get(a_seq, Counter())
+        der_cand = der_map.get(d_seq, Counter()) # d_seq is now len 4 for a seq of 5
+        
+        poss = set(abs_cand.keys())
+        for c in der_cand.keys(): poss.add(last_val + c)
+        
+        if not poss: return random.choice(all_vals)
+        
+        best, max_s = None, -1
+        for v in poss:
+            # Add votes from absolute expert + votes from derivative expert
+            s = abs_cand[v] + der_cand[v - last_val]
+            if s > max_s: max_s, best = s, v
+        return best
+    return last_val
 
-# Pad Sequences
-encoder_input_data = pad_sequences(encoder_input_data, maxlen=max_len, padding='post')
-decoder_input_data = pad_sequences(decoder_input_data, maxlen=max_len, padding='post')
-decoder_target_data = pad_sequences(decoder_target_data, maxlen=max_len, padding='post')
-
-# One-hot encode targets for Softmax
-decoder_target_one_hot = to_categorical(decoder_target_data, num_classes=vocab_size)
-
-print(f"Encoder Input Shape: {encoder_input_data.shape}")
-print(f"Decoder Input Shape: {decoder_input_data.shape}")
-print(f"Decoder Target Shape: {decoder_target_one_hot.shape}")
-
-# --- 3. MODEL ARCHITECTURE (Seq2Seq) ---
-
-# Define Regularizer
-reg = l1_l2(l1=L1_REG, l2=L2_REG)
-
-# --- Encoder ---
-encoder_inputs = Input(shape=(None,), name="Encoder_Input")
-
-# Separate definition from call to reuse layer later
-enc_emb_layer = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Encoder_Embedding")
-encoder_embedding = enc_emb_layer(encoder_inputs)
-
-encoder_dropout = Dropout(DROPOUT_RATE)(encoder_embedding)
-
-# return_state=True to get the internal state vectors (h, c)
-encoder_lstm = LSTM(LATENT_DIM, return_state=True, dropout=DROPOUT_RATE, kernel_regularizer=reg, name="Encoder_LSTM")
-encoder_outputs, state_h, state_c = encoder_lstm(encoder_dropout)
-
-# We discard `encoder_outputs` and only keep the states.
-encoder_states = [state_h, state_c]
-
-# --- Decoder ---
-decoder_inputs = Input(shape=(None,), name="Decoder_Input")
-
-# Separate definition from call to reuse layer later in inference
-dec_emb_layer = Embedding(vocab_size, EMBEDDING_DIM, mask_zero=True, name="Decoder_Embedding")
-decoder_embedding = dec_emb_layer(decoder_inputs)
-
-decoder_dropout = Dropout(DROPOUT_RATE)(decoder_embedding)
-
-# return_sequences=True to output the whole sequence
-# return_state=True is needed for inference later, though ignored during training
-decoder_lstm = LSTM(LATENT_DIM, return_sequences=True, return_state=True, dropout=DROPOUT_RATE, kernel_regularizer=reg, name="Decoder_LSTM")
-decoder_outputs, _, _ = decoder_lstm(decoder_dropout, initial_state=encoder_states)
-
-decoder_dense = Dense(vocab_size, activation='softmax', kernel_regularizer=reg, name="Decoder_Output")
-decoder_outputs = decoder_dense(decoder_outputs)
-
-# --- Define Training Model ---
-model = Model([encoder_inputs, decoder_inputs], decoder_outputs)
-
-model.compile(optimizer='rmsprop', loss='categorical_crossentropy', metrics=['accuracy'])
-model.summary()
-
-# --- 4. TRAINING ---
-print("Starting training...")
-# Note: We pass TWO inputs: [encoder_input_data, decoder_input_data]
-history = model.fit(
-    [encoder_input_data, decoder_input_data],
-    decoder_target_one_hot,
-    batch_size=BATCH_SIZE,
-    epochs=EPOCHS,
-    validation_split=VALIDATION_SPLIT
-)
-
-# --- 5. INFERENCE SETUP (Sampling Models) ---
-# To generate text, we need to separate the Encoder and Decoder so we can loop manually.
-
-# Encoder Inference Model
-encoder_model = Model(encoder_inputs, encoder_states)
-
-# Decoder Inference Model
-decoder_state_input_h = Input(shape=(LATENT_DIM,))
-decoder_state_input_c = Input(shape=(LATENT_DIM,))
-decoder_states_inputs = [decoder_state_input_h, decoder_state_input_c]
-
-# Reuse the embedding layer defined above (dec_emb_layer), not the tensor
-dec_emb2 = dec_emb_layer(decoder_inputs) 
-
-# Reuse the LSTM layer
-dec_outputs2, state_h2, state_c2 = decoder_lstm(dec_emb2, initial_state=decoder_states_inputs)
-decoder_states2 = [state_h2, state_c2]
-
-# Reuse the Dense layer
-decoder_outputs2 = decoder_dense(dec_outputs2)
-
-decoder_model = Model(
-    [decoder_inputs] + decoder_states_inputs,
-    [decoder_outputs2] + decoder_states2
-)
-
-def decode_sequence(input_seq):
-    # Encode the input as state vectors.
-    states_value = encoder_model.predict(input_seq, verbose=0)
-
-    # Generate empty target sequence of length 1.
-    target_seq = np.zeros((1, 1))
-    # Populate the first character of target sequence with the start character.
-    target_seq[0, 0] = char_to_int[SOS_TOKEN]
-
-    # Sampling loop for a batch of sequences
-    # (to simplify, here we assume a batch of size 1).
-    stop_condition = False
-    decoded_sentence = ''
+def evaluate_config(prices, bucket_size, seq_len):
+    buckets = [get_bucket(p, bucket_size) for p in prices]
+    split_idx = int(len(buckets) * 0.7)
+    train = buckets[:split_idx]
+    test = buckets[split_idx:]
     
-    while not stop_condition:
-        output_tokens, h, c = decoder_model.predict([target_seq] + states_value, verbose=0)
-
-        # Sample a token
-        sampled_token_index = np.argmax(output_tokens[0, -1, :])
-        sampled_char = int_to_char[sampled_token_index]
-
-        if sampled_char != EOS_TOKEN:
-            decoded_sentence += sampled_char
-
-        # Exit condition: either hit max length or find stop character.
-        if (sampled_char == EOS_TOKEN or
-           len(decoded_sentence) > max_len):
-            stop_condition = True
-
-        # Update the target sequence (of length 1).
-        target_seq = np.zeros((1, 1))
-        target_seq[0, 0] = sampled_token_index
-
-        # Update states
-        states_value = [h, c]
-
-    return decoded_sentence
-
-# --- 6. PLOTTING & GITHUB UPLOAD ---
-def upload_plot_to_github(history):
-    print("\n--- Generating and Uploading Plot ---")
+    if len(train) < seq_len + 10: return -1, "None", 0
     
-    # Generate Plot
-    plt.figure(figsize=(6, 4))
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.title('Encoder-Decoder Loss Over Epochs')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
+    all_vals = list(set(train))
+    all_changes = list(set(train[j] - train[j-1] for j in range(1, len(train))))
+    abs_map, der_map = train_models(train, seq_len)
     
-    filename = f"seq2seq_loss_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    plt.savefig(filename, dpi=60)
-    plt.close()
-    print(f"Plot saved locally as {filename}")
+    stats = {"Absolute": [0,0], "Derivative": [0,0], "Combined": [0,0]}
+    
+    for i in range(len(test) - seq_len):
+        curr = split_idx + i
+        a_seq = tuple(buckets[curr : curr+seq_len])
+        
+        # FIX: Same logic here. Use range(curr + 1, ...) for internal diffs only
+        d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr + 1, curr+seq_len))
+        
+        last, act = a_seq[-1], buckets[curr+seq_len]
+        act_diff = act - last
+        
+        p_abs = get_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last, all_vals, all_changes)
+        p_der = get_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last, all_vals, all_changes)
+        p_comb = get_prediction("Combined", abs_map, der_map, a_seq, d_seq, last, all_vals, all_changes)
+        
+        for name, pred in [("Absolute", p_abs), ("Derivative", p_der), ("Combined", p_comb)]:
+            p_diff = pred - last
+            if p_diff != 0 and act_diff != 0:
+                stats[name][1] += 1
+                if (p_diff > 0 and act_diff > 0) or (p_diff < 0 and act_diff < 0):
+                    stats[name][0] += 1
+                    
+    best_acc, best_name, best_trades = -1, "None", 0
+    for name, (corr, tot) in stats.items():
+        if tot > 0:
+            acc = (corr/tot)*100
+            if acc > best_acc: best_acc, best_name, best_trades = acc, name, tot
+            
+    return best_acc, best_name, best_trades
 
-    # Prepare for Upload
-    repo_owner = "constantinbender51-cmyk"
-    repo_name = "models"
-    github_token = os.getenv("PAT")
+def find_optimal_strategy(prices):
+    avg_price = sum(prices) / len(prices)
+    base_step = max(1, int(avg_price * 0.001)) 
+    bucket_sizes = [base_step * i for i in range(1, 11)] 
+    seq_lengths = [3, 4, 5, 6]
     
-    if not github_token:
-        print("Error: PAT not found in .env. Skipping upload.")
+    results = []
+    for b in bucket_sizes:
+        for s in seq_lengths:
+            acc, mod, tr = evaluate_config(prices, b, s)
+            if tr > 20: 
+                results.append({
+                    "bucket_size": b,
+                    "seq_len": s,
+                    "model_type": mod,
+                    "accuracy": acc,
+                    "trades": tr
+                })
+    
+    results.sort(key=lambda x: x['accuracy'], reverse=True)
+    return results[:3]
+
+# --- 3. GITHUB UPLOAD ---
+
+def upload_to_github(file_path, content):
+    if not GITHUB_PAT:
+        print("Error: No PAT found in .env")
         return
 
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{filename}"
-    
-    with open(filename, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-
+    url = GITHUB_API_URL + file_path
     headers = {
-        "Authorization": f"Bearer {github_token}",
-        "Accept": "application/vnd.github+json"
+        "Authorization": f"Bearer {GITHUB_PAT}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    json_content = json.dumps(content, indent=2)
+    b64_content = base64.b64encode(json_content.encode("utf-8")).decode("utf-8")
+    data = {
+        "message": f"Update model for {file_path}",
+        "content": b64_content
     }
     
-    payload = {
-        "message": f"Upload seq2seq plot {filename}",
-        "content": encoded_string
-    }
+    check_resp = requests.get(url, headers=headers)
+    if check_resp.status_code == 200:
+        data["sha"] = check_resp.json()["sha"]
+        print(f"Updating existing file: {file_path}")
+    else:
+        print(f"Creating new file: {file_path}")
+        
+    resp = requests.put(url, headers=headers, data=json.dumps(data))
+    if resp.status_code in [200, 201]:
+        print(f"Success: Uploaded {file_path}")
+    else:
+        print(f"Failed to upload {file_path}: {resp.text}")
 
-    try:
-        response = requests.put(api_url, json=payload, headers=headers)
-        if response.status_code in [200, 201]:
-            print("Upload successful!")
-        else:
-            print(f"Upload failed: {response.status_code}")
-    except Exception as e:
-        print(f"Error uploading: {e}")
+def main():
+    if not GITHUB_PAT:
+        print("WARNING: 'PAT' not found in environment. GitHub upload will fail.")
 
-upload_plot_to_github(history)
-
-# --- 7. TESTING ---
-print("\n--- Testing Autoregressive Model ---")
-
-test_indices = np.random.choice(len(encoder_input_data), 5, replace=False)
-
-print(f"{'Input (Misspelled)':<20} | {'Decoded (Prediction)':<20}")
-print("-" * 45)
-
-for idx in test_indices:
-    input_seq = encoder_input_data[idx:idx+1]
-    
-    # Reconstruct input string for display (remove padding)
-    input_str = ""
-    for i in input_seq[0]:
-        if i != 0: input_str += int_to_char[i]
+    for asset in ASSETS:
+        raw_data = get_binance_data(asset)
+        if not raw_data: continue
+        
+        for tf_name, tf_pandas in TIMEFRAMES.items():
+            print(f"Processing {asset} [{tf_name}]...")
+            prices = resample_prices(raw_data, tf_pandas)
+            if len(prices) < 200: continue
             
-    decoded_sentence = decode_sequence(input_seq)
-    
-    print(f"{input_str:<20} | {decoded_sentence:<20}")
+            top_configs = find_optimal_strategy(prices)
+            if not top_configs: continue
+                
+            final_payload = {
+                "asset": asset,
+                "timeframe": tf_name,
+                "timestamp": datetime.now().isoformat(),
+                "data_points": len(prices),
+                "strategy_union": top_configs 
+            }
+            
+            filename = f"{asset}_{tf_name}.json"
+            upload_to_github(filename, final_payload)
+            
+    print("\n--- OPTIMIZATION & UPLOAD COMPLETE ---")
+
+if __name__ == "__main__":
+    main()
