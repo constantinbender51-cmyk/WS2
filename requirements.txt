@@ -3,3 +3,4 @@ tensorflow
 requests
 matplotlib
 python-dotenv
+pandas
