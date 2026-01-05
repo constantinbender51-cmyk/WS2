@@ -1,184 +1,179 @@
-import os
+import random
+import time
 import sys
 import json
-import time
-import random
 import urllib.request
-import pandas as pd
-from datetime import datetime
 from collections import Counter, defaultdict
+from datetime import datetime
 
 # --- CONFIGURATION ---
 SYMBOL = "ETHUSDT"
-TARGET_INTERVAL = "60m" # Using the key from 26's TIMEFRAMES logic (60m = 1h)
-START_DATE = "2020-01-01"
-BASE_INTERVAL = "15m"   # Download base data like in 26
+INTERVAL = "1h"
+START_DATE = "2020-01-01" 
 
-# Timeframe mapping (for resampling)
-TIMEFRAMES = {
-    "15m": None,
-    "30m": "30min",
-    "60m": "1h",
-    "240m": "4h",
-    "1d": "1D"
-}
-
-# --- 1. DATA FETCHING (Logic from 26) ---
-
-def get_binance_data(symbol, start_str=START_DATE):
-    """Fetches raw 15m data to be resampled, ensuring consistency."""
-    print(f"\n[{symbol}] Fetching raw {BASE_INTERVAL} data from {start_str}...")
+def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE):
+    """Fetches historical kline data from Binance public API."""
+    print(f"\n--- Fetching {symbol} {interval} data from Binance (Once) ---")
+    
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ts = int(time.time() * 1000)
-    all_candles = []
+    
+    all_prices = []
     current_start = start_ts
+    total_time = end_ts - start_ts
     
     while current_start < end_ts:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={BASE_INTERVAL}&startTime={current_start}&limit=1000"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&startTime={current_start}&limit=1000"
         try:
             with urllib.request.urlopen(url) as response:
                 data = json.loads(response.read().decode())
-                if not data: break
-                # Extract close price (index 4) and close time (index 6)
-                batch = [(int(c[6]), float(c[4])) for c in data]
-                all_candles.extend(batch)
+                if not data:
+                    break
+                
+                batch_prices = [float(candle[4]) for candle in data]
+                all_prices.extend(batch_prices)
                 current_start = data[-1][6] + 1
                 
-                # Simple progress
-                sys.stdout.write(f"\rDownloaded {len(all_candles)} raw candles...")
+                progress = (current_start - start_ts) / total_time
+                sys.stdout.write(f"\rDownload Progress: [{int(progress*20)*'#'}{(20-int(progress*20))*'-'}] {len(all_prices)} candles")
                 sys.stdout.flush()
+                
         except Exception as e:
-            print(f"Error fetching: {e}")
+            print(f"\nError fetching data: {e}")
             break
             
-    print(f"\n[{symbol}] Total raw candles: {len(all_candles)}")
-    return all_candles
-
-def resample_prices(raw_data, target_freq):
-    """Resamples raw data to target frequency using Pandas."""
-    if target_freq is None: return [x[1] for x in raw_data]
-    
-    df = pd.DataFrame(raw_data, columns=['timestamp', 'price'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    
-    # Resample using 'last' (close price logic)
-    resampled = df['price'].resample(target_freq).last().dropna()
-    return resampled.tolist()
-
-# --- 2. CORE STRATEGY LOGIC (Updated to 26's Fixed Logic) ---
+    print(f"\nTotal data points fetched: {len(all_prices)}")
+    return all_prices
 
 def get_bucket(price, bucket_size):
-    if price >= 0: return (int(price) // bucket_size) + 1
-    else: return (int(price + 1) // bucket_size) - 1
+    """Converts price to variable bucket size."""
+    if price >= 0:
+        return (int(price) // bucket_size) + 1
+    else:
+        return (int(price + 1) // bucket_size) - 1
 
 def train_models(train_buckets, seq_len):
-    """
-    Train models using the fixed indexing from 26.
-    """
+    """Helper to train models and return the maps."""
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
     
     for i in range(len(train_buckets) - seq_len):
-        # 1. Absolute Sequence
         a_seq = tuple(train_buckets[i : i + seq_len])
         a_succ = train_buckets[i + seq_len]
         abs_map[a_seq][a_succ] += 1
         
-        # 2. Derivative Sequence (FIXED LOGIC)
-        # We start at i+1 to perform internal diffs only (buckets[i+1] - buckets[i])
-        d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i + 1, i + seq_len))
-        
-        d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
-        der_map[d_seq][d_succ] += 1
+        if i > 0:
+            d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i, i + seq_len))
+            d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
+            der_map[d_seq][d_succ] += 1
             
     return abs_map, der_map
 
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val, all_vals, all_changes):
+    """Helper to get a single prediction based on model type."""
+    
     if model_type == "Absolute":
-        if a_seq in abs_map: return abs_map[a_seq].most_common(1)[0][0]
+        if a_seq in abs_map:
+            return abs_map[a_seq].most_common(1)[0][0]
         return random.choice(all_vals)
         
     elif model_type == "Derivative":
-        if d_seq in der_map: pred_change = der_map[d_seq].most_common(1)[0][0]
-        else: pred_change = random.choice(all_changes)
+        if d_seq in der_map:
+            pred_change = der_map[d_seq].most_common(1)[0][0]
+        else:
+            pred_change = random.choice(all_changes)
         return last_val + pred_change
         
     elif model_type == "Combined":
-        abs_cand = abs_map.get(a_seq, Counter())
-        der_cand = der_map.get(d_seq, Counter())
+        abs_candidates = abs_map.get(a_seq, Counter())
+        der_candidates = der_map.get(d_seq, Counter())
         
-        poss = set(abs_cand.keys())
-        for c in der_cand.keys(): poss.add(last_val + c)
+        possible_next_vals = set(abs_candidates.keys())
+        for change in der_candidates.keys():
+            possible_next_vals.add(last_val + change)
+            
+        if not possible_next_vals:
+            return random.choice(all_vals)
         
-        if not poss: return random.choice(all_vals)
-        
-        best, max_s = None, -1
-        for v in poss:
-            # Add votes from absolute expert + votes from derivative expert
-            s = abs_cand[v] + der_cand[v - last_val]
-            if s > max_s: max_s, best = s, v
-        return best
+        best_val = None
+        max_combined_score = -1
+        for val in possible_next_vals:
+            implied_change = val - last_val
+            score = abs_candidates[val] + der_candidates[implied_change]
+            if score > max_combined_score:
+                max_combined_score = score
+                best_val = val
+        return best_val
+    
     return last_val
 
 def evaluate_parameters(prices, bucket_size, seq_len):
     """
-    Evaluates config using the fixed indexing logic.
+    Runs analysis. Returns stats for ALL 3 models so we can pick the best.
     """
     buckets = [get_bucket(p, bucket_size) for p in prices]
     split_idx = int(len(buckets) * 0.7)
-    train = buckets[:split_idx]
-    test = buckets[split_idx:]
+    train_buckets = buckets[:split_idx]
+    test_buckets = buckets[split_idx:]
     
-    if len(train) < seq_len + 10: return 0, "None", 0
+    all_train_values = list(set(train_buckets))
+    all_train_changes = list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
+
+    abs_map, der_map = train_models(train_buckets, seq_len)
+
+    # Stats: [correct_count, valid_total_count]
+    stats = {"Absolute": [0, 0], "Derivative": [0, 0], "Combined": [0, 0]}
     
-    all_vals = list(set(train))
-    all_changes = list(set(train[j] - train[j-1] for j in range(1, len(train))))
-    abs_map, der_map = train_models(train, seq_len)
+    total_samples = len(test_buckets) - seq_len
     
-    stats = {"Absolute": [0,0], "Derivative": [0,0], "Combined": [0,0]}
-    
-    for i in range(len(test) - seq_len):
-        curr = split_idx + i
-        a_seq = tuple(buckets[curr : curr+seq_len])
-        
-        # FIX: range(curr + 1, ...) ensures we don't look back before the window
-        d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr + 1, curr+seq_len))
-        
+    for i in range(total_samples):
+        curr_idx = split_idx + i
+        a_seq = tuple(buckets[curr_idx : curr_idx + seq_len])
+        d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_idx, curr_idx + seq_len))
         last_val = a_seq[-1]
-        actual_val = buckets[curr+seq_len]
-        act_diff = actual_val - last_val
-        
-        p_abs = get_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val, all_vals, all_changes)
-        p_der = get_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val, all_vals, all_changes)
-        p_comb = get_prediction("Combined", abs_map, der_map, a_seq, d_seq, last_val, all_vals, all_changes)
-        
+        actual_val = buckets[curr_idx + seq_len]
+        actual_diff = actual_val - last_val
+
+        # Get predictions
+        p_abs = get_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val, all_train_values, all_train_changes)
+        p_der = get_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val, all_train_values, all_train_changes)
+        p_comb = get_prediction("Combined", abs_map, der_map, a_seq, d_seq, last_val, all_train_values, all_train_changes)
+
         for name, pred in [("Absolute", p_abs), ("Derivative", p_der), ("Combined", p_comb)]:
-            p_diff = pred - last_val
-            if p_diff != 0 and act_diff != 0:
+            pred_diff = pred - last_val
+            if pred_diff != 0 and actual_diff != 0:
                 stats[name][1] += 1
-                if (p_diff > 0 and act_diff > 0) or (p_diff < 0 and act_diff < 0):
+                if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
                     stats[name][0] += 1
-                    
-    best_acc, best_name, best_trades = -1, "None", 0
-    for name, (corr, tot) in stats.items():
-        if tot > 0:
-            acc = (corr/tot)*100
-            if acc > best_acc: best_acc, best_name, best_trades = acc, name, tot
-            
-    return best_acc, best_name, best_trades
+
+    # Return best
+    best_acc = -1
+    best_model = "None"
+    best_trades = 0
+    for name, (correct, total) in stats.items():
+        if total > 0:
+            acc = (correct / total) * 100
+            if acc > best_acc:
+                best_acc = acc
+                best_model = name
+                best_trades = total
+    
+    return best_acc, best_model, best_trades
 
 def run_portfolio_analysis(prices, top_configs):
     """
-    Runs the portfolio analysis (from 27) but using the FIXED sequence logic (from 26).
+    Runs the 'Union' strategy on the top 3 configurations.
     """
     print(f"\n--- Running Portfolio Analysis (Union of Top {len(top_configs)}) ---")
     
+    # 1. Train all top models
     models = []
     for config in top_configs:
         b_size = config['bucket']
         s_len = config['seq_len']
+        m_type = config['model']
         
+        # Re-process buckets for this specific config
         buckets = [get_bucket(p, b_size) for p in prices]
         split_idx = int(len(buckets) * 0.7)
         train_buckets = buckets[:split_idx]
@@ -186,9 +181,10 @@ def run_portfolio_analysis(prices, top_configs):
         # Train
         abs_map, der_map = train_models(train_buckets, s_len)
         
+        # Store everything needed to predict
         models.append({
             "config": config,
-            "buckets": buckets,
+            "buckets": buckets, # Full bucket list for this config
             "split_idx": split_idx,
             "abs_map": abs_map,
             "der_map": der_map,
@@ -196,8 +192,16 @@ def run_portfolio_analysis(prices, top_configs):
             "all_changes": list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
         })
 
+    # 2. Iterate through TEST time (aligned by raw price index)
+    # We must iterate by raw index to ensure time alignment across different bucket sizes
+    
+    # Determine the start index for testing (max split_idx of all models to be safe/aligned)
+    # Actually, all use same 0.7 split, so split_idx depends on len(buckets). 
+    # Since prices len is const, len(buckets) is const. split_idx is const.
     start_test_idx = models[0]['split_idx']
     max_seq_len = max(m['config']['seq_len'] for m in models)
+    
+    # Effective range
     total_test_len = len(models[0]['buckets']) - start_test_idx - max_seq_len
     
     unique_correct = 0
@@ -206,23 +210,43 @@ def run_portfolio_analysis(prices, top_configs):
     print(f"Scanning {total_test_len} time steps for combined signals...")
     
     for i in range(total_test_len):
+        # Raw index in the test set
         curr_raw_idx = start_test_idx + i
-        active_directions = []
         
+        active_directions = [] # Stores 1 (Up) or -1 (Down)
+        
+        actual_move_direction = 0 # 1, -1, or 0
+        
+        # Check each model
         for model in models:
             c = model['config']
             seq_len = c['seq_len']
             buckets = model['buckets']
             
-            # Sequence Generation (FIXED)
-            a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
-            d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_raw_idx + 1, curr_raw_idx + seq_len))
+            # Context for this model
+            # Note: curr_raw_idx is the index of the "current" candle. We predict next.
             
+            # Need to be careful with index alignment. 
+            # In evaluate(), we did: range(total_samples). curr_idx = split + i.
+            # a_seq = buckets[curr_idx : curr_idx+seq] -> predicts buckets[curr_idx+seq]
+            # Here we do the same.
+            
+            a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
+            d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_raw_idx, curr_raw_idx + seq_len))
             last_val = a_seq[-1]
             actual_val = buckets[curr_raw_idx + seq_len]
             
+            # Determine actual move for this specific bucket size
             diff = actual_val - last_val
-            model_actual_dir = 1 if diff > 0 else -1 if diff < 0 else 0
+            if diff > 0: model_actual_dir = 1
+            elif diff < 0: model_actual_dir = -1
+            else: model_actual_dir = 0
+            
+            # We only really care if the market actually moved in "Reality".
+            # But "Reality" is subjective to bucket size.
+            # However, for the "Trade" to be valid, we usually compare against that specific model's reality.
+            # BUT, for a portfolio, we need a ground truth. 
+            # Let's assume: If the model predicts UP, and in its OWN bucket system it went UP, it's correct.
             
             pred_val = get_prediction(c['model'], model['abs_map'], model['der_map'], 
                                       a_seq, d_seq, last_val, model['all_vals'], model['all_changes'])
@@ -231,6 +255,9 @@ def run_portfolio_analysis(prices, top_configs):
             
             if pred_diff != 0:
                 direction = 1 if pred_diff > 0 else -1
+                
+                # Check if this specific prediction would be correct
+                # (We don't count it yet, just store the signal)
                 is_correct = (direction == model_actual_dir)
                 is_flat = (model_actual_dir == 0)
                 
@@ -241,16 +268,56 @@ def run_portfolio_analysis(prices, top_configs):
                 })
 
         # --- Aggregate Signals ---
-        if not active_directions: continue
+        if not active_directions:
+            continue
             
+        # Extract just the directions (1 or -1)
         dirs = [x['dir'] for x in active_directions]
         
-        # Conflict Check
-        if (1 in dirs) and (-1 in dirs): continue
+        # Check for Conflict
+        has_up = 1 in dirs
+        has_down = -1 in dirs
+        
+        if has_up and has_down:
+            # Conflict: Skip trade (Safety)
+            continue
             
-        # Directional Accuracy Check
+        # No conflict, we have a signal.
+        # Now, was it correct?
+        # If we have multiple agreeing signals, they are 1 unique trade.
+        # Is it "Correct" if ANY of them are correct? Or if the consensus is correct?
+        # Since they agree on direction, we just need to know if the market moved that way.
+        # But different bucket sizes might disagree on "Actual" move (rare but possible near edges).
+        # Let's use majority vote on "is_correct".
+        # Actually, simpler: If the Models agree UP, did the price go UP?
+        # We need a universal ground truth for the result.
+        # Let's use the raw price change.
+        
+        # Raw Price Check
+        raw_current = prices[curr_raw_idx + max_seq_len - 1] # Approximate alignment
+        # This is getting messy due to sequence length offsets. 
+        # Let's stick to the model's own boolean "is_correct".
+        
+        # If models agree on Direction, they *should* agree on outcome unless bucket boundaries differ.
+        # If ANY of the agreeing models was correct, we count it as a correct trade? 
+        # Or do we penalize if it was flat?
+        
+        # Logic: 
+        # 1. Prediction is UNANIMOUS (after filtering conflicts).
+        # 2. We count this as 1 Unique Trade.
+        # 3. It is CORRECT if the majority of the involved models flagged it as correct.
+        #    (e.g. Model A(Bucket10) says Up->Correct. Model B(Bucket100) says Up->Flat. Result = Mixed)
+        #    Let's be strict: It is correct if AT LEAST ONE model was correct AND NONE were "Wrong" (Opposite).
+        #    (Flat is usually ignored in Directional Accuracy, but here we count valid trades).
+        
+        # Let's use the "Directional Accuracy" definition:
+        # Denominator: Market actually moved (in at least one bucket scale).
+        # Numerator: Prediction matched direction.
+        
         any_correct = any(x['is_correct'] for x in active_directions)
         any_wrong_direction = any((not x['is_correct'] and not x['is_flat']) for x in active_directions)
+        
+        # If the market was flat for ALL models, we ignore this sample (not a valid directional test).
         all_flat = all(x['is_flat'] for x in active_directions)
         
         if not all_flat:
@@ -261,24 +328,11 @@ def run_portfolio_analysis(prices, top_configs):
     return unique_correct, unique_total
 
 def run_grid_search():
-    # 1. Fetch Raw Data
-    raw_candles = get_binance_data(SYMBOL)
-    if not raw_candles: return
+    prices = get_binance_data()
+    if len(prices) < 500: return
 
-    # 2. Resample (Using logic from 26)
-    target_pd_freq = TIMEFRAMES.get(TARGET_INTERVAL, "1h")
-    print(f"Resampling to {TARGET_INTERVAL} ({target_pd_freq})...")
-    prices = resample_prices(raw_candles, target_pd_freq)
-    
-    if len(prices) < 500:
-        print("Not enough data after resampling.")
-        return
-
-    # 3. Dynamic Grid Setup
-    avg_price = sum(prices) / len(prices)
-    base_step = max(1, int(avg_price * 0.001)) # 0.1% base step
-    # Generates 10 bucket sizes scaling up
-    bucket_sizes = [base_step * i for i in range(1, 11)] 
+    # Grid
+    bucket_sizes = list(range(100, 9, -10))
     seq_lengths = [3, 4, 5, 6]
     
     results = []
@@ -290,7 +344,7 @@ def run_grid_search():
     for b_size in bucket_sizes:
         for s_len in seq_lengths:
             accuracy, model_name, trades = evaluate_parameters(prices, b_size, s_len)
-            if trades > 20: 
+            if trades > 30: # Lowered threshold slightly to allow more candidates
                 results.append({
                     "bucket": b_size,
                     "seq_len": s_len,
@@ -320,7 +374,7 @@ def run_grid_search():
             print(f"Combined Unique Trades: {u_total}")
             print(f"Combined Accuracy:      {(u_correct/u_total)*100:.2f}%")
         else:
-            print("No unique trades found.")
+            print("No unique trades found (Models might be conflicting or silence each other).")
 
 if __name__ == "__main__":
     run_grid_search()
