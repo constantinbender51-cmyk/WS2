@@ -57,15 +57,19 @@ def train_models(train_buckets, seq_len):
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
     
-    for i in range(len(train_buckets) - seq_len):
+    # We start at 1 so we can compute the first derivative for the sequence start
+    for i in range(1, len(train_buckets) - seq_len):
+        # Absolute Sequence
         a_seq = tuple(train_buckets[i : i + seq_len])
         a_succ = train_buckets[i + seq_len]
         abs_map[a_seq][a_succ] += 1
         
-        if i > 0:
-            d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i, i + seq_len))
-            d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
-            der_map[d_seq][d_succ] += 1
+        # Derivative Sequence
+        # d_seq captures the changes leading up to the last known value
+        d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i, i + seq_len))
+        # d_succ is the change from the last known value to the next value
+        d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
+        der_map[d_seq][d_succ] += 1
             
     return abs_map, der_map
 
@@ -85,9 +89,16 @@ def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val, all_val
         return last_val + pred_change
         
     elif model_type == "Combined":
+        # --- LOGIC UPDATE START ---
+        
+        # 1. Get candidates from the Absolute Sequence Map
         abs_candidates = abs_map.get(a_seq, Counter())
+        
+        # 2. Get candidates from the Derivative Map
         der_candidates = der_map.get(d_seq, Counter())
         
+        # Create a set of ALL possible next values from both models
+        # (Union of Absolute predictions and Derivative predictions converted to absolute values)
         possible_next_vals = set(abs_candidates.keys())
         for change in der_candidates.keys():
             possible_next_vals.add(last_val + change)
@@ -97,13 +108,29 @@ def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val, all_val
         
         best_val = None
         max_combined_score = -1
+        
+        # Iterate through all unique candidates to find the one with the highest combined count
         for val in possible_next_vals:
+            # Step 1: Use the sequence + prediction count (Absolute Count)
+            count_abs = abs_candidates[val] # Returns 0 if not found
+            
+            # Step 2: Compute the derivative of the absolute sequence + prediction
+            # The 'derivative sequence' is already in d_seq.
+            # We need the 'prediction derivative' (the change):
             implied_change = val - last_val
-            score = abs_candidates[val] + der_candidates[implied_change]
-            if score > max_combined_score:
-                max_combined_score = score
+            
+            # Step 3: Add the count of this sequence in the derivative map
+            count_der = der_candidates[implied_change] # Returns 0 if not found
+            
+            total_score = count_abs + count_der
+            
+            # Step 4: The combined model selects the prediction with the highest count
+            if total_score > max_combined_score:
+                max_combined_score = total_score
                 best_val = val
+                
         return best_val
+        # --- LOGIC UPDATE END ---
     
     return last_val
 
@@ -193,11 +220,6 @@ def run_portfolio_analysis(prices, top_configs):
         })
 
     # 2. Iterate through TEST time (aligned by raw price index)
-    # We must iterate by raw index to ensure time alignment across different bucket sizes
-    
-    # Determine the start index for testing (max split_idx of all models to be safe/aligned)
-    # Actually, all use same 0.7 split, so split_idx depends on len(buckets). 
-    # Since prices len is const, len(buckets) is const. split_idx is const.
     start_test_idx = models[0]['split_idx']
     max_seq_len = max(m['config']['seq_len'] for m in models)
     
@@ -223,14 +245,6 @@ def run_portfolio_analysis(prices, top_configs):
             seq_len = c['seq_len']
             buckets = model['buckets']
             
-            # Context for this model
-            # Note: curr_raw_idx is the index of the "current" candle. We predict next.
-            
-            # Need to be careful with index alignment. 
-            # In evaluate(), we did: range(total_samples). curr_idx = split + i.
-            # a_seq = buckets[curr_idx : curr_idx+seq] -> predicts buckets[curr_idx+seq]
-            # Here we do the same.
-            
             a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
             d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_raw_idx, curr_raw_idx + seq_len))
             last_val = a_seq[-1]
@@ -242,12 +256,6 @@ def run_portfolio_analysis(prices, top_configs):
             elif diff < 0: model_actual_dir = -1
             else: model_actual_dir = 0
             
-            # We only really care if the market actually moved in "Reality".
-            # But "Reality" is subjective to bucket size.
-            # However, for the "Trade" to be valid, we usually compare against that specific model's reality.
-            # BUT, for a portfolio, we need a ground truth. 
-            # Let's assume: If the model predicts UP, and in its OWN bucket system it went UP, it's correct.
-            
             pred_val = get_prediction(c['model'], model['abs_map'], model['der_map'], 
                                       a_seq, d_seq, last_val, model['all_vals'], model['all_changes'])
             
@@ -256,8 +264,6 @@ def run_portfolio_analysis(prices, top_configs):
             if pred_diff != 0:
                 direction = 1 if pred_diff > 0 else -1
                 
-                # Check if this specific prediction would be correct
-                # (We don't count it yet, just store the signal)
                 is_correct = (direction == model_actual_dir)
                 is_flat = (model_actual_dir == 0)
                 
@@ -279,45 +285,11 @@ def run_portfolio_analysis(prices, top_configs):
         has_down = -1 in dirs
         
         if has_up and has_down:
-            # Conflict: Skip trade (Safety)
-            continue
+            continue # Conflict
             
-        # No conflict, we have a signal.
-        # Now, was it correct?
-        # If we have multiple agreeing signals, they are 1 unique trade.
-        # Is it "Correct" if ANY of them are correct? Or if the consensus is correct?
-        # Since they agree on direction, we just need to know if the market moved that way.
-        # But different bucket sizes might disagree on "Actual" move (rare but possible near edges).
-        # Let's use majority vote on "is_correct".
-        # Actually, simpler: If the Models agree UP, did the price go UP?
-        # We need a universal ground truth for the result.
-        # Let's use the raw price change.
-        
-        # Raw Price Check
-        raw_current = prices[curr_raw_idx + max_seq_len - 1] # Approximate alignment
-        # This is getting messy due to sequence length offsets. 
-        # Let's stick to the model's own boolean "is_correct".
-        
-        # If models agree on Direction, they *should* agree on outcome unless bucket boundaries differ.
-        # If ANY of the agreeing models was correct, we count it as a correct trade? 
-        # Or do we penalize if it was flat?
-        
-        # Logic: 
-        # 1. Prediction is UNANIMOUS (after filtering conflicts).
-        # 2. We count this as 1 Unique Trade.
-        # 3. It is CORRECT if the majority of the involved models flagged it as correct.
-        #    (e.g. Model A(Bucket10) says Up->Correct. Model B(Bucket100) says Up->Flat. Result = Mixed)
-        #    Let's be strict: It is correct if AT LEAST ONE model was correct AND NONE were "Wrong" (Opposite).
-        #    (Flat is usually ignored in Directional Accuracy, but here we count valid trades).
-        
-        # Let's use the "Directional Accuracy" definition:
-        # Denominator: Market actually moved (in at least one bucket scale).
-        # Numerator: Prediction matched direction.
-        
         any_correct = any(x['is_correct'] for x in active_directions)
         any_wrong_direction = any((not x['is_correct'] and not x['is_flat']) for x in active_directions)
         
-        # If the market was flat for ALL models, we ignore this sample (not a valid directional test).
         all_flat = all(x['is_flat'] for x in active_directions)
         
         if not all_flat:
@@ -344,7 +316,7 @@ def run_grid_search():
     for b_size in bucket_sizes:
         for s_len in seq_lengths:
             accuracy, model_name, trades = evaluate_parameters(prices, b_size, s_len)
-            if trades > 30: # Lowered threshold slightly to allow more candidates
+            if trades > 30: # Threshold
                 results.append({
                     "bucket": b_size,
                     "seq_len": s_len,
