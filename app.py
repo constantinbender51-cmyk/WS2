@@ -1,51 +1,32 @@
-#!/usr/bin/env python3
-"""
-Octopus: Multi-Strategy Aggregator & Execution Engine for Kraken Futures.
-"""
-
 import os
 import sys
 import time
 import json
-import math
-import base64
-import logging
-import threading
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta
+import matplotlib.pyplot as plt
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple, Any, Optional
-
-# --- Local Imports ---
-try:
-    from kraken_futures import KrakenFuturesApi
-    import stress_test  # Import the new stress test module
-except ImportError as e:
-    print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' and 'stress_test.py' are in the directory.")
-    sys.exit(1)
+from datetime import datetime, timezone, timedelta
 
 # --- Configuration ---
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-# API Keys
-KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
-KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
-GITHUB_PAT = os.getenv("PAT")
-
-# Global Settings
-LEVERAGE = 2.0  # Global leverage setting
+# 1. Environment & Auth
 REPO_OWNER = "constantinbender51-cmyk"
 REPO_NAME = "Models"
-GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
+GITHUB_PAT = os.getenv("PAT") or os.getenv("GITHUB_TOKEN")
 
-# Asset Mapping (Binance USDT -> Kraken Futures Perpetual)
+# 2. Data Scope (Full History)
+# We fetch ALL data from 2020 to Now.
+# The script will calculate the 70% cutoff automatically.
+START_DATE = "2020-01-01" 
+END_DATE = datetime.now().strftime("%Y-%m-%d") # Today
+
+# 3. Backtest Settings
+INITIAL_CAPITAL = 10000.0
+LEVERAGE = 2.0
+TRAIN_SPLIT = 0.70  # First 70% is Training, last 30% is Unseen (Trading)
+
+# 4. Asset Mapping
 SYMBOL_MAP = {
     "BTCUSDT": "ff_xbtusd_260327",
     "ETHUSDT": "pf_ethusd",
@@ -57,27 +38,10 @@ SYMBOL_MAP = {
     "AVAXUSDT": "pf_avaxusd",
     "DOTUSDT": "pf_dotusd",
     "LINKUSDT": "pf_linkusd",
-    # Add others if needed
 }
 
-# Reverse map for logging
-REVERSE_MAP = {v: k for k, v in SYMBOL_MAP.items()}
-
-# Logging Setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("octopus.log"), logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("Octopus")
-
-# --- Helper Classes ---
-
+# --- Strategy Logic (Standard) ---
 class Strategy:
-    """
-    Represents a single loaded strategy (Asset + Timeframe).
-    Holds the model logic (Probability Maps) and its current Virtual Position.
-    """
     def __init__(self, asset: str, timeframe: str, config: dict):
         self.asset = asset
         self.timeframe = timeframe
@@ -86,25 +50,15 @@ class Strategy:
         self.seq_len = config['seq_len']
         self.model_type = config['model_type']
         
-        # State
-        self.virtual_position = 0.0  # The position this strategy *wants* to hold
+        self.virtual_position = 0.0
         self.abs_map = defaultdict(Counter)
         self.der_map = defaultdict(Counter)
-        self.all_vals = []
-        self.all_changes = []
-        
-        # Identity
         self.id = f"{asset}_{timeframe}"
 
-    def train(self, prices: List[float]):
-        """Rebuilds the probability maps based on provided historical prices."""
+    def train(self, prices):
+        """Builds the Probability Map from historical prices."""
         buckets = [self._get_bucket(p) for p in prices]
-        
-        if len(buckets) < self.seq_len + 10:
-            return # Not enough data
-            
-        self.all_vals = list(set(buckets))
-        self.all_changes = list(set(buckets[j] - buckets[j-1] for j in range(1, len(buckets))))
+        if len(buckets) < self.seq_len + 10: return
         
         self.abs_map.clear()
         self.der_map.clear()
@@ -119,32 +73,16 @@ class Strategy:
                 d_succ = buckets[i + self.seq_len] - buckets[i + self.seq_len - 1]
                 self.der_map[d_seq][d_succ] += 1
 
-    def predict(self, recent_prices: List[float]) -> int:
-        """Returns signal: 1 (Buy), -1 (Sell), 0 (Flat/Neutral)."""
-        # We need seq_len + 1 data points to generate seq_len differences
-        # to match the logic in app.py where it uses a lookback to start the sequence.
-        if len(recent_prices) < self.seq_len + 1:
-            return 0
-            
+    def predict(self, recent_prices) -> int:
+        if len(recent_prices) < self.seq_len + 1: return 0
         buckets = [self._get_bucket(p) for p in recent_prices]
-        
-        # FIX: Fetch seq_len + 1 buckets to capture the leading derivative
-        # If seq_len is 3, we grab 4 items: [Preceding, A, B, C]
         window = buckets[-(self.seq_len + 1):] 
         
-        # Absolute sequence uses the LAST seq_len items (ignoring the extra old one)
-        # Result: [A, B, C]
         a_seq = tuple(window[1:]) 
-        
-        # Derivative sequence uses ALL items to create differences
-        # (A-Preceding), (B-A), (C-B) -> Length 3
         d_seq = tuple(window[j] - window[j-1] for j in range(1, len(window)))
-        
         last_val = window[-1]
         
-        # Get Prediction Target
         pred_bucket = last_val
-        
         if self.model_type == "Absolute":
             if a_seq in self.abs_map:
                 pred_bucket = self.abs_map[a_seq].most_common(1)[0][0]
@@ -153,492 +91,227 @@ class Strategy:
                 change = self.der_map[d_seq].most_common(1)[0][0]
                 pred_bucket = last_val + change
         elif self.model_type == "Combined":
-            # (Simplified logic for brevity, matching training logic)
             abs_cand = self.abs_map.get(a_seq, Counter())
             der_cand = self.der_map.get(d_seq, Counter())
             poss = set(abs_cand.keys())
             for c in der_cand.keys(): poss.add(last_val + c)
-            
             best, max_s = last_val, -1
             for v in poss:
                 s = abs_cand[v] + der_cand[v - last_val]
                 if s > max_s: max_s, best = s, v
             pred_bucket = best
 
-        # Signal Logic
         if pred_bucket > last_val: return 1
         elif pred_bucket < last_val: return -1
         else: return 0
 
     def _get_bucket(self, price: float) -> int:
-        if price >= 0:
-            return (int(price) // self.bucket_size) + 1
-        else:
-            return (int(price + 1) // self.bucket_size) - 1
+        if price >= 0: return (int(price) // self.bucket_size) + 1
+        else: return (int(price + 1) // self.bucket_size) - 1
 
-
-class Octopus:
+# --- Out-of-Sample Backtester ---
+class OOSBacktester:
     def __init__(self):
-        self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.strategies: Dict[str, Strategy] = {}
-        self.price_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list) # Asset -> [(ts, price)]
-        self.executor = ThreadPoolExecutor(max_workers=5) # Parallel execution
-        self.total_strategies_count = 0
-        self.instrument_specs = {} # Store lotSize and tickSize
+        self.strategies = {}
+        self.data_store = {} 
+        self.portfolio = {
+            "cash": INITIAL_CAPITAL,
+            "holdings": {k: 0.0 for k in SYMBOL_MAP.keys()},
+            "equity_history": [],
+            "ts_history": []
+        }
+        self.split_timestamp = None
 
-    # --- Initialization ---
-    def initialize(self):
-        logger.info("Initializing Octopus...")
-        
-        # 0. Fetch Instrument Specs (Critical for correct sizing)
-        self._fetch_instrument_specs()
-        
-        # --- STRESS TEST INJECTION ---
-        logger.info("Executing Startup Stress Test...")
-        stress_test.run_stress_test(
-            self.kf, 
-            SYMBOL_MAP, 
-            LEVERAGE, 
-            REPO_OWNER, 
-            REPO_NAME, 
-            GITHUB_PAT
-        )
-        logger.info("Stress Test Completed. Proceeding with Normal Boot.")
-        # -----------------------------
-
-        self._load_strategies_from_github()
-        self._fetch_initial_data()
-        self._train_all_strategies()
-        logger.info("Initialization Complete. Entering Wait Loop.")
-
-    def _fetch_instrument_specs(self):
-        """Fetches tick size and lot size for all instruments to prevent invalidSize errors."""
-        try:
-            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            resp = requests.get(url).json()
-            if "instruments" in resp:
-                for inst in resp["instruments"]:
-                    sym = inst["symbol"].lower()
-                    self.instrument_specs[sym] = {
-                        "lotSize": float(inst.get("lotSize", 1.0)),
-                        "tickSize": float(inst.get("tickSize", 0.1)),
-                        "contractSize": float(inst.get("contractSize", 1.0))
-                    }
-                logger.info(f"Loaded specs for {len(self.instrument_specs)} instruments.")
-            else:
-                logger.error("Failed to load instrument specs (no 'instruments' in response).")
-        except Exception as e:
-            logger.error(f"Error fetching instrument specs: {e}")
-
-    def _load_strategies_from_github(self):
-        """Downloads all JSON strategy files from the repo."""
+    def load_strategies(self):
+        """Downloads configs from GitHub."""
         if not GITHUB_PAT:
-            logger.error("No GitHub PAT found. Cannot load strategies.")
-            return
+            print("CRITICAL: No GITHUB_PAT found.")
+            sys.exit(1)
 
+        url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
         headers = {"Authorization": f"Bearer {GITHUB_PAT}"}
+        
         try:
-            resp = requests.get(GITHUB_API_URL, headers=headers)
+            resp = requests.get(url, headers=headers)
             resp.raise_for_status()
             files = resp.json()
             
             count = 0
             for f in files:
                 if f['name'].endswith(".json"):
-                    # Download content
-                    content_resp = requests.get(f['download_url'])
-                    data = content_resp.json()
-                    
-                    # Parse filename: ASSET_TIMEFRAME.json
-                    # But config is inside.
+                    data = requests.get(f['download_url'], headers=headers).json()
                     asset = data['asset']
                     tf = data['timeframe']
-                    
-                    # Pick best strategy from the union
-                    best_strat = data['strategy_union'][0] # Top 1 is best
-                    
-                    s = Strategy(asset, tf, best_strat)
-                    self.strategies[s.id] = s
-                    count += 1
-            
-            self.total_strategies_count = count
-            logger.info(f"Loaded {count} strategies from GitHub.")
-            
+                    if asset in SYMBOL_MAP:
+                        best_strat = data['strategy_union'][0]
+                        s = Strategy(asset, tf, best_strat)
+                        self.strategies[s.id] = s
+                        count += 1
+            print(f"Loaded {count} strategies.")
         except Exception as e:
-            logger.error(f"Failed to load strategies: {e}")
+            print(f"Error loading strategies: {e}")
+            sys.exit(1)
 
-    def _fetch_initial_data(self):
-        """Fetches all 15m data since 2020 for all active assets from Binance."""
+    def fetch_full_history(self):
+        """Fetches full history (2020-Now) to establish the split."""
         active_assets = set(s.asset for s in self.strategies.values())
-        logger.info(f"Fetching historical data for {len(active_assets)} assets (Since 2020)...")
+        print(f"Fetching full history (2020 - Now) for {len(active_assets)} assets...")
         
-        # 2020-01-01 00:00:00 UTC timestamp in milliseconds
-        start_timestamp_2020 = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        start_ts = int(datetime.strptime(START_DATE, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+        end_ts = int(datetime.now().replace(tzinfo=timezone.utc).timestamp() * 1000)
         
         for asset in active_assets:
-            try:
-                # Binance requires Symbol, e.g. BTCUSDT
-                url = "https://api.binance.com/api/v3/klines"
-                
+            filename = f"full_data_{asset}.csv"
+            
+            if os.path.exists(filename):
+                df = pd.read_csv(filename)
+                df['ts'] = pd.to_datetime(df['ts'])
+            else:
+                print(f"Downloading {asset} (This may take a minute)...")
                 all_candles = []
-                current_start = start_timestamp_2020
-                
-                while True:
-                    params = {
-                        "symbol": asset, 
-                        "interval": "15m", 
-                        "limit": 1000,
-                        "startTime": current_start
-                    }
-                    
+                current = start_ts
+                while current < end_ts:
+                    url = "https://api.binance.com/api/v3/klines"
+                    params = {"symbol": asset, "interval": "15m", "limit": 1000, "startTime": current}
                     r = requests.get(url, params=params)
                     data = r.json()
-                    
-                    if not data or not isinstance(data, list):
-                        break
-                        
+                    if not data: break
                     all_candles.extend(data)
-                    
-                    # Check if we reached the end (fewer than limit returned)
-                    if len(data) < 1000:
-                        break
-                        
-                    # Update start time for next batch
-                    # Index 6 is Close Time. We want next candle, so +1ms
-                    last_close_time = int(data[-1][6])
-                    current_start = last_close_time + 1
-                    
-                    # Rate limit safety
-                    time.sleep(0.1)
+                    current = int(data[-1][6]) + 1
+                    time.sleep(0.05)
                 
-                # Store (Time, Close) -> Index 6 is Close Time, Index 4 is Close Price
-                self.price_history[asset] = [(int(x[6]), float(x[4])) for x in all_candles]
-                logger.info(f"Loaded {len(all_candles)} candles for {asset} since 2020")
-                
-            except Exception as e:
-                logger.error(f"Error fetching data for {asset}: {e}")
-
-    def _train_all_strategies(self):
-        """Resamples data and trains every strategy."""
-        logger.info("Training strategies...")
-        for s_id, strat in self.strategies.items():
-            # 1. Get raw 15m data
-            raw = self.price_history[strat.asset]
-            if not raw: continue
+                df = pd.DataFrame(all_candles, columns=['ot','o','h','l','c','v','ct','q','n','tb','tq','i'])
+                df['ts'] = pd.to_datetime(df['ct'], unit='ms')
+                df['price'] = df['c'].astype(float)
+                df = df[['ts', 'price']]
+                df.to_csv(filename, index=False)
             
-            # 2. Resample
-            prices = self._resample(raw, strat.timeframe)
+            self.data_store[asset] = df
+
+    def resample(self, df_slice, timeframe):
+        if timeframe == "15m": return df_slice['price'].tolist()
+        rule_map = {"30m": "30min", "60m": "1h", "240m": "4h", "1d": "1D"}
+        temp = df_slice.set_index('ts')
+        return temp['price'].resample(rule_map[timeframe]).last().dropna().tolist()
+
+    def run_oos_test(self):
+        # 1. Align Data
+        common_idx = None
+        for df in self.data_store.values():
+            if common_idx is None: common_idx = df.index
+            else: common_idx = common_idx.intersection(df.index)
+        
+        total_len = len(df) # Approximate length of aligned data
+        split_idx = int(total_len * TRAIN_SPLIT)
+        
+        # Get the timestamp where the "Unseen" period begins
+        # We assume all DataFrames are roughly aligned by row count now
+        # Ideally, we grab the timestamp from the first asset at the split index
+        first_asset = list(self.data_store.keys())[0]
+        self.split_timestamp = self.data_store[first_asset].iloc[split_idx]['ts']
+        
+        print(f"--- SPLIT CALCULATION ---")
+        print(f"Total Candles: {total_len}")
+        print(f"Training Data: First {TRAIN_SPLIT*100}% (approx {split_idx} candles)")
+        print(f"Unseen Data starts at: {self.split_timestamp}")
+        print(f"Backtesting ONLY on Unseen Data...")
+        print(f"-------------------------")
+
+        # 2. Loop strictly through the Unseen portion
+        # We start 'i' at split_idx
+        for i in range(split_idx, total_len):
             
-            # 3. Train
-            strat.train(prices)
-
-    def _resample(self, raw_data: List[Tuple[int, float]], timeframe: str) -> List[float]:
-        """Convert 15m raw data to target timeframe prices."""
-        if timeframe == "15m":
-            return [x[1] for x in raw_data]
+            current_ts = self.data_store[first_asset].iloc[i]['ts']
             
-        # Pandas for complex resampling
-        df = pd.DataFrame(raw_data, columns=['ts', 'price'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        df.set_index('ts', inplace=True)
-        
-        tf_map = {"30m": "30min", "60m": "1h", "240m": "4h", "1d": "1D"}
-        target = tf_map.get(timeframe)
-        
-        if not target: return [x[1] for x in raw_data]
-        
-        # Resample logic: Take last close
-        resampled = df['price'].resample(target).last().dropna()
-        return resampled.tolist()
-
-    def _round_to_step(self, value: float, step: float) -> float:
-        """Helper to round a value to the nearest step increment."""
-        if step == 0:
-            return value
-        
-        rounded = round(value / step) * step
-        
-        # Fix floating point precision artifacts (e.g. 300.2000000004)
-        if isinstance(step, float) and "." in str(step):
-            decimals = len(str(step).split(".")[1])
-            rounded = round(rounded, decimals)
-        elif isinstance(step, int) or step.is_integer():
-            rounded = int(rounded)
+            # --- A. Mark to Market ---
+            equity = self.portfolio["cash"]
+            current_prices = {}
+            for asset, df in self.data_store.items():
+                # Safety check for index bounds
+                if i < len(df):
+                    price = df.iloc[i]['price']
+                    current_prices[asset] = price
+                    equity += self.portfolio["holdings"][asset] * price
             
-        return rounded
-
-    # --- Core Loop Logic ---
-
-    def run(self):
-        while True:
-            now = datetime.now(timezone.utc)
-            minute = now.minute
-            hour = now.hour
+            self.portfolio["equity_history"].append(equity)
+            self.portfolio["ts_history"].append(current_ts)
             
-            # 1. Update Data (Every 15 mins)
-            if minute % 15 == 1: # Run at :01, :16, :31, :46
-                logger.info(f"--- Trigger: {hour:02}:{minute:02} ---")
-                self._update_all_data() # Append latest candle
-                
-                # 2. Determine which TFs to run
-                tfs_to_run = []
-                tfs_to_run.append("15m")
-                
-                if minute == 1 or minute == 31:
-                    tfs_to_run.append("30m")
-                
-                if minute == 1:
-                    tfs_to_run.append("60m")
-                    if hour % 4 == 0: tfs_to_run.append("240m")
-                    if hour == 0: tfs_to_run.append("1d")
-
-                logger.info(f"Running strategies for: {tfs_to_run}")
-                
-                # 3. Execute Logic
-                self._process_strategies(tfs_to_run)
-                
-                # Sleep to avoid double triggering in the same minute
-                time.sleep(60)
-            
-            time.sleep(1)
-
-    def _update_all_data(self):
-        """Fetches just the last few candles to append."""
-        active_assets = set(s.asset for s in self.strategies.values())
-        for asset in active_assets:
-            try:
-                url = "https://api.binance.com/api/v3/klines"
-                params = {"symbol": asset, "interval": "15m", "limit": 5} 
-                r = requests.get(url, params=params)
-                data = r.json()
-                
-                # Append new ones if timestamp > last stored
-                last_stored_ts = self.price_history[asset][-1][0]
-                for candle in data:
-                    ts = int(candle[6])
-                    price = float(candle[4])
-                    if ts > last_stored_ts:
-                        self.price_history[asset].append((ts, price))
-                        
-                if len(self.price_history[asset]) > 200000:
-                    self.price_history[asset] = self.price_history[asset][-200000:]
-                    
-            except Exception as e:
-                logger.error(f"Update failed for {asset}: {e}")
-
-    def _process_strategies(self, active_tfs: List[str]):
-        """Generates signals and manages execution."""
-        
-        # 1. Get Capital
-        try:
-            acc = self.kf.get_accounts()
-            if "flex" in acc.get("accounts", {}):
-                equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
-            else:
-                first_acc = list(acc.get("accounts", {}).values())[0]
-                equity = float(first_acc.get("marginEquity", 0))
-                
             if equity <= 0:
-                logger.error("Equity is 0 or negative. Aborting.")
-                return
-                
-        except Exception as e:
-            logger.error(f"Failed to fetch accounts: {e}")
-            return
+                print(f"Bankruptcy at {current_ts}")
+                break
 
-        # 2. Calculate Unit Size
-        if self.total_strategies_count == 0: return
-        unit_size_usd = (equity * LEVERAGE) / self.total_strategies_count
-        logger.info(f"Equity: ${equity:.2f} | Unit Size: ${unit_size_usd:.2f}")
+            # --- B. Strategy Updates ---
+            total_strats = len(self.strategies)
+            unit_size = (equity * LEVERAGE) / total_strats if total_strats > 0 else 0
+            net_targets = defaultdict(float)
 
-        # 3. Generate Signals & Update Virtual Positions
-        active_assets = set()
-        
-        for s in self.strategies.values():
-            if s.timeframe in active_tfs:
-                active_assets.add(s.asset)
+            for s in self.strategies.values():
+                # Walk-Forward Logic:
+                # The model is allowed to "see" history up to 'i'.
+                # Even though we are in the unseen period, the model continually updates 
+                # its map with the data it just experienced (just like in live trading).
                 
-                # Get Data
-                raw = self.price_history[s.asset]
-                prices = self._resample(raw, s.timeframe)
+                # Optimization: Limit lookback for training (last 3000 candles is plenty for map building)
+                start_lookback = max(0, i - 3000)
+                subset = self.data_store[s.asset].iloc[start_lookback : i + 1]
                 
-                # Retrain with new data (fast)
+                prices = self.resample(subset, s.timeframe)
                 s.train(prices)
+                sig = s.predict(prices)
                 
-                # Predict
-                sig = s.predict(prices) # 1, -1, 0
-                
-                # Update Virtual Position
-                s.virtual_position = sig * unit_size_usd
-                
-                logger.info(f"Strategy {s.id}: Signal {sig} -> VirtPos ${s.virtual_position:.2f}")
+                s.virtual_position = sig * unit_size
+                net_targets[s.asset] += s.virtual_position
 
-        # 4. Aggregation & Execution (Per Asset)
-        futures_map = {k: [] for k in active_assets}
-        
-        # Launch parallel execution for each asset
-        for asset in active_assets:
-            self.executor.submit(self._execute_asset_logic, asset)
+            # --- C. Execution ---
+            for asset, target_usd in net_targets.items():
+                if asset not in current_prices: continue
+                price = current_prices[asset]
+                
+                current_qty = self.portfolio["holdings"][asset]
+                target_qty = target_usd / price
+                delta = target_qty - current_qty
+                
+                trade_value = abs(delta * price)
+                
+                # Minimum trade size filter (simulates dust limits)
+                if trade_value > 10.0:
+                    fee = trade_value * 0.0005 # 0.05%
+                    self.portfolio["cash"] -= fee
+                    self.portfolio["cash"] -= (delta * price)
+                    self.portfolio["holdings"][asset] += delta
 
-    def _execute_asset_logic(self, binance_asset: str):
-        """Calculates Net Target and executes Maker Order loop."""
-        kf_symbol = SYMBOL_MAP.get(binance_asset)
-        if not kf_symbol:
-            logger.warning(f"No Kraken mapping for {binance_asset}")
+            # Log periodically
+            if i % 1000 == 0:
+                print(f"[{current_ts}] Eq: ${equity:.2f}")
+
+    def report(self):
+        equity = self.portfolio["equity_history"]
+        if not equity:
+            print("No trades executed.")
             return
 
-        # A. Calculate Net Target (USD Value)
-        net_target_usd = 0.0
-        for s in self.strategies.values():
-            if s.asset == binance_asset:
-                net_target_usd += s.virtual_position
-
-        # B. Get Current Position on Kraken
-        try:
-            open_pos = self.kf.get_open_positions()
-            current_pos_size = 0.0
-            
-            if "openPositions" in open_pos:
-                for p in open_pos["openPositions"]:
-                    if p["symbol"].lower() == kf_symbol.lower():
-                        size = float(p["size"]) # Contracts
-                        # Check direction
-                        if p["side"] == "short": size = -size
-                        current_pos_size = size
-                        break
-        except Exception as e:
-            logger.error(f"[{kf_symbol}] Failed to get positions: {e}")
-            return
-
-        # C. Get Market Price for Conversion (USD -> Contracts)
-        try:
-            tickers = self.kf.get_tickers()
-            mark_price = 0.0
-            for t in tickers.get("tickers", []):
-                if t["symbol"].lower() == kf_symbol.lower():
-                    mark_price = float(t["markPrice"])
-                    break
-            
-            if mark_price == 0: raise ValueError("Mark price 0")
-            
-            # Convert Target USD to Contracts
-            target_contracts = net_target_usd / mark_price
-            
-            # Delta
-            delta = target_contracts - current_pos_size
-            
-            logger.info(f"[{kf_symbol}] Net Target: {target_contracts:.6f} | Curr: {current_pos_size} | Delta: {delta:.6f}")
-
-            # --- Execution Filtering ---
-            specs = self.instrument_specs.get(kf_symbol.lower())
-            
-            # Note: User specified Tick Size restricts SIZE, Lot Size restricts PRICE.
-            size_increment = specs['tickSize'] if specs else 0.001
-
-            # Check actionability by rounding locally just for the check
-            check_qty = self._round_to_step(abs(delta), size_increment)
-
-            if check_qty < size_increment:
-                logger.info(f"[{kf_symbol}] Delta rounds to 0 (Rounded: {check_qty} < SizeInc: {size_increment}). Skipping.")
-                return
-
-            # D. Execute Maker Loop
-            # Pass the RAW delta; explicit rounding happens right before send inside the loop
-            self._run_maker_loop(kf_symbol, delta, mark_price)
-
-        except Exception as e:
-            logger.error(f"[{kf_symbol}] Execution Logic Failed: {e}")
-
-    def _run_maker_loop(self, symbol: str, quantity: float, initial_mark: float):
-        """
-        Places a limit order and updates it every 30s to chase/decay towards mark.
-        quantity: positive (buy) or negative (sell) - RAW (unrounded) quantity.
-        """
-        side = "buy" if quantity > 0 else "sell"
-        abs_qty_raw = abs(quantity)
+        final_eq = equity[-1]
+        ret = (final_eq - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
         
-        # Initial Offset (e.g., 0.5%)
-        decay_steps = 10 # 5 minutes / 30s
-        
-        order_id = None
-        
-        # Specs for Rounding
-        specs = self.instrument_specs.get(symbol.lower())
-        # As per user instruction:
-        size_increment = specs['tickSize'] if specs else 0.001
-        price_increment = specs['lotSize'] if specs else 0.01
+        print("\n--- Out-of-Sample Results (30% Unseen) ---")
+        print(f"Start Date:   {self.split_timestamp}")
+        print(f"End Date:     {self.portfolio['ts_history'][-1]}")
+        print(f"Initial Cap:  ${INITIAL_CAPITAL:.2f}")
+        print(f"Final Cap:    ${final_eq:.2f}")
+        print(f"Return:       {ret:.2f}%")
 
-        for i in range(decay_steps):
-            try:
-                # 1. Get Fresh Mark Price
-                tickers = self.kf.get_tickers()
-                curr_mark = 0.0
-                for t in tickers.get("tickers", []):
-                    if t["symbol"].lower() == symbol.lower():
-                        curr_mark = float(t["markPrice"])
-                        break
-                
-                if curr_mark == 0: curr_mark = initial_mark
-                
-                # 2. Calculate Decay Price
-                direction = 1 if side == "buy" else -1
-                decay_factor = math.exp(-i * 0.5)
-                offset = curr_mark * 0.01 * -direction * decay_factor
-                
-                raw_limit_price = curr_mark + offset
-                
-                # --- ROUNDING (Right before send) ---
-                final_limit_price = self._round_to_step(raw_limit_price, price_increment)
-                final_size = self._round_to_step(abs_qty_raw, size_increment)
-                
-                logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {final_size} @ {final_limit_price} (Mark: {curr_mark})")
-
-                # 3. Place or Edit
-                if order_id is None:
-                    # Send New
-                    resp = self.kf.send_order({
-                        "orderType": "lmt",
-                        "symbol": symbol,
-                        "side": side,
-                        "size": final_size,
-                        "limitPrice": final_limit_price
-                    })
-                    if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                         order_id = resp["sendStatus"]["order_id"]
-                    else:
-                         logger.error(f"[{symbol}] Order fail: {resp}")
-                         break # Fatal
-                else:
-                    # Edit
-                    self.kf.edit_order({
-                        "orderId": order_id,
-                        "limitPrice": final_limit_price,
-                        "size": final_size,
-                        "symbol": symbol 
-                    })
-
-                # 4. Wait
-                time.sleep(30)
-                
-            except Exception as e:
-                logger.error(f"[{symbol}] Maker Loop Error: {e}")
-                time.sleep(5)
-        
-        # Timeout - Cancel
-        if order_id:
-            try:
-                logger.info(f"[{symbol}] Timeout. Cancelling.")
-                
-                process_before = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                self.kf.cancel_order({
-                    "order_id": order_id,
-                    "symbol": symbol,
-                    "processBefore": process_before
-                })
-            except Exception as e:
-                logger.error(f"[{symbol}] Cancel failed: {e}")
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.portfolio["ts_history"], equity, label="Equity (OOS)")
+        plt.axvline(x=self.split_timestamp, color='r', linestyle='--', label="Unseen Data Start")
+        plt.title(f"Performance on Unseen Data (Last 30%)")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("backtest_oos.png")
+        print("Chart saved to backtest_oos.png")
 
 if __name__ == "__main__":
-    bot = Octopus()
-    bot.initialize()
-    bot.run()
+    bt = OOSBacktester()
+    bt.load_strategies()
+    bt.fetch_full_history()
+    bt.run_oos_test()
+    bt.report()
