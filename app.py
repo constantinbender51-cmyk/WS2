@@ -5,7 +5,6 @@ import json
 import requests
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 
@@ -16,8 +15,6 @@ REPO_NAME = "Models"
 GITHUB_PAT = os.getenv("PAT") or os.getenv("GITHUB_TOKEN")
 
 # 2. Data Scope (Full History)
-# We fetch ALL data from 2020 to Now.
-# The script will calculate the 70% cutoff automatically.
 START_DATE = "2020-01-01" 
 END_DATE = datetime.now().strftime("%Y-%m-%d") # Today
 
@@ -39,6 +36,11 @@ SYMBOL_MAP = {
     "DOTUSDT": "pf_dotusd",
     "LINKUSDT": "pf_linkusd",
 }
+
+def delayed_print(text):
+    """Custom print with 0.1s delay as requested."""
+    print(text)
+    time.sleep(0.1)
 
 # --- Strategy Logic (Standard) ---
 class Strategy:
@@ -118,20 +120,32 @@ class OOSBacktester:
             "cash": INITIAL_CAPITAL,
             "holdings": {k: 0.0 for k in SYMBOL_MAP.keys()},
             "equity_history": [],
-            "ts_history": []
+            "ts_history": [],
+            "returns_history": [],
+            "drawdown_history": []
+        }
+        self.metrics = {
+            "wins": 0,
+            "losses": 0,
+            "total_intervals": 0,
+            "correct_predictions": 0,
+            "total_predictions": 0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0
         }
         self.split_timestamp = None
 
     def load_strategies(self):
         """Downloads configs from GitHub."""
         if not GITHUB_PAT:
-            print("CRITICAL: No GITHUB_PAT found.")
+            delayed_print("CRITICAL: No GITHUB_PAT found.")
             sys.exit(1)
 
         url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
         headers = {"Authorization": f"Bearer {GITHUB_PAT}"}
         
         try:
+            delayed_print("Connecting to GitHub...")
             resp = requests.get(url, headers=headers)
             resp.raise_for_status()
             files = resp.json()
@@ -147,15 +161,15 @@ class OOSBacktester:
                         s = Strategy(asset, tf, best_strat)
                         self.strategies[s.id] = s
                         count += 1
-            print(f"Loaded {count} strategies.")
+            delayed_print(f"Loaded {count} strategies.")
         except Exception as e:
-            print(f"Error loading strategies: {e}")
+            delayed_print(f"Error loading strategies: {e}")
             sys.exit(1)
 
     def fetch_full_history(self):
         """Fetches full history (2020-Now) to establish the split."""
         active_assets = set(s.asset for s in self.strategies.values())
-        print(f"Fetching full history (2020 - Now) for {len(active_assets)} assets...")
+        delayed_print(f"Fetching full history (2020 - Now) for {len(active_assets)} assets...")
         
         start_ts = int(datetime.strptime(START_DATE, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
         end_ts = int(datetime.now().replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -167,7 +181,7 @@ class OOSBacktester:
                 df = pd.read_csv(filename)
                 df['ts'] = pd.to_datetime(df['ts'])
             else:
-                print(f"Downloading {asset} (This may take a minute)...")
+                delayed_print(f"Downloading {asset} (This may take a minute)...")
                 all_candles = []
                 current = start_ts
                 while current < end_ts:
@@ -204,21 +218,21 @@ class OOSBacktester:
         total_len = len(df) # Approximate length of aligned data
         split_idx = int(total_len * TRAIN_SPLIT)
         
-        # Get the timestamp where the "Unseen" period begins
-        # We assume all DataFrames are roughly aligned by row count now
-        # Ideally, we grab the timestamp from the first asset at the split index
         first_asset = list(self.data_store.keys())[0]
         self.split_timestamp = self.data_store[first_asset].iloc[split_idx]['ts']
         
-        print(f"--- SPLIT CALCULATION ---")
-        print(f"Total Candles: {total_len}")
-        print(f"Training Data: First {TRAIN_SPLIT*100}% (approx {split_idx} candles)")
-        print(f"Unseen Data starts at: {self.split_timestamp}")
-        print(f"Backtesting ONLY on Unseen Data...")
-        print(f"-------------------------")
+        delayed_print(f"--- SPLIT CALCULATION ---")
+        delayed_print(f"Total Candles: {total_len}")
+        delayed_print(f"Training Data: First {TRAIN_SPLIT*100}% (approx {split_idx} candles)")
+        delayed_print(f"Unseen Data starts at: {self.split_timestamp}")
+        delayed_print(f"Backtesting ONLY on Unseen Data...")
+        delayed_print(f"-------------------------")
+
+        prev_equity = self.portfolio["cash"]
+        peak_equity = prev_equity
+        prev_net_exposure = 0.0
 
         # 2. Loop strictly through the Unseen portion
-        # We start 'i' at split_idx
         for i in range(split_idx, total_len):
             
             current_ts = self.data_store[first_asset].iloc[i]['ts']
@@ -227,31 +241,54 @@ class OOSBacktester:
             equity = self.portfolio["cash"]
             current_prices = {}
             for asset, df in self.data_store.items():
-                # Safety check for index bounds
                 if i < len(df):
                     price = df.iloc[i]['price']
                     current_prices[asset] = price
                     equity += self.portfolio["holdings"][asset] * price
             
+            # Metrics: Returns & Drawdown
+            step_return = equity - prev_equity
             self.portfolio["equity_history"].append(equity)
             self.portfolio["ts_history"].append(current_ts)
+            self.portfolio["returns_history"].append(step_return)
+            
+            if equity > peak_equity: peak_equity = equity
+            drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
+            self.portfolio["drawdown_history"].append(drawdown)
+
+            # Metrics: Win/Loss Counts (Interval based)
+            self.metrics["total_intervals"] += 1
+            if step_return > 0:
+                self.metrics["wins"] += 1
+                self.metrics["gross_profit"] += step_return
+            elif step_return < 0:
+                self.metrics["losses"] += 1
+                self.metrics["gross_loss"] += abs(step_return)
+
+            # Metrics: Directional Accuracy
+            # Compare previous exposure to current PnL direction
+            if prev_net_exposure > 0 and step_return > 0: self.metrics["correct_predictions"] += 1
+            elif prev_net_exposure < 0 and step_return < 0: self.metrics["correct_predictions"] += 1
+            elif prev_net_exposure != 0: 
+                # If we had exposure but PnL didn't match direction (loss)
+                pass 
+            
+            if prev_net_exposure != 0:
+                 self.metrics["total_predictions"] += 1
             
             if equity <= 0:
-                print(f"Bankruptcy at {current_ts}")
+                delayed_print(f"Bankruptcy at {current_ts}")
                 break
+
+            prev_equity = equity
 
             # --- B. Strategy Updates ---
             total_strats = len(self.strategies)
             unit_size = (equity * LEVERAGE) / total_strats if total_strats > 0 else 0
             net_targets = defaultdict(float)
+            current_total_exposure = 0.0
 
             for s in self.strategies.values():
-                # Walk-Forward Logic:
-                # The model is allowed to "see" history up to 'i'.
-                # Even though we are in the unseen period, the model continually updates 
-                # its map with the data it just experienced (just like in live trading).
-                
-                # Optimization: Limit lookback for training (last 3000 candles is plenty for map building)
                 start_lookback = max(0, i - 3000)
                 subset = self.data_store[s.asset].iloc[start_lookback : i + 1]
                 
@@ -261,6 +298,11 @@ class OOSBacktester:
                 
                 s.virtual_position = sig * unit_size
                 net_targets[s.asset] += s.virtual_position
+                
+                # Simple sum of all target USD exposures
+                current_total_exposure += s.virtual_position
+
+            prev_net_exposure = current_total_exposure
 
             # --- C. Execution ---
             for asset, target_usd in net_targets.items():
@@ -273,7 +315,6 @@ class OOSBacktester:
                 
                 trade_value = abs(delta * price)
                 
-                # Minimum trade size filter (simulates dust limits)
                 if trade_value > 10.0:
                     fee = trade_value * 0.0005 # 0.05%
                     self.portfolio["cash"] -= fee
@@ -282,32 +323,72 @@ class OOSBacktester:
 
             # Log periodically
             if i % 1000 == 0:
-                print(f"[{current_ts}] Eq: ${equity:.2f}")
+                delayed_print(f"[{current_ts}] Eq: ${equity:,.2f} | DD: {drawdown*100:.2f}%")
 
     def report(self):
         equity = self.portfolio["equity_history"]
         if not equity:
-            print("No trades executed.")
+            delayed_print("No trades executed.")
             return
 
         final_eq = equity[-1]
-        ret = (final_eq - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+        total_return = (final_eq - INITIAL_CAPITAL) / INITIAL_CAPITAL
         
-        print("\n--- Out-of-Sample Results (30% Unseen) ---")
-        print(f"Start Date:   {self.split_timestamp}")
-        print(f"End Date:     {self.portfolio['ts_history'][-1]}")
-        print(f"Initial Cap:  ${INITIAL_CAPITAL:.2f}")
-        print(f"Final Cap:    ${final_eq:.2f}")
-        print(f"Return:       {ret:.2f}%")
+        # Safe calculations
+        returns_np = np.array(self.portfolio["returns_history"])
+        # Filter out first zero if exists to avoid skew
+        if len(returns_np) > 1: returns_np = returns_np[1:] 
+        
+        # Annualized metrics (Assuming 15m intervals -> 35040 intervals/year)
+        intervals_per_year = 35040
+        mean_return = np.mean(returns_np)
+        std_return = np.std(returns_np)
+        
+        sharpe = 0.0
+        if std_return > 0:
+            sharpe = (mean_return / std_return) * np.sqrt(intervals_per_year)
+            
+        # Sortino
+        downside_returns = returns_np[returns_np < 0]
+        downside_std = np.std(downside_returns) if len(downside_returns) > 0 else 1.0
+        sortino = 0.0
+        if downside_std > 0:
+            sortino = (mean_return / downside_std) * np.sqrt(intervals_per_year)
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(self.portfolio["ts_history"], equity, label="Equity (OOS)")
-        plt.axvline(x=self.split_timestamp, color='r', linestyle='--', label="Unseen Data Start")
-        plt.title(f"Performance on Unseen Data (Last 30%)")
-        plt.legend()
-        plt.grid(True)
-        plt.savefig("backtest_oos.png")
-        print("Chart saved to backtest_oos.png")
+        # Max Drawdown
+        max_dd = max(self.portfolio["drawdown_history"])
+        
+        # Profit Factor
+        gross_p = self.metrics["gross_profit"]
+        gross_l = self.metrics["gross_loss"]
+        profit_factor = gross_p / gross_l if gross_l > 0 else float('inf')
+
+        # Win Rate (Intervals)
+        win_rate = (self.metrics["wins"] / self.metrics["total_intervals"]) * 100 if self.metrics["total_intervals"] > 0 else 0
+        
+        # Directional Accuracy (Active predictions)
+        accuracy = (self.metrics["correct_predictions"] / self.metrics["total_predictions"]) * 100 if self.metrics["total_predictions"] > 0 else 0
+
+        # Text Only Report
+        print("\n" + "="*40)
+        print("   OUT-OF-SAMPLE PERFORMANCE REPORT")
+        print("="*40)
+        print(f"Start Date:          {self.split_timestamp}")
+        print(f"End Date:            {self.portfolio['ts_history'][-1]}")
+        print("-" * 40)
+        print(f"Initial Capital:     ${INITIAL_CAPITAL:,.2f}")
+        print(f"Final Equity:        ${final_eq:,.2f}")
+        print(f"Total Return:        {total_return*100:.2f}%")
+        print("-" * 40)
+        print(f"Annualized Sharpe:   {sharpe:.4f}")
+        print(f"Annualized Sortino:  {sortino:.4f}")
+        print(f"Max Drawdown:        {max_dd*100:.2f}%")
+        print(f"Profit Factor:       {profit_factor:.2f}")
+        print("-" * 40)
+        print(f"Win Rate (Interval): {win_rate:.2f}%")
+        print(f"Direction Accuracy:  {accuracy:.2f}%")
+        print(f"Total Intervals:     {self.metrics['total_intervals']}")
+        print("="*40 + "\n")
 
 if __name__ == "__main__":
     bt = OOSBacktester()
