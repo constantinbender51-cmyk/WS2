@@ -281,28 +281,31 @@ def run_portfolio_analysis(prices, top_configs):
                     "is_flat": is_flat
                 })
 
-        # --- Aggregate Signals ---
+        # --- Aggregate Signals (Majority Rule) ---
         if not active_directions:
             continue
             
         dirs = [x['dir'] for x in active_directions]
+        up_votes = dirs.count(1)
+        down_votes = dirs.count(-1)
         
-        # Conflict Check
-        has_up = 1 in dirs
-        has_down = -1 in dirs
-        
-        if has_up and has_down:
+        final_dir = 0
+        if up_votes > down_votes:
+            final_dir = 1
+        elif down_votes > up_votes:
+            final_dir = -1
+        else:
+            # Tie (or empty, though caught above) -> Abstain
             continue
             
-        any_correct = any(x['is_correct'] for x in active_directions)
-        any_wrong_direction = any((not x['is_correct'] and not x['is_flat']) for x in active_directions)
+        unique_total += 1
         
-        all_flat = all(x['is_flat'] for x in active_directions)
-        
-        if not all_flat:
-            unique_total += 1
-            if any_correct and not any_wrong_direction:
-                unique_correct += 1
+        # Correctness Check:
+        # If the majority direction matches ANY of the voting models' "correct" criteria,
+        # it means the price moved in that direction sufficient for at least one bucket scale.
+        winning_voters = [x for x in active_directions if x['dir'] == final_dir]
+        if any(x['is_correct'] for x in winning_voters):
+            unique_correct += 1
 
     return unique_correct, unique_total
 
