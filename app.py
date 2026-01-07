@@ -81,8 +81,10 @@ def train_models(train_buckets, seq_len):
         a_succ = train_buckets[i + seq_len]
         abs_map[a_seq][a_succ] += 1
         
-        if i > 0:
-            d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i, i + seq_len))
+        # UPDATED: Derive sequence strictly from a_seq (no lookback)
+        # Length becomes seq_len - 1
+        if seq_len > 1:
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
             d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
             der_map[d_seq][d_succ] += 1
             
@@ -148,7 +150,13 @@ def evaluate_parameters(prices, bucket_size, seq_len):
     for i in range(total_samples):
         curr_idx = split_idx + i
         a_seq = tuple(buckets[curr_idx : curr_idx + seq_len])
-        d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_idx, curr_idx + seq_len))
+        
+        # UPDATED: Derive d_seq from a_seq (Length = seq_len - 1)
+        if seq_len > 1:
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
+        else:
+            d_seq = ()
+
         last_val = a_seq[-1]
         actual_val = buckets[curr_idx + seq_len]
         actual_diff = actual_val - last_val
@@ -240,7 +248,13 @@ def run_portfolio_analysis(prices, top_configs):
             buckets = model['buckets']
             
             a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
-            d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_raw_idx, curr_raw_idx + seq_len))
+            
+            # UPDATED: Derive d_seq from a_seq (Length = seq_len - 1)
+            if seq_len > 1:
+                d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
+            else:
+                d_seq = ()
+                
             last_val = a_seq[-1]
             actual_val = buckets[curr_raw_idx + seq_len]
             
