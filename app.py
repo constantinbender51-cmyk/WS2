@@ -169,9 +169,8 @@ def evaluate_parameters(prices, bucket_size, seq_len):
         for name, pred in [("Absolute", p_abs), ("Derivative", p_der), ("Combined", p_comb)]:
             pred_diff = pred - last_val
             
-            # REVERTED LOGIC: Directional Move Accuracy
+            # Original Logic: Directional Move Accuracy
             # We only count the trade if the model PREDICTS a move AND the market actually MOVES.
-            # If the market is flat (actual_diff == 0), it is not a "Loss", it is ignored.
             if pred_diff != 0 and actual_diff != 0:
                 stats[name][1] += 1
                 if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
@@ -299,24 +298,21 @@ def run_portfolio_analysis(prices, top_configs):
         elif down_votes > up_votes:
             final_dir = -1
         else:
-            # Tie (or empty) -> Abstain
+            # Tie -> Abstain
             continue
-            
+        
+        # Identify the voters that formed the majority decision
+        winning_voters = [x for x in active_directions if x['dir'] == final_dir]
+        
         # --- CORRECTNESS FILTER ---
-        # To align with individual stats: we must skip if the market is FLAT.
-        # But "Flat" is relative. We check if ALL voting models saw a flat market.
-        # If all predicting models see actual_diff == 0, we treat the move as "too small to count" (Flat).
-        
-        all_active_saw_flat = all(x['is_flat'] for x in active_directions)
-        
-        if all_active_saw_flat:
-            continue # Skip: Market didn't move enough for any model to register a hit/miss.
+        # We only look at the outcome from the perspective of the models that drove the decision.
+        # If ALL winning voters saw a "Flat" market, then the signal didn't encounter a testable move.
+        if all(x['is_flat'] for x in winning_voters):
+            continue 
             
         unique_total += 1
         
-        # Correctness Check:
-        # If the majority direction matches ANY of the voting models' "correct" criteria.
-        winning_voters = [x for x in active_directions if x['dir'] == final_dir]
+        # Win if ANY of the winning voters were correct
         if any(x['is_correct'] for x in winning_voters):
             unique_correct += 1
 
