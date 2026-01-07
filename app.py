@@ -81,7 +81,7 @@ def train_models(train_buckets, seq_len):
         a_succ = train_buckets[i + seq_len]
         abs_map[a_seq][a_succ] += 1
         
-        # UPDATED: Derive sequence strictly from a_seq (no lookback)
+        # Derive sequence strictly from a_seq (no lookback)
         # Length becomes seq_len - 1
         if seq_len > 1:
             d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
@@ -151,7 +151,7 @@ def evaluate_parameters(prices, bucket_size, seq_len):
         curr_idx = split_idx + i
         a_seq = tuple(buckets[curr_idx : curr_idx + seq_len])
         
-        # UPDATED: Derive d_seq from a_seq (Length = seq_len - 1)
+        # Derive d_seq from a_seq (Length = seq_len - 1)
         if seq_len > 1:
             d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
         else:
@@ -168,6 +168,10 @@ def evaluate_parameters(prices, bucket_size, seq_len):
 
         for name, pred in [("Absolute", p_abs), ("Derivative", p_der), ("Combined", p_comb)]:
             pred_diff = pred - last_val
+            
+            # REVERTED LOGIC: Directional Move Accuracy
+            # We only count the trade if the model PREDICTS a move AND the market actually MOVES.
+            # If the market is flat (actual_diff == 0), it is not a "Loss", it is ignored.
             if pred_diff != 0 and actual_diff != 0:
                 stats[name][1] += 1
                 if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
@@ -189,7 +193,7 @@ def evaluate_parameters(prices, bucket_size, seq_len):
 
 def run_portfolio_analysis(prices, top_configs):
     """
-    Runs the 'Union' strategy on the top 3 configurations.
+    Runs the 'Majority Vote' strategy on the top configurations.
     """
     print(f"\n--- Running Portfolio Analysis (Union of Top {len(top_configs)}) ---")
     
@@ -249,7 +253,7 @@ def run_portfolio_analysis(prices, top_configs):
             
             a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
             
-            # UPDATED: Derive d_seq from a_seq (Length = seq_len - 1)
+            # Derive d_seq from a_seq (Length = seq_len - 1)
             if seq_len > 1:
                 d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
             else:
@@ -295,14 +299,23 @@ def run_portfolio_analysis(prices, top_configs):
         elif down_votes > up_votes:
             final_dir = -1
         else:
-            # Tie (or empty, though caught above) -> Abstain
+            # Tie (or empty) -> Abstain
             continue
+            
+        # --- CORRECTNESS FILTER ---
+        # To align with individual stats: we must skip if the market is FLAT.
+        # But "Flat" is relative. We check if ALL voting models saw a flat market.
+        # If all predicting models see actual_diff == 0, we treat the move as "too small to count" (Flat).
+        
+        all_active_saw_flat = all(x['is_flat'] for x in active_directions)
+        
+        if all_active_saw_flat:
+            continue # Skip: Market didn't move enough for any model to register a hit/miss.
             
         unique_total += 1
         
         # Correctness Check:
-        # If the majority direction matches ANY of the voting models' "correct" criteria,
-        # it means the price moved in that direction sufficient for at least one bucket scale.
+        # If the majority direction matches ANY of the voting models' "correct" criteria.
         winning_voters = [x for x in active_directions if x['dir'] == final_dir]
         if any(x['is_correct'] for x in winning_voters):
             unique_correct += 1
