@@ -297,9 +297,8 @@ def run_grid_search():
     if len(prices) < 500: return
 
     # --- UPDATED GRID SEARCH LOGIC ---
-    # Instead of hardcoded bucket sizes, we use target bucket counts.
-    # This automatically adapts to the price range of the asset.
-    bucket_counts = [10, 25, 50, 75, 100, 150, 200, 300]
+    # Testing buckets from 10 to 250 in steps of 10
+    bucket_counts = list(range(10, 251, 10))
     seq_lengths = [3, 4, 5, 6, 8]
     
     results = []
