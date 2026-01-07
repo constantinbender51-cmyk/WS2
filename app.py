@@ -340,21 +340,21 @@ def run_grid_search():
                 })
                 print(f"{b_count:<8} | {b_size:<8.4f} | {s_len:<8} | {model_name:<12} | {accuracy:<10.2f} | {trades:<8}")
 
-    # Top 3
+    # Top 5
     results.sort(key=lambda x: x['accuracy'], reverse=True)
-    top_3 = results[:3]
+    top_5 = results[:5]
     
     print("\n" + "="*50)
-    print(" TOP 3 CONFIGURATIONS ")
+    print(" TOP 5 CONFIGURATIONS ")
     print("="*50)
-    for i, res in enumerate(top_3):
+    for i, res in enumerate(top_5):
         print(f"#{i+1}: Count {res['bucket_count']} (Size {res['bucket_size']:.4f}), Len {res['seq_len']} ({res['model']}) -> {res['accuracy']:.2f}% ({res['trades']} trades)")
 
     # Combined Analysis
-    if len(top_3) > 0:
-        u_correct, u_total = run_portfolio_analysis(prices, top_3)
+    if len(top_5) > 0:
+        u_correct, u_total = run_portfolio_analysis(prices, top_5)
         print("\n" + "="*50)
-        print(" FINAL PORTFOLIO RESULT (Union of Top 3) ")
+        print(" FINAL PORTFOLIO RESULT (Union of Top 5) ")
         print("="*50)
         if u_total > 0:
             print(f"Combined Unique Trades: {u_total}")
