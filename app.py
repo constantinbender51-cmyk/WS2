@@ -1,389 +1,330 @@
-import random
+import requests
+import pandas as pd
+import numpy as np
 import time
-import sys
 import json
-import urllib.request
+import logging
+import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple
 
-# --- CONFIGURATION ---
-SYMBOL = "ETHUSDT"
-INTERVAL = "1h"
-START_DATE = "2020-01-01" 
-# Fixed end date to match Octopus.py frozen model logic
-TRAINING_END_DATE = "2026-01-01"
+# --- Configuration ---
+REPO_OWNER = "constantinbender51-cmyk"
+REPO_NAME = "Models"
+GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
+BACKTEST_DAYS = 90  # 3 Months
 
-def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE, end_str=TRAINING_END_DATE):
-    """
-    Fetches historical kline data from Binance public API.
-    Strictly bounded between START_DATE and TRAINING_END_DATE.
-    """
-    print(f"\n--- Fetching {symbol} {interval} data ({start_str} to {end_str}) ---")
-    
-    # Parse dates to timestamps (ms)
-    start_dt = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end_dt = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    
-    start_ts = int(start_dt.timestamp() * 1000)
-    end_ts = int(end_dt.timestamp() * 1000)
-    
-    all_prices = []
-    current_start = start_ts
-    total_time = end_ts - start_ts
-    
-    while current_start < end_ts:
-        # We fetch up to 'end_ts'
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&startTime={current_start}&endTime={end_ts}&limit=1000"
-        try:
-            with urllib.request.urlopen(url) as response:
-                data = json.loads(response.read().decode())
-                if not data:
-                    break
-                
-                batch_prices = [float(candle[4]) for candle in data]
-                all_prices.extend(batch_prices)
-                
-                # Update start time for next batch (Last Close Time + 1ms)
-                current_start = data[-1][6] + 1
-                
-                progress = (current_start - start_ts) / total_time
-                # Cap progress at 1.0 for display
-                progress = min(progress, 1.0)
-                sys.stdout.write(f"\rDownload Progress: [{int(progress*20)*'#'}{(20-int(progress*20))*'-'}] {len(all_prices)} candles")
-                sys.stdout.flush()
-                
-        except Exception as e:
-            print(f"\nError fetching data: {e}")
-            break
-            
-    print(f"\nTotal data points fetched: {len(all_prices)}")
-    return all_prices
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("Backtester")
 
-# --- UPDATED BUCKET LOGIC (From strategies_1_2.py) ---
+# --- Strategy Classes (Ported from Octopus) ---
 
-def get_bucket(price, bucket_size):
-    """Converts price to bucket index based on dynamic size."""
-    # Safety for extremely small sizes to prevent division by zero
-    if bucket_size <= 0: bucket_size = 1e-9
-    
-    if price >= 0:
-        return int(price // bucket_size)
-    else:
-        return int(price // bucket_size) - 1
-
-def calculate_bucket_size(prices, bucket_count):
-    """Calculates bucket size based on total range and target count."""
-    if not prices: return 1.0
-    min_p = min(prices)
-    max_p = max(prices)
-    price_range = max_p - min_p
-    
-    if bucket_count <= 0: return 1.0
-    
-    size = price_range / bucket_count
-    return size if size > 0 else 0.01
-
-# --- CORE LOGIC ---
-
-def train_models(train_buckets, seq_len):
-    """Helper to train models and return the maps."""
-    abs_map = defaultdict(Counter)
-    der_map = defaultdict(Counter)
-    
-    for i in range(len(train_buckets) - seq_len):
-        a_seq = tuple(train_buckets[i : i + seq_len])
-        a_succ = train_buckets[i + seq_len]
-        abs_map[a_seq][a_succ] += 1
+class SubStrategy:
+    def __init__(self, strategy_data: dict):
+        config = strategy_data.get('config', {})
+        params = strategy_data.get('trained_parameters', {})
         
-        # Derive sequence strictly from a_seq (no lookback)
-        if seq_len > 1:
-            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
-            d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
-            der_map[d_seq][d_succ] += 1
-            
-    return abs_map, der_map
+        self.model_type = config.get('model_type', 'Absolute')
+        self.bucket_size = params.get('bucket_size', 1.0)
+        self.seq_len = params.get('seq_len', 3)
+        self.all_vals = params.get('all_vals', [])
+        self.all_changes = params.get('all_changes', [])
+        self.abs_map = self._deserialize_map(params.get('abs_map', {}))
+        self.der_map = self._deserialize_map(params.get('der_map', {}))
 
-def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val, all_vals, all_changes):
-    """Helper to get a single prediction based on model type."""
-    
-    if model_type == "Absolute":
-        if a_seq in abs_map:
-            return abs_map[a_seq].most_common(1)[0][0]
-        return random.choice(all_vals)
-        
-    elif model_type == "Derivative":
-        if d_seq in der_map:
-            pred_change = der_map[d_seq].most_common(1)[0][0]
+    def _deserialize_map(self, serialized_map: dict) -> dict:
+        deserialized = {}
+        for k, v in serialized_map.items():
+            if k == "":
+                tuple_key = ()
+            else:
+                try:
+                    tuple_key = tuple(int(x) for x in k.split("|"))
+                except ValueError:
+                    continue 
+            
+            inner_counter = Counter()
+            for inner_k, inner_v in v.items():
+                try:
+                    inner_counter[int(inner_k)] = inner_v
+                except ValueError:
+                    continue
+            deserialized[tuple_key] = inner_counter
+        return deserialized
+
+    def _get_bucket(self, price: float) -> int:
+        bs = self.bucket_size
+        if bs <= 0: bs = 1e-9
+        if price >= 0:
+            return int(price // bs)
         else:
-            pred_change = random.choice(all_changes)
-        return last_val + pred_change
-        
-    elif model_type == "Combined":
-        abs_candidates = abs_map.get(a_seq, Counter())
-        der_candidates = der_map.get(d_seq, Counter())
-        
-        possible_next_vals = set(abs_candidates.keys())
-        for change in der_candidates.keys():
-            possible_next_vals.add(last_val + change)
+            return int(price // bs) - 1
+
+    def get_prediction_value(self, recent_prices: List[float]) -> int:
+        if len(recent_prices) < self.seq_len + 1:
+            return self._get_bucket(recent_prices[-1]) if recent_prices else 0
             
-        if not possible_next_vals:
-            return random.choice(all_vals)
+        buckets = [self._get_bucket(p) for p in recent_prices]
+        window = buckets[-(self.seq_len + 1):] 
+        a_seq = tuple(window[1:]) 
         
-        best_val = None
-        max_combined_score = -1
-        for val in possible_next_vals:
-            implied_change = val - last_val
-            score = abs_candidates[val] + der_candidates[implied_change]
-            if score > max_combined_score:
-                max_combined_score = score
-                best_val = val
-        return best_val
-    
-    return last_val
-
-def evaluate_parameters(prices, bucket_size, seq_len):
-    """
-    Runs analysis. Returns stats for ALL 3 models so we can pick the best.
-    """
-    buckets = [get_bucket(p, bucket_size) for p in prices]
-    
-    # 70% Train / 30% Test split logic
-    split_idx = int(len(buckets) * 0.7)
-    train_buckets = buckets[:split_idx]
-    test_buckets = buckets[split_idx:]
-    
-    all_train_values = list(set(train_buckets))
-    all_train_changes = list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
-
-    abs_map, der_map = train_models(train_buckets, seq_len)
-
-    # Stats: [correct_count, valid_total_count]
-    stats = {"Absolute": [0, 0], "Derivative": [0, 0], "Combined": [0, 0]}
-    
-    total_samples = len(test_buckets) - seq_len
-    
-    for i in range(total_samples):
-        curr_idx = split_idx + i
-        a_seq = tuple(buckets[curr_idx : curr_idx + seq_len])
-        
-        if seq_len > 1:
+        if self.seq_len > 1:
             d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
         else:
             d_seq = ()
-
-        last_val = a_seq[-1]
-        actual_val = buckets[curr_idx + seq_len]
-        actual_diff = actual_val - last_val
-
-        # Get predictions
-        p_abs = get_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val, all_train_values, all_train_changes)
-        p_der = get_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val, all_train_values, all_train_changes)
-        p_comb = get_prediction("Combined", abs_map, der_map, a_seq, d_seq, last_val, all_train_values, all_train_changes)
-
-        for name, pred in [("Absolute", p_abs), ("Derivative", p_der), ("Combined", p_comb)]:
-            pred_diff = pred - last_val
             
-            # Original Logic: Directional Move Accuracy
-            # We only count the trade if the model PREDICTS a move AND the market actually MOVES.
-            if pred_diff != 0 and actual_diff != 0:
-                stats[name][1] += 1
-                if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
-                    stats[name][0] += 1
-
-    # Return best
-    best_acc = -1
-    best_model = "None"
-    best_trades = 0
-    for name, (correct, total) in stats.items():
-        if total > 0:
-            acc = (correct / total) * 100
-            if acc > best_acc:
-                best_acc = acc
-                best_model = name
-                best_trades = total
-    
-    return best_acc, best_model, best_trades
-
-def run_portfolio_analysis(prices, top_configs):
-    """
-    Runs the 'Majority Vote' strategy on the top configurations.
-    """
-    print(f"\n--- Running Portfolio Analysis (Union of Top {len(top_configs)}) ---")
-    
-    # 1. Train all top models
-    models = []
-    for config in top_configs:
-        # Use the stored bucket size (derived from count)
-        b_size = config['bucket_size'] 
-        s_len = config['seq_len']
-        m_type = config['model']
+        last_val = window[-1]
         
-        # Re-process buckets for this specific config
-        buckets = [get_bucket(p, b_size) for p in prices]
-        split_idx = int(len(buckets) * 0.7)
-        train_buckets = buckets[:split_idx]
-        
-        # Train
-        abs_map, der_map = train_models(train_buckets, s_len)
-        
-        # Store everything needed to predict
-        models.append({
-            "config": config,
-            "buckets": buckets, # Full bucket list for this config
-            "split_idx": split_idx,
-            "abs_map": abs_map,
-            "der_map": der_map,
-            "all_vals": list(set(train_buckets)),
-            "all_changes": list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
-        })
-
-    if not models:
-        return 0, 0
-
-    # 2. Iterate through TEST time (aligned by raw price index)
-    start_test_idx = models[0]['split_idx']
-    max_seq_len = max(m['config']['seq_len'] for m in models)
-    
-    # Effective range
-    total_test_len = len(models[0]['buckets']) - start_test_idx - max_seq_len
-    
-    unique_correct = 0
-    unique_total = 0
-    
-    print(f"Scanning {total_test_len} time steps for combined signals...")
-    
-    for i in range(total_test_len):
-        # Raw index in the test set
-        curr_raw_idx = start_test_idx + i
-        
-        active_directions = [] # Stores 1 (Up) or -1 (Down)
-        
-        # Check each model
-        for model in models:
-            c = model['config']
-            seq_len = c['seq_len']
-            buckets = model['buckets']
+        if self.model_type == "Absolute":
+            if a_seq in self.abs_map:
+                return self.abs_map[a_seq].most_common(1)[0][0]
+            return getattr(self, 'all_vals', [last_val])[0] if self.all_vals else last_val
             
-            a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
+        elif self.model_type == "Derivative":
+            if d_seq in self.der_map:
+                change = self.der_map[d_seq].most_common(1)[0][0]
+                return last_val + change
+            change = getattr(self, 'all_changes', [0])[0] if self.all_changes else 0
+            return last_val + change
             
-            if seq_len > 1:
-                d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
+        elif self.model_type == "Combined":
+            abs_cand = self.abs_map.get(a_seq, Counter())
+            der_cand = self.der_map.get(d_seq, Counter())
+            poss = set(abs_cand.keys())
+            for c in der_cand.keys(): poss.add(last_val + c)
+            
+            if not poss: 
+                return getattr(self, 'all_vals', [last_val])[0] if self.all_vals else last_val
+            
+            best, max_s = last_val, -1
+            for v in poss:
+                s = abs_cand[v] + der_cand[v - last_val]
+                if s > max_s: max_s, best = s, v
+            return best
+        return last_val
+
+class EnsembleStrategy:
+    def __init__(self, asset: str, timeframe: str, strategy_union: List[dict], listed_acc: float):
+        self.asset = asset
+        self.timeframe = timeframe
+        self.id = f"{asset}_{timeframe}"
+        self.listed_accuracy = listed_acc
+        
+        self.sub_strategies = []
+        for s_data in strategy_union:
+             if 'config' in s_data and 'trained_parameters' in s_data:
+                 self.sub_strategies.append(SubStrategy(s_data))
+        
+        if self.sub_strategies:
+            self.min_bucket_size = min(s.bucket_size for s in self.sub_strategies)
+        else:
+            self.min_bucket_size = 0.0
+
+    def predict(self, recent_prices: List[float]) -> int:
+        if not recent_prices or not self.sub_strategies: return 0
+        votes = []
+        for strat in self.sub_strategies:
+            pred_bucket = strat.get_prediction_value(recent_prices)
+            current_bucket = strat._get_bucket(recent_prices[-1])
+            diff = pred_bucket - current_bucket
+            if diff > 0: votes.append(1)
+            elif diff < 0: votes.append(-1)
+            else: votes.append(0)
+            
+        up = votes.count(1)
+        down = votes.count(-1)
+        if up > down: return 1
+        elif down > up: return -1
+        return 0
+
+# --- Backtesting Engine ---
+
+class Backtester:
+    def __init__(self):
+        self.strategies = []
+        self.price_data = {}
+        self.results = []
+
+    def load_strategies(self):
+        logger.info(f"Fetching strategies from {GITHUB_API_URL}...")
+        try:
+            resp = requests.get(GITHUB_API_URL)
+            if resp.status_code != 200:
+                logger.error(f"GitHub API Error: {resp.status_code}")
+                return
+
+            files = resp.json()
+            for f in files:
+                if f['name'].endswith(".json") and f['name'] != "performance.json":
+                    try:
+                        data = requests.get(f['download_url']).json()
+                        asset = data.get('asset')
+                        tf = data.get('timeframe')
+                        acc = data.get('combined_accuracy', 0)
+                        union = data.get('strategy_union', [])
+                        
+                        if asset and tf and union:
+                            strat = EnsembleStrategy(asset, tf, union, acc)
+                            self.strategies.append(strat)
+                            logger.info(f"Loaded {strat.id} (Listed Acc: {acc}%)")
+                    except Exception as e:
+                        logger.error(f"Error loading {f['name']}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load strategies: {e}")
+
+    def fetch_binance_data(self, symbol: str, interval: str, days: int) -> pd.DataFrame:
+        """Fetches historical klines from Binance handling pagination."""
+        end_time = int(time.time() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        
+        all_klines = []
+        current_start = start_time
+        
+        logger.info(f"Fetching {days} days of {interval} data for {symbol}...")
+        
+        while True:
+            url = "https://api.binance.com/api/v3/klines"
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "startTime": current_start,
+                "endTime": end_time,
+                "limit": 1000
+            }
+            try:
+                resp = requests.get(url, params=params)
+                data = resp.json()
+                
+                if not isinstance(data, list) or len(data) == 0:
+                    break
+                    
+                all_klines.extend(data)
+                last_ts = data[-1][0]
+                
+                if last_ts >= end_time or len(data) < 1000:
+                    break
+                
+                current_start = last_ts + 1
+                time.sleep(0.1) # Respect rate limits
+            except Exception as e:
+                logger.error(f"Error fetching data for {symbol}: {e}")
+                break
+
+        if not all_klines:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_klines, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume', 
+            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+        ])
+        df['close'] = df['close'].astype(float)
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        return df[['open_time', 'close']]
+
+    def resample_data(self, df: pd.DataFrame, target_tf: str) -> List[float]:
+        """Resamples 15m data to target timeframe if needed."""
+        if target_tf == "15m":
+            return df['close'].tolist()
+        
+        tf_map = {"30m": "30min", "60m": "1h", "240m": "4h", "1d": "1D"}
+        target = tf_map.get(target_tf)
+        if not target:
+            return df['close'].tolist()
+
+        df_res = df.set_index('open_time')
+        df_res = df_res['close'].resample(target).last().dropna()
+        return df_res.tolist()
+
+    def run_backtest(self):
+        # 1. Gather unique assets to fetch
+        unique_assets = set(s.asset for s in self.strategies)
+        base_data = {}
+        
+        # 2. Fetch Base Data (15m)
+        for asset in unique_assets:
+            df = self.fetch_binance_data(asset, "15m", BACKTEST_DAYS)
+            if not df.empty:
+                base_data[asset] = df
             else:
-                d_seq = ()
+                logger.warning(f"No data found for {asset}")
+
+        print("\n" + "="*80)
+        print(f"{'STRATEGY ID':<20} | {'LISTED %':<10} | {'BACKTEST %':<10} | {'TRADES':<8} | {'ACT. RATIO':<10} | {'STATUS'}")
+        print("="*80)
+
+        # 3. Simulate per Strategy
+        for strat in self.strategies:
+            if strat.asset not in base_data: continue
+            
+            # Prepare data
+            raw_prices = self.resample_data(base_data[strat.asset], strat.timeframe)
+            if len(raw_prices) < 50: continue
+
+            wins = 0
+            losses = 0
+            flats_outcome = 0
+            
+            # Sliding window simulation
+            # Need roughly max(seq_len) history for first prediction. 
+            # Assuming max seq_len is around 10 to be safe.
+            warmup = 20 
+            
+            for i in range(warmup, len(raw_prices) - 1):
+                # Context Window
+                context = raw_prices[i-warmup : i+1]
+                current_price = raw_prices[i]
+                next_price = raw_prices[i+1]
                 
-            last_val = a_seq[-1]
-            actual_val = buckets[curr_raw_idx + seq_len]
-            
-            # Determine actual move for this specific bucket size
-            diff = actual_val - last_val
-            if diff > 0: model_actual_dir = 1
-            elif diff < 0: model_actual_dir = -1
-            else: model_actual_dir = 0
-            
-            pred_val = get_prediction(c['model'], model['abs_map'], model['der_map'], 
-                                      a_seq, d_seq, last_val, model['all_vals'], model['all_changes'])
-            
-            pred_diff = pred_val - last_val
-            
-            if pred_diff != 0:
-                direction = 1 if pred_diff > 0 else -1
+                # Predict
+                signal = strat.predict(context)
                 
-                is_correct = (direction == model_actual_dir)
-                is_flat = (model_actual_dir == 0)
+                # Evaluate (Logic from PerformanceTracker)
+                if signal == 0:
+                    continue # No trade taken
+
+                price_diff = next_price - current_price
+                threshold = strat.min_bucket_size
                 
-                active_directions.append({
-                    "dir": direction,
-                    "is_correct": is_correct,
-                    "is_flat": is_flat
-                })
-
-        # --- Aggregate Signals (Majority Rule) ---
-        if not active_directions:
-            continue
+                # Check for Directional Move (Non-flat outcome)
+                if abs(price_diff) < threshold:
+                    flats_outcome += 1
+                    continue # Outcome was flat, prediction discarded
+                
+                is_win = False
+                if signal == 1 and price_diff > 0: is_win = True
+                elif signal == -1 and price_diff < 0: is_win = True
+                
+                if is_win:
+                    wins += 1
+                else:
+                    losses += 1
             
-        dirs = [x['dir'] for x in active_directions]
-        up_votes = dirs.count(1)
-        down_votes = dirs.count(-1)
-        
-        final_dir = 0
-        if up_votes > down_votes:
-            final_dir = 1
-        elif down_votes > up_votes:
-            final_dir = -1
-        else:
-            # Tie -> Abstain
-            continue
-        
-        # Identify the voters that formed the majority decision
-        winning_voters = [x for x in active_directions if x['dir'] == final_dir]
-        
-        # --- CORRECTNESS FILTER ---
-        if all(x['is_flat'] for x in winning_voters):
-            continue 
-            
-        unique_total += 1
-        
-        # Win if ANY of the winning voters were correct
-        if any(x['is_correct'] for x in winning_voters):
-            unique_correct += 1
-
-    return unique_correct, unique_total
-
-def run_grid_search():
-    prices = get_binance_data()
-    if len(prices) < 500: return
-
-    # --- UPDATED GRID SEARCH LOGIC ---
-    # Testing buckets from 10 to 250 in steps of 10
-    bucket_counts = list(range(10, 251, 10))
-    seq_lengths = [3, 4, 5, 6, 8]
-    
-    results = []
-    
-    print(f"\n--- Starting Grid Search ({len(bucket_counts) * len(seq_lengths)} combinations) ---")
-    print(f"{'Count':<8} | {'Size':<8} | {'SeqLen':<8} | {'Best Model':<12} | {'Dir Acc %':<10} | {'Trades':<8}")
-    print("-" * 75)
-
-    for b_count in bucket_counts:
-        # Calculate size dynamically based on this count target
-        b_size = calculate_bucket_size(prices, b_count)
-        
-        for s_len in seq_lengths:
-            accuracy, model_name, trades = evaluate_parameters(prices, b_size, s_len)
-            
-            # Filter low trade count
-            if trades > 20: 
-                results.append({
-                    "bucket_count": b_count, # Store count for ref
-                    "bucket_size": b_size,   # Store size for usage
-                    "seq_len": s_len,
-                    "model": model_name,
-                    "accuracy": accuracy,
-                    "trades": trades
-                })
-                print(f"{b_count:<8} | {b_size:<8.4f} | {s_len:<8} | {model_name:<12} | {accuracy:<10.2f} | {trades:<8}")
-
-    # Top 5
-    results.sort(key=lambda x: x['accuracy'], reverse=True)
-    top_5 = results[:5]
-    
-    print("\n" + "="*50)
-    print(" TOP 5 CONFIGURATIONS ")
-    print("="*50)
-    for i, res in enumerate(top_5):
-        print(f"#{i+1}: Count {res['bucket_count']} (Size {res['bucket_size']:.4f}), Len {res['seq_len']} ({res['model']}) -> {res['accuracy']:.2f}% ({res['trades']} trades)")
-
-    # Combined Analysis
-    if len(top_5) > 0:
-        u_correct, u_total = run_portfolio_analysis(prices, top_5)
-        print("\n" + "="*50)
-        print(" FINAL PORTFOLIO RESULT (Union of Top 5) ")
-        print("="*50)
-        if u_total > 0:
-            print(f"Combined Unique Trades: {u_total}")
-            print(f"Combined Accuracy:      {(u_correct/u_total)*100:.2f}%")
-        else:
-            print("No unique trades found (Models might be conflicting or silence each other).")
+            # Metrics
+            total_trades = wins + losses
+            if total_trades > 0:
+                dma = (wins / total_trades) * 100
+                activity_ratio = total_trades / (total_trades + flats_outcome)
+            else:
+                dma = 0.0
+                activity_ratio = 0.0
+                
+            # deviation check
+            deviation = dma - strat.listed_accuracy
+            status = "OK"
+            if abs(deviation) > 20.0:
+                status = "!!! ALARM !!!"
+            elif total_trades < 10:
+                status = "LOW DATA"
+                
+            print(f"{strat.id:<20} | {strat.listed_accuracy:>8.2f}% | {dma:>8.2f}%   | {total_trades:>8} | {activity_ratio:>8.2f}   | {status}")
 
 if __name__ == "__main__":
-    run_grid_search()
+    bt = Backtester()
+    bt.load_strategies()
+    bt.run_backtest()
