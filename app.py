@@ -5,7 +5,6 @@ import time
 import os
 import sys
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
 
 # =========================================
 # 1. CONFIGURATION
@@ -18,10 +17,8 @@ START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
 # --- Grid Search Ranges ---
-# X: Multiplier for Tick Size (e.g., 50 * 0.01 = 0.5 price movement)
-X_START = 50
-X_END = 400
-X_STEP = 50
+# N: Number of Buckets to divide the Training Range into
+N_BUCKETS_LIST = [16, 32, 64, 128]
 
 # B: Lookback candles for lag features
 B_START = 2
@@ -51,13 +48,6 @@ def slow_print(text, delay=PRINT_DELAY):
     print(text)
     sys.stdout.flush()
     time.sleep(delay)
-
-def get_tick_size(symbol):
-    exchange = ccxt.binance()
-    markets = exchange.load_markets()
-    if symbol not in markets:
-        raise ValueError(f"Symbol {symbol} not found on Binance.")
-    return markets[symbol]['precision']['price']
 
 def get_ohlcv_data(symbol, timeframe, start_str, end_str):
     if os.path.exists(FILE_PATH):
@@ -102,21 +92,26 @@ def get_ohlcv_data(symbol, timeframe, start_str, end_str):
     df.to_csv(FILE_PATH)
     return df
 
-def prepare_data(df_input, tick_size, x, b):
+def prepare_features_and_target(df_input, step_size, b):
+    """
+    df_input: Full dataset (or slice)
+    step_size: Calculated externally based on Training Range
+    b: Number of lag features
+    """
     df = df_input.copy()
-    step_size = x * tick_size
     
-    # 1. Round Close price
-    df['close_rounded'] = np.round(df['close'] / step_size) * step_size
-    df['price_step_index'] = np.round(df['close'] / step_size)
+    # 1. Bucketize Price (Discretization)
+    # Using floor division to get bucket index (e.g., 5 // 10 = 0, 11 // 10 = 1)
+    # We add 1 just to match the user's "5=1, 11=2" mental model, though mathematically it doesn't change the derivative.
+    df['bucket_index'] = np.floor(df['close'] / step_size).astype(int) + 1
 
-    # 2. Log Returns
+    # 2. Log Returns (Features)
     df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
-    # 3. Target: Derivative of steps
-    df['target_derivative'] = df['price_step_index'].shift(-1) - df['price_step_index']
+    # 3. Target: Derivative of Bucket Index
+    df['target_derivative'] = df['bucket_index'].shift(-1) - df['bucket_index']
     
-    # 4. Features
+    # 4. Create Lag Features
     feature_cols = []
     for i in range(1, b + 1):
         col_name = f'lag_{i}'
@@ -127,7 +122,7 @@ def prepare_data(df_input, tick_size, x, b):
     return df, feature_cols
 
 def calculate_metrics_and_score(y_true, y_pred_raw):
-    # Round predictions
+    # Round predictions to nearest bucket step
     y_pred = np.round(y_pred_raw)
     
     results = pd.DataFrame({'actual': y_true, 'pred': y_pred})
@@ -137,7 +132,7 @@ def calculate_metrics_and_score(y_true, y_pred_raw):
     total_trades = len(directional_preds)
     
     if total_trades == 0:
-        return 0.0, 0.0, 0, -1.0 # Return -1 score for no trades
+        return 0.0, 0.0, 0, -1.0 
 
     # 1. Flat Outcome Ratio
     flat_outcomes = directional_preds[directional_preds['actual'] == 0]
@@ -162,27 +157,35 @@ def calculate_metrics_and_score(y_true, y_pred_raw):
 # =========================================
 
 def main():
-    slow_print("--- STARTING GRID SEARCH ---")
+    slow_print("--- STARTING GRID SEARCH (BUCKET LOGIC) ---")
     
-    try:
-        tick_size = get_tick_size(SYMBOL)
-    except Exception as e:
-        slow_print(f"[CRITICAL] {e}")
-        return
-
+    # 1. Load Data
     try:
         df_raw = get_ohlcv_data(SYMBOL, TIMEFRAME, START_DATE, END_DATE)
     except Exception as e:
         slow_print(f"[CRITICAL] {e}")
         return
 
-    x_values = list(range(X_START, X_END + 1, X_STEP))
-    b_values = list(range(B_START, B_END + 1))
+    # 2. Determine Split Points
+    n_total = len(df_raw)
+    train_end_idx = int(n_total * 0.60)
+    val_end_idx = int(n_total * 0.80)
+
+    # 3. Calculate Training Range (For Step Size)
+    # CRITICAL: Only use training data to determine step size to avoid leakage
+    train_slice = df_raw.iloc[:train_end_idx]
+    train_min = train_slice['close'].min()
+    train_max = train_slice['close'].max()
+    train_range = train_max - train_min
     
-    total_combinations = len(x_values) * len(b_values)
-    slow_print(f"[INFO] Grid: X({len(x_values)}) * B({len(b_values)}) = {total_combinations} combinations.")
+    slow_print(f"[INFO] Train Data Range: {train_min:.2f} to {train_max:.2f} (Diff: {train_range:.2f})")
+
+    # 4. Prepare Grid
+    b_values = list(range(B_START, B_END + 1))
+    total_combinations = len(N_BUCKETS_LIST) * len(b_values)
+    
+    slow_print(f"[INFO] Grid: N_Buckets({len(N_BUCKETS_LIST)}) * B({len(b_values)}) = {total_combinations} combinations.")
     slow_print(f"[INFO] FILTER: Discard if Accuracy < {MIN_ACCURACY_THRESHOLD:.0%}")
-    slow_print(f"[INFO] Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)")
     slow_print("-" * 40)
 
     best_score = -float('inf')
@@ -191,25 +194,37 @@ def main():
     
     counter = 0
     
-    for x in x_values:
+    # --- LOOP ---
+    for n in N_BUCKETS_LIST:
+        # Calculate Step Size for this N
+        step_size = train_range / n
+        
+        # Optimization: Prepare entire DF with this step_size once per N
+        # We loop B inside, so features (lags) change, but targets (buckets) stay same for this N.
+        # However, prepare_features drops NA based on B, so we must be careful.
+        # For simplicity/safety, we re-run prepare per iteration (overhead is low for this data size).
+        
         for b in b_values:
             counter += 1
             
-            # Prepare Data
-            df_processed, feature_cols = prepare_data(df_raw, tick_size, x, b)
+            # Prepare Data with dynamic Step Size
+            df_processed, feature_cols = prepare_features_and_target(df_raw, step_size, b)
             
             X_feat = df_processed[feature_cols]
             y = df_processed['target_derivative']
             
-            # Split (60/20 Train/Val)
-            n = len(df_processed)
-            train_end = int(n * 0.60)
-            val_end = int(n * 0.80)
+            # We need to respect the original time indices for splitting
+            # Since prepare_data drops 'b' rows from start, we need to adjust indices or slice by timestamp
+            # Safest is to slice by count, acknowledging a tiny shift of 'b' candles is negligible
             
-            X_train = X_feat.iloc[:train_end]
-            y_train = y.iloc[:train_end]
-            X_val = X_feat.iloc[train_end:val_end]
-            y_val = y.iloc[train_end:val_end]
+            n_proc = len(df_processed)
+            t_end = int(n_proc * 0.60)
+            v_end = int(n_proc * 0.80)
+            
+            X_train = X_feat.iloc[:t_end]
+            y_train = y.iloc[:t_end]
+            X_val = X_feat.iloc[t_end:v_end]
+            y_val = y.iloc[t_end:v_end]
             
             # Train Random Forest
             rf = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
@@ -224,17 +239,15 @@ def main():
             
             # --- FILTER ---
             if acc < MIN_ACCURACY_THRESHOLD:
-                # Optional: Print filtered results sparingly (e.g., if highly active)
-                # print(f"  [FILTERED] X={x} B={b} (Acc: {acc:.1%} < 60%)")
                 continue
             
             # Output valid candidate
-            if counter % 10 == 0 or score > best_score:
-                print(f"[{counter}/{total_combinations}] X={x}, B={b} | Score: {score:.2f} | Acc: {acc:.1%} | Trades: {trades} | Flat: {flat_ratio:.1%}")
+            if counter % 5 == 0 or score > best_score:
+                print(f"[{counter}/{total_combinations}] N={n} (Step:{step_size:.2f}), B={b} | Score: {score:.2f} | Acc: {acc:.1%} | Trades: {trades} | Flat: {flat_ratio:.1%}")
 
             if score > best_score:
                 best_score = score
-                best_params = {'x': x, 'b': b}
+                best_params = {'n': n, 'step_size': step_size, 'b': b}
                 best_metrics = {'acc': acc, 'trades': trades, 'flat': flat_ratio}
 
     slow_print("-" * 40)
@@ -245,7 +258,8 @@ def main():
         return
 
     slow_print(f"BEST PARAMETERS FOUND:")
-    slow_print(f"X (Multiplier) : {best_params['x']}")
+    slow_print(f"N (Buckets)    : {best_params['n']}")
+    slow_print(f"Step Size      : {best_params['step_size']:.4f}")
     slow_print(f"B (Candles)    : {best_params['b']}")
     slow_print(f"Validation Score : {best_score:.4f}")
     slow_print(f" > Accuracy      : {best_metrics['acc']:.2%}")
@@ -255,22 +269,23 @@ def main():
     slow_print("-" * 40)
     slow_print("--- RUNNING FINAL TEST ON BEST PARAMS ---")
     
-    x_best = best_params['x']
+    # Re-run best on Test Set
+    step_best = best_params['step_size']
     b_best = best_params['b']
     
-    df_final, feat_cols_final = prepare_data(df_raw, tick_size, x_best, b_best)
+    df_final, feat_cols_final = prepare_features_and_target(df_raw, step_best, b_best)
     
     X_f = df_final[feat_cols_final]
     y_f = df_final['target_derivative']
     
-    n = len(df_final)
-    train_end = int(n * 0.60)
-    val_end = int(n * 0.80)
+    n_proc = len(df_final)
+    t_end = int(n_proc * 0.60)
+    v_end = int(n_proc * 0.80)
     
-    X_train_final = X_f.iloc[:train_end]
-    y_train_final = y_f.iloc[:train_end]
-    X_test_final = X_f.iloc[val_end:] 
-    y_test_final = y_f.iloc[val_end:]
+    X_train_final = X_f.iloc[:t_end]
+    y_train_final = y_f.iloc[:t_end]
+    X_test_final = X_f.iloc[v_end:] 
+    y_test_final = y_f.iloc[v_end:]
     
     rf_final = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
     rf_final.fit(X_train_final, y_train_final)
