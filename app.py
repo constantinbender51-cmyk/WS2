@@ -101,8 +101,7 @@ def prepare_features_and_target(df_input, step_size, b):
     df = df_input.copy()
     
     # 1. Bucketize Price (Discretization)
-    # Using floor division to get bucket index (e.g., 5 // 10 = 0, 11 // 10 = 1)
-    # We add 1 just to match the user's "5=1, 11=2" mental model, though mathematically it doesn't change the derivative.
+    # Using floor division to get bucket index
     df['bucket_index'] = np.floor(df['close'] / step_size).astype(int) + 1
 
     # 2. Log Returns (Features)
@@ -169,8 +168,7 @@ def main():
     # 2. Determine Split Points
     n_total = len(df_raw)
     train_end_idx = int(n_total * 0.60)
-    val_end_idx = int(n_total * 0.80)
-
+    
     # 3. Calculate Training Range (For Step Size)
     # CRITICAL: Only use training data to determine step size to avoid leakage
     train_slice = df_raw.iloc[:train_end_idx]
@@ -199,11 +197,6 @@ def main():
         # Calculate Step Size for this N
         step_size = train_range / n
         
-        # Optimization: Prepare entire DF with this step_size once per N
-        # We loop B inside, so features (lags) change, but targets (buckets) stay same for this N.
-        # However, prepare_features drops NA based on B, so we must be careful.
-        # For simplicity/safety, we re-run prepare per iteration (overhead is low for this data size).
-        
         for b in b_values:
             counter += 1
             
@@ -212,10 +205,6 @@ def main():
             
             X_feat = df_processed[feature_cols]
             y = df_processed['target_derivative']
-            
-            # We need to respect the original time indices for splitting
-            # Since prepare_data drops 'b' rows from start, we need to adjust indices or slice by timestamp
-            # Safest is to slice by count, acknowledging a tiny shift of 'b' candles is negligible
             
             n_proc = len(df_processed)
             t_end = int(n_proc * 0.60)
@@ -257,7 +246,7 @@ def main():
         slow_print("[WARNING] No parameters met the 60% accuracy threshold.")
         return
 
-    slow_print(f"BEST PARAMETERS FOUND:")
+    slow_print(f"BEST VALIDATION PARAMETERS FOUND:")
     slow_print(f"N (Buckets)    : {best_params['n']}")
     slow_print(f"Step Size      : {best_params['step_size']:.4f}")
     slow_print(f"B (Candles)    : {best_params['b']}")
@@ -267,38 +256,7 @@ def main():
     slow_print(f" > Flat Ratio    : {best_metrics['flat']:.2%}")
     
     slow_print("-" * 40)
-    slow_print("--- RUNNING FINAL TEST ON BEST PARAMS ---")
-    
-    # Re-run best on Test Set
-    step_best = best_params['step_size']
-    b_best = best_params['b']
-    
-    df_final, feat_cols_final = prepare_features_and_target(df_raw, step_best, b_best)
-    
-    X_f = df_final[feat_cols_final]
-    y_f = df_final['target_derivative']
-    
-    n_proc = len(df_final)
-    t_end = int(n_proc * 0.60)
-    v_end = int(n_proc * 0.80)
-    
-    X_train_final = X_f.iloc[:t_end]
-    y_train_final = y_f.iloc[:t_end]
-    X_test_final = X_f.iloc[v_end:] 
-    y_test_final = y_f.iloc[v_end:]
-    
-    rf_final = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
-    rf_final.fit(X_train_final, y_train_final)
-    
-    test_preds = rf_final.predict(X_test_final)
-    t_acc, t_flat, t_trades, t_score = calculate_metrics_and_score(y_test_final, test_preds)
-    
-    slow_print(f"[TEST SET RESULTS]")
-    slow_print(f"Non-Flat Accuracy : {t_acc:.2%}")
-    slow_print(f"Total Trades      : {t_trades}")
-    slow_print(f"Flat Outcome Ratio: {t_flat:.2%}")
-    slow_print(f"Final Score       : {t_score:.4f}")
-    slow_print("--- DONE ---")
+    slow_print("[INFO] Test set results hidden as requested.")
 
 if __name__ == "__main__":
     main()
