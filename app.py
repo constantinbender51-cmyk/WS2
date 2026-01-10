@@ -17,10 +17,10 @@ TIMEFRAME = '15m'
 START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
-# --- Grid Search Ranges ---
-X_START = 200
-X_END = 2000
-X_STEP = 100
+# --- Grid Search Ranges (UPDATED) ---
+X_START = 50
+X_END = 400
+X_STEP = 50
 
 B_START = 2
 B_END = 10
@@ -31,6 +31,7 @@ FILE_NAME = 'ethusdt_15m_2020_2026.csv'
 FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
 # --- Model Settings for Grid Search ---
+# Optimizing Random Forest (Tree) Performance
 RF_ESTIMATORS = 30 
 RF_MAX_DEPTH = 8
 RANDOM_STATE = 42
@@ -146,10 +147,8 @@ def calculate_metrics_and_score(y_true, y_pred_raw):
         correct_direction = np.sign(valid_scoring_moves['pred']) == np.sign(valid_scoring_moves['actual'])
         accuracy = correct_direction.sum() / len(valid_scoring_moves)
 
-    # 3. NEW CUSTOM SCORE
+    # 3. CUSTOM SCORE
     # Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)
-    # This sets 50% accuracy as the baseline (score 0). 
-    # Below 50% becomes negative score.
     score = (accuracy - 0.50) * total_trades * (1 - flat_ratio)
 
     return accuracy, flat_ratio, total_trades, score
@@ -173,15 +172,17 @@ def main():
         slow_print(f"[CRITICAL] {e}")
         return
 
+    # Range is inclusive of start, exclusive of end in Python, so we add Step to end to include 400
     x_values = list(range(X_START, X_END + 1, X_STEP))
     b_values = list(range(B_START, B_END + 1))
     
     total_combinations = len(x_values) * len(b_values)
     slow_print(f"[INFO] Grid: X({len(x_values)}) * B({len(b_values)}) = {total_combinations} combinations.")
+    slow_print(f"[INFO] Optimizing: RANDOM FOREST (TREE)")
     slow_print(f"[INFO] Optimizing Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)")
     slow_print("-" * 40)
 
-    best_score = -float('inf') # Initialize to negative infinity since scores can be negative
+    best_score = -float('inf')
     best_params = {}
     best_metrics = {}
     
@@ -207,7 +208,7 @@ def main():
             X_val = X_feat.iloc[train_end:val_end]
             y_val = y.iloc[train_end:val_end]
             
-            # Train
+            # Train Random Forest
             rf = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
                                        max_depth=RF_MAX_DEPTH, 
                                        n_jobs=-1, 
