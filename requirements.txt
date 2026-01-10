@@ -1,6 +1,6 @@
+ccxt
 numpy
-tensorflow
-requests
-matplotlib
-python-dotenv
 pandas
+python-dotenv
+requests
+scikit-learn
