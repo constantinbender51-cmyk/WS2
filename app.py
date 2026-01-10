@@ -18,7 +18,7 @@ START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
 # --- Feature Engineering Parameters ---
-ROUNDING_MULTIPLIER = 1000      # 'x': Used to calculate step size (x * tick_size)
+ROUNDING_MULTIPLIER = 2000      # 'x': Used to calculate step size (x * tick_size)
 LOOKBACK_CANDLES = 5           # 'b': Number of previous candles to use as features
 
 # --- Data Storage ---
