@@ -33,7 +33,7 @@ FILE_NAME = 'ethusdt_15m_2020_2026.csv'
 FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
 # --- Model Settings ---
-RF_ESTIMATORS = 30 
+RF_ESTIMATORS = 60
 RF_MAX_DEPTH = 8
 RANDOM_STATE = 42
 
