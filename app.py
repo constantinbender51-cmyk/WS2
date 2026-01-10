@@ -18,7 +18,7 @@ START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
 # --- Feature Engineering Parameters ---
-ROUNDING_MULTIPLIER = 1000       # 'x': Used to calculate step size (x * tick_size)
+ROUNDING_MULTIPLIER = 1000      # 'x': Used to calculate step size (x * tick_size)
 LOOKBACK_CANDLES = 5           # 'b': Number of previous candles to use as features
 
 # --- Data Storage ---
@@ -28,7 +28,7 @@ FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
 # --- Model Hyperparameters ---
 RF_ESTIMATORS = 50             # Random Forest number of trees
-RF_MAX_DEPTH = 10          # Random Forest max depth
+RF_MAX_DEPTH = 10              # Random Forest max depth
 RANDOM_STATE = 42              # Seed for reproducibility
 
 # --- Output Settings ---
@@ -99,21 +99,28 @@ def prepare_data(df, tick_size, x, b):
     slow_print("[PROCESSING] Rounding prices...")
     step_size = x * tick_size
     
-    # Calculate the integer "step" index (e.g., price 2000 with step 10 -> index 200)
+    # 1. Round Close price to nearest Grid Step
+    df['close_rounded'] = np.round(df['close'] / step_size) * step_size
+    
+    # 2. Calculate the integer "step" index for the Target
+    # (Used to calculate the derivative +1, -1, etc.)
     df['price_step_index'] = np.round(df['close'] / step_size)
 
-    slow_print("[PROCESSING] Computing Log Returns...")
-    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+    # 3. Compute Log of ROUNDED Price (No Returns)
+    slow_print("[PROCESSING] Computing Log of Rounded Prices...")
+    # Ensure no zero division/log errors (though unlikely for ETH)
+    df = df[df['close_rounded'] > 0].copy()
+    df['log_rounded_price'] = np.log(df['close_rounded'])
     
     slow_print("[PROCESSING] Creating targets and features...")
     # Target: The change in steps (derivative)
-    # e.g., Index 200 -> Index 202 = Target +2
     df['target_derivative'] = df['price_step_index'].shift(-1) - df['price_step_index']
     
     feature_cols = []
     for i in range(1, b + 1):
         col_name = f'lag_{i}'
-        df[col_name] = df['log_returns'].shift(i)
+        # Features: Lagged LOG ROUNDED PRICES
+        df[col_name] = df['log_rounded_price'].shift(i)
         feature_cols.append(col_name)
     
     df.dropna(inplace=True)
@@ -177,7 +184,7 @@ def main():
     df_processed, feature_cols = prepare_data(df, tick_size, ROUNDING_MULTIPLIER, LOOKBACK_CANDLES)
     
     X = df_processed[feature_cols]
-    y = df_processed['target_derivative'] # Integers (-1, 0, 1, 2...)
+    y = df_processed['target_derivative'] 
     
     n = len(df_processed)
     train_end = int(n * 0.60)
