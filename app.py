@@ -99,18 +99,15 @@ def prepare_data(df, tick_size, x, b):
     slow_print("[PROCESSING] Rounding prices...")
     step_size = x * tick_size
     
-    # 1. Round Close price to nearest Grid Step
+    # 1. Round Close price to nearest Grid Step (for Target Calculation)
     df['close_rounded'] = np.round(df['close'] / step_size) * step_size
     
     # 2. Calculate the integer "step" index for the Target
-    # (Used to calculate the derivative +1, -1, etc.)
     df['price_step_index'] = np.round(df['close'] / step_size)
 
-    # 3. Compute Log of ROUNDED Price (No Returns)
-    slow_print("[PROCESSING] Computing Log of Rounded Prices...")
-    # Ensure no zero division/log errors (though unlikely for ETH)
-    df = df[df['close_rounded'] > 0].copy()
-    df['log_rounded_price'] = np.log(df['close_rounded'])
+    # 3. Compute Log Returns
+    slow_print("[PROCESSING] Computing Log Returns...")
+    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
     slow_print("[PROCESSING] Creating targets and features...")
     # Target: The change in steps (derivative)
@@ -119,8 +116,8 @@ def prepare_data(df, tick_size, x, b):
     feature_cols = []
     for i in range(1, b + 1):
         col_name = f'lag_{i}'
-        # Features: Lagged LOG ROUNDED PRICES
-        df[col_name] = df['log_rounded_price'].shift(i)
+        # Features: Lagged Log Returns
+        df[col_name] = df['log_returns'].shift(i)
         feature_cols.append(col_name)
     
     df.dropna(inplace=True)
@@ -141,7 +138,7 @@ def calculate_metrics(y_true, y_pred_raw):
     total_predictions = len(directional_preds)
     
     if total_predictions == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0
 
     # 3. Metric: Flat Outcome Ratio (Ghost Moves)
     # Model said move, Market stayed flat (Actual == 0)
@@ -159,7 +156,7 @@ def calculate_metrics(y_true, y_pred_raw):
         correct_direction = np.sign(valid_scoring_moves['pred']) == np.sign(valid_scoring_moves['actual'])
         accuracy = correct_direction.sum() / len(valid_scoring_moves)
 
-    return accuracy, flat_outcome_ratio
+    return accuracy, flat_outcome_ratio, total_predictions
 
 # =========================================
 # 3. MAIN EXECUTION
@@ -201,7 +198,7 @@ def main():
     lr_model.fit(X_train, y_train)
     lr_pred = lr_model.predict(X_test)
     
-    lr_acc, lr_flat_ratio = calculate_metrics(y_test, lr_pred)
+    lr_acc, lr_flat_ratio, lr_total_preds = calculate_metrics(y_test, lr_pred)
     
     # --- Random Forest ---
     slow_print("--- TRAINING RANDOM FOREST ---")
@@ -212,7 +209,7 @@ def main():
     rf_model.fit(X_train, y_train)
     rf_pred = rf_model.predict(X_test)
     
-    rf_acc, rf_flat_ratio = calculate_metrics(y_test, rf_pred)
+    rf_acc, rf_flat_ratio, rf_total_preds = calculate_metrics(y_test, rf_pred)
 
     # --- REPORTING ---
     slow_print("--- FINAL PERFORMANCE METRICS ---")
@@ -222,14 +219,16 @@ def main():
     slow_print("-" * 30)
 
     slow_print(f"[LINEAR REGRESSION]")
-    slow_print(f"Non-Flat Accuracy:  {lr_acc:.2%}")
-    slow_print(f"Flat Outcome Ratio:   {lr_flat_ratio:.2%}")
+    slow_print(f"Total Directional Preds: {lr_total_preds}")
+    slow_print(f"Non-Flat Accuracy:       {lr_acc:.2%}")
+    slow_print(f"Flat Outcome Ratio:      {lr_flat_ratio:.2%}")
     
     slow_print(f"-" * 15)
     
     slow_print(f"[RANDOM FOREST]")
-    slow_print(f"Non-Flat Accuracy:  {rf_acc:.2%}")
-    slow_print(f"Flat Outcome Ratio:   {rf_flat_ratio:.2%}")
+    slow_print(f"Total Directional Preds: {rf_total_preds}")
+    slow_print(f"Non-Flat Accuracy:       {rf_acc:.2%}")
+    slow_print(f"Flat Outcome Ratio:      {rf_flat_ratio:.2%}")
     
     slow_print("--- ANALYSIS COMPLETE ---")
 
