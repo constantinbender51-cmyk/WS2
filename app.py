@@ -18,12 +18,17 @@ START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
 # --- Grid Search Ranges ---
+# X: Multiplier for Tick Size (e.g., 50 * 0.01 = 0.5 price movement)
 X_START = 50
 X_END = 400
 X_STEP = 50
 
+# B: Lookback candles for lag features
 B_START = 2
 B_END = 10
+
+# --- Filtering ---
+MIN_ACCURACY_THRESHOLD = 0.60  # 60%
 
 # --- Data Storage ---
 DATA_DIR = '/app/data/'
@@ -121,42 +126,43 @@ def prepare_data(df_input, tick_size, x, b):
     df.dropna(inplace=True)
     return df, feature_cols
 
-def calculate_accuracy_only(y_true, y_pred_raw):
-    """
-    Calculates pure directional accuracy for non-flat predictions.
-    """
+def calculate_metrics_and_score(y_true, y_pred_raw):
     # Round predictions
     y_pred = np.round(y_pred_raw)
     
     results = pd.DataFrame({'actual': y_true, 'pred': y_pred})
     
-    # Filter for directional predictions (Model != 0)
+    # Filter for directional predictions
     directional_preds = results[results['pred'] != 0]
     total_trades = len(directional_preds)
     
     if total_trades == 0:
-        return 0.0, 0
+        return 0.0, 0.0, 0, -1.0 # Return -1 score for no trades
 
-    # Accuracy: (Model != 0) AND (Model Sign == Actual Sign)
-    # We filter out cases where actual was 0 (ghost moves) from the *numerator* of accuracy usually,
-    # but strictly speaking "Accuracy" is Correct / Total.
-    # If model says +1 and market is 0, that is WRONG (False Positive).
-    
-    # Check strict correctness:
-    # If pred > 0, actual must be > 0. If pred < 0, actual must be < 0.
-    correct_direction = np.sign(directional_preds['pred']) == np.sign(directional_preds['actual'])
-    
-    # Note: np.sign(0) is 0. So if actual is 0, sign won't match pred (+1/-1), which is correct (it's a miss).
-    accuracy = correct_direction.sum() / total_trades
+    # 1. Flat Outcome Ratio
+    flat_outcomes = directional_preds[directional_preds['actual'] == 0]
+    flat_ratio = len(flat_outcomes) / total_trades
 
-    return accuracy, total_trades
+    # 2. Non-Flat Accuracy
+    valid_scoring_moves = directional_preds[directional_preds['actual'] != 0]
+    if len(valid_scoring_moves) == 0:
+        accuracy = 0.0
+    else:
+        correct_direction = np.sign(valid_scoring_moves['pred']) == np.sign(valid_scoring_moves['actual'])
+        accuracy = correct_direction.sum() / len(valid_scoring_moves)
+
+    # 3. CUSTOM SCORE
+    # Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)
+    score = (accuracy - 0.50) * total_trades * (1 - flat_ratio)
+
+    return accuracy, flat_ratio, total_trades, score
 
 # =========================================
 # 3. MAIN EXECUTION
 # =========================================
 
 def main():
-    slow_print("--- STARTING GRID SEARCH (ACCURACY ONLY) ---")
+    slow_print("--- STARTING GRID SEARCH ---")
     
     try:
         tick_size = get_tick_size(SYMBOL)
@@ -170,18 +176,18 @@ def main():
         slow_print(f"[CRITICAL] {e}")
         return
 
-    # Range is inclusive of start, exclusive of end in Python
     x_values = list(range(X_START, X_END + 1, X_STEP))
     b_values = list(range(B_START, B_END + 1))
     
     total_combinations = len(x_values) * len(b_values)
     slow_print(f"[INFO] Grid: X({len(x_values)}) * B({len(b_values)}) = {total_combinations} combinations.")
-    slow_print(f"[INFO] Optimizing: VALIDATION ACCURACY")
+    slow_print(f"[INFO] FILTER: Discard if Accuracy < {MIN_ACCURACY_THRESHOLD:.0%}")
+    slow_print(f"[INFO] Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)")
     slow_print("-" * 40)
 
-    best_acc = -1.0
+    best_score = -float('inf')
     best_params = {}
-    best_trades = 0
+    best_metrics = {}
     
     counter = 0
     
@@ -214,26 +220,70 @@ def main():
             
             # Validate
             preds = rf.predict(X_val)
-            acc, trades = calculate_accuracy_only(y_val, preds)
+            acc, flat_ratio, trades, score = calculate_metrics_and_score(y_val, preds)
             
-            # Output
-            if counter % 10 == 0 or acc > best_acc:
-                print(f"[{counter}/{total_combinations}] X={x}, B={b} | Val Acc: {acc:.2%} ({trades} trades)")
+            # --- FILTER ---
+            if acc < MIN_ACCURACY_THRESHOLD:
+                # Optional: Print filtered results sparingly (e.g., if highly active)
+                # print(f"  [FILTERED] X={x} B={b} (Acc: {acc:.1%} < 60%)")
+                continue
+            
+            # Output valid candidate
+            if counter % 10 == 0 or score > best_score:
+                print(f"[{counter}/{total_combinations}] X={x}, B={b} | Score: {score:.2f} | Acc: {acc:.1%} | Trades: {trades} | Flat: {flat_ratio:.1%}")
 
-            if acc > best_acc:
-                best_acc = acc
+            if score > best_score:
+                best_score = score
                 best_params = {'x': x, 'b': b}
-                best_trades = trades
+                best_metrics = {'acc': acc, 'trades': trades, 'flat': flat_ratio}
 
     slow_print("-" * 40)
     slow_print("--- GRID SEARCH COMPLETE ---")
-    slow_print(f"BEST VALIDATION PARAMETERS:")
+    
+    if not best_params:
+        slow_print("[WARNING] No parameters met the 60% accuracy threshold.")
+        return
+
+    slow_print(f"BEST PARAMETERS FOUND:")
     slow_print(f"X (Multiplier) : {best_params['x']}")
     slow_print(f"B (Candles)    : {best_params['b']}")
-    slow_print(f"Validation Acc : {best_acc:.2%}")
-    slow_print(f"Total Trades   : {best_trades}")
+    slow_print(f"Validation Score : {best_score:.4f}")
+    slow_print(f" > Accuracy      : {best_metrics['acc']:.2%}")
+    slow_print(f" > Trades        : {best_metrics['trades']}")
+    slow_print(f" > Flat Ratio    : {best_metrics['flat']:.2%}")
+    
     slow_print("-" * 40)
-    slow_print("[INFO] Test set results hidden as requested.")
+    slow_print("--- RUNNING FINAL TEST ON BEST PARAMS ---")
+    
+    x_best = best_params['x']
+    b_best = best_params['b']
+    
+    df_final, feat_cols_final = prepare_data(df_raw, tick_size, x_best, b_best)
+    
+    X_f = df_final[feat_cols_final]
+    y_f = df_final['target_derivative']
+    
+    n = len(df_final)
+    train_end = int(n * 0.60)
+    val_end = int(n * 0.80)
+    
+    X_train_final = X_f.iloc[:train_end]
+    y_train_final = y_f.iloc[:train_end]
+    X_test_final = X_f.iloc[val_end:] 
+    y_test_final = y_f.iloc[val_end:]
+    
+    rf_final = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+    rf_final.fit(X_train_final, y_train_final)
+    
+    test_preds = rf_final.predict(X_test_final)
+    t_acc, t_flat, t_trades, t_score = calculate_metrics_and_score(y_test_final, test_preds)
+    
+    slow_print(f"[TEST SET RESULTS]")
+    slow_print(f"Non-Flat Accuracy : {t_acc:.2%}")
+    slow_print(f"Total Trades      : {t_trades}")
+    slow_print(f"Flat Outcome Ratio: {t_flat:.2%}")
+    slow_print(f"Final Score       : {t_score:.4f}")
+    slow_print("--- DONE ---")
 
 if __name__ == "__main__":
     main()
