@@ -16,13 +16,13 @@ TIMEFRAME = '15m'
 START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
-# --- Grid Search Ranges ---
-# N: Number of Buckets to divide the Training Range into
-N_BUCKETS_LIST = [16, 32, 64, 128]
+# --- Grid Search Ranges (UPDATED) ---
+# N: Number of Buckets (100 to 1000, step 100)
+N_BUCKETS_LIST = list(range(100, 1001, 100))
 
-# B: Lookback candles for lag features
+# B: Lookback candles (2 to 7)
 B_START = 2
-B_END = 10
+B_END = 7
 
 # --- Filtering ---
 MIN_ACCURACY_THRESHOLD = 0.60  # 60%
@@ -93,18 +93,12 @@ def get_ohlcv_data(symbol, timeframe, start_str, end_str):
     return df
 
 def prepare_features_and_target(df_input, step_size, b):
-    """
-    df_input: Full dataset (or slice)
-    step_size: Calculated externally based on Training Range
-    b: Number of lag features
-    """
     df = df_input.copy()
     
-    # 1. Bucketize Price (Discretization)
-    # Using floor division to get bucket index
+    # 1. Bucketize Price
     df['bucket_index'] = np.floor(df['close'] / step_size).astype(int) + 1
 
-    # 2. Log Returns (Features)
+    # 2. Log Returns
     df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
     # 3. Target: Derivative of Bucket Index
@@ -121,7 +115,6 @@ def prepare_features_and_target(df_input, step_size, b):
     return df, feature_cols
 
 def calculate_metrics_and_score(y_true, y_pred_raw):
-    # Round predictions to nearest bucket step
     y_pred = np.round(y_pred_raw)
     
     results = pd.DataFrame({'actual': y_true, 'pred': y_pred})
@@ -146,7 +139,6 @@ def calculate_metrics_and_score(y_true, y_pred_raw):
         accuracy = correct_direction.sum() / len(valid_scoring_moves)
 
     # 3. CUSTOM SCORE
-    # Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)
     score = (accuracy - 0.50) * total_trades * (1 - flat_ratio)
 
     return accuracy, flat_ratio, total_trades, score
@@ -169,8 +161,7 @@ def main():
     n_total = len(df_raw)
     train_end_idx = int(n_total * 0.60)
     
-    # 3. Calculate Training Range (For Step Size)
-    # CRITICAL: Only use training data to determine step size to avoid leakage
+    # 3. Calculate Training Range
     train_slice = df_raw.iloc[:train_end_idx]
     train_min = train_slice['close'].min()
     train_max = train_slice['close'].max()
@@ -194,13 +185,12 @@ def main():
     
     # --- LOOP ---
     for n in N_BUCKETS_LIST:
-        # Calculate Step Size for this N
         step_size = train_range / n
         
         for b in b_values:
             counter += 1
             
-            # Prepare Data with dynamic Step Size
+            # Prepare Data
             df_processed, feature_cols = prepare_features_and_target(df_raw, step_size, b)
             
             X_feat = df_processed[feature_cols]
@@ -215,7 +205,7 @@ def main():
             X_val = X_feat.iloc[t_end:v_end]
             y_val = y.iloc[t_end:v_end]
             
-            # Train Random Forest
+            # Train
             rf = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
                                        max_depth=RF_MAX_DEPTH, 
                                        n_jobs=-1, 
@@ -230,7 +220,7 @@ def main():
             if acc < MIN_ACCURACY_THRESHOLD:
                 continue
             
-            # Output valid candidate
+            # Output
             if counter % 5 == 0 or score > best_score:
                 print(f"[{counter}/{total_combinations}] N={n} (Step:{step_size:.2f}), B={b} | Score: {score:.2f} | Acc: {acc:.1%} | Trades: {trades} | Flat: {flat_ratio:.1%}")
 
