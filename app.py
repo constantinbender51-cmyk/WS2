@@ -18,7 +18,7 @@ START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
 # --- Feature Engineering Parameters ---
-ROUNDING_MULTIPLIER = 10       # 'x': Used to calculate step size (x * tick_size)
+ROUNDING_MULTIPLIER = 100       # 'x': Used to calculate step size (x * tick_size)
 LOOKBACK_CANDLES = 5           # 'b': Number of previous candles to use as features
 
 # --- Data Storage ---
@@ -28,7 +28,7 @@ FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
 # --- Model Hyperparameters ---
 RF_ESTIMATORS = 50             # Random Forest number of trees
-RF_MAX_DEPTH = 100            # Random Forest max depth
+RF_MAX_DEPTH = 10          # Random Forest max depth
 RANDOM_STATE = 42              # Seed for reproducibility
 
 # --- Output Settings ---
