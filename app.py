@@ -3,43 +3,49 @@ import pandas as pd
 import numpy as np
 import time
 import os
-from sklearn.linear_model import LinearRegression
+import sys
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 
 # =========================================
-# 1. GLOBAL CONFIGURATION
+# 1. CONFIGURATION
 # =========================================
 
 # --- Exchange & Data Settings ---
-SYMBOL = 'ETH/USDT'            # Pair to fetch
-TIMEFRAME = '15m'              # Candle timeframe
+SYMBOL = 'ETH/USDT'
+TIMEFRAME = '15m'
 START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
 
-# --- Feature Engineering Parameters ---
-ROUNDING_MULTIPLIER = 2000      # 'x': Used to calculate step size (x * tick_size)
-LOOKBACK_CANDLES = 5           # 'b': Number of previous candles to use as features
+# --- Grid Search Ranges ---
+X_START = 200
+X_END = 2000
+X_STEP = 100
+
+B_START = 2
+B_END = 10
 
 # --- Data Storage ---
 DATA_DIR = '/app/data/'
 FILE_NAME = 'ethusdt_15m_2020_2026.csv'
 FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
-# --- Model Hyperparameters ---
-RF_ESTIMATORS = 50             # Random Forest number of trees
-RF_MAX_DEPTH = 10              # Random Forest max depth
-RANDOM_STATE = 42              # Seed for reproducibility
+# --- Model Settings for Grid Search ---
+# Reduced slightly for speed during search, can be increased for final run
+RF_ESTIMATORS = 30 
+RF_MAX_DEPTH = 8
+RANDOM_STATE = 42
 
 # --- Output Settings ---
-PRINT_DELAY = 0.1              # Delay in seconds for text output
+PRINT_DELAY = 0.01  # Faster printing for grid search updates
 
 # =========================================
-# 2. UTILITY FUNCTIONS
+# 2. HELPER FUNCTIONS
 # =========================================
 
 def slow_print(text, delay=PRINT_DELAY):
     print(text)
+    sys.stdout.flush()
     time.sleep(delay)
 
 def get_tick_size(symbol):
@@ -50,16 +56,14 @@ def get_tick_size(symbol):
     return markets[symbol]['precision']['price']
 
 def get_ohlcv_data(symbol, timeframe, start_str, end_str):
-    # Check cache
     if os.path.exists(FILE_PATH):
-        slow_print(f"[CACHE] Found data at {FILE_PATH}. Loading...")
+        slow_print(f"[CACHE] Loading data from {FILE_PATH}...")
         df = pd.read_csv(FILE_PATH)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
         return df
 
-    # Fetch from API
-    slow_print(f"[API] File not found. Connecting to Binance...")
+    slow_print(f"[API] Fetching new data from Binance...")
     exchange = ccxt.binance()
     start_ts = exchange.parse8601(start_str)
     end_ts = exchange.parse8601(end_str)
@@ -92,145 +96,193 @@ def get_ohlcv_data(symbol, timeframe, start_str, end_str):
         os.makedirs(DATA_DIR)
     
     df.to_csv(FILE_PATH)
-    slow_print(f"[IO] Data saved to {FILE_PATH}.")
     return df
 
-def prepare_data(df, tick_size, x, b):
-    slow_print("[PROCESSING] Rounding prices...")
+def prepare_data(df_input, tick_size, x, b):
+    # Work on a copy to avoid SettingWithCopy warnings on the main DF
+    df = df_input.copy()
+    
     step_size = x * tick_size
     
-    # 1. Round Close price to nearest Grid Step (for Target Calculation)
+    # 1. Round Close price (Target calculation base)
     df['close_rounded'] = np.round(df['close'] / step_size) * step_size
-    
-    # 2. Calculate the integer "step" index for the Target
     df['price_step_index'] = np.round(df['close'] / step_size)
 
-    # 3. Compute Log Returns
-    slow_print("[PROCESSING] Computing Log Returns...")
+    # 2. Log Returns
     df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
-    slow_print("[PROCESSING] Creating targets and features...")
-    # Target: The change in steps (derivative)
+    # 3. Target
     df['target_derivative'] = df['price_step_index'].shift(-1) - df['price_step_index']
     
+    # 4. Features
     feature_cols = []
     for i in range(1, b + 1):
         col_name = f'lag_{i}'
-        # Features: Lagged Log Returns
         df[col_name] = df['log_returns'].shift(i)
         feature_cols.append(col_name)
     
     df.dropna(inplace=True)
     return df, feature_cols
 
-def calculate_metrics(y_true, y_pred_raw):
-    """
-    y_true: Actual integer step changes
-    y_pred_raw: Raw float predictions from model
-    """
-    # 1. Round predictions to nearest integer
+def calculate_metrics_and_score(y_true, y_pred_raw):
+    # Round predictions
     y_pred = np.round(y_pred_raw)
     
     results = pd.DataFrame({'actual': y_true, 'pred': y_pred})
     
-    # 2. Filter: Only look at where Model Predicted a Move (Non-Flat)
+    # Filter for directional predictions
     directional_preds = results[results['pred'] != 0]
-    total_predictions = len(directional_preds)
+    total_trades = len(directional_preds)
     
-    if total_predictions == 0:
-        return 0.0, 0.0, 0
+    # Default scores if no trades
+    if total_trades == 0:
+        return 0.0, 0.0, 0, 0.0
 
-    # 3. Metric: Flat Outcome Ratio (Ghost Moves)
-    # Model said move, Market stayed flat (Actual == 0)
+    # 1. Flat Outcome Ratio
     flat_outcomes = directional_preds[directional_preds['actual'] == 0]
-    flat_outcome_ratio = len(flat_outcomes) / total_predictions
+    flat_ratio = len(flat_outcomes) / total_trades
 
-    # 4. Metric: Non-Flat Accuracy
-    # Filter: Model Predicted Move AND Market Moved (Actual != 0)
+    # 2. Non-Flat Accuracy
     valid_scoring_moves = directional_preds[directional_preds['actual'] != 0]
-    
     if len(valid_scoring_moves) == 0:
         accuracy = 0.0
     else:
-        # Check if signs match (Direction correct)
         correct_direction = np.sign(valid_scoring_moves['pred']) == np.sign(valid_scoring_moves['actual'])
         accuracy = correct_direction.sum() / len(valid_scoring_moves)
 
-    return accuracy, flat_outcome_ratio, total_predictions
+    # 3. Custom Score
+    # Score = (Accuracy * Trades) / Flat_Outcome_Ratio
+    # Add epsilon to denominator to avoid division by zero
+    denominator = flat_ratio if flat_ratio > 0 else 1e-9
+    score = (accuracy * total_trades) / denominator
+
+    return accuracy, flat_ratio, total_trades, score
 
 # =========================================
 # 3. MAIN EXECUTION
 # =========================================
 
 def main():
-    slow_print("--- INITIALIZING SCRIPT ---")
+    slow_print("--- STARTING GRID SEARCH ---")
     
     try:
         tick_size = get_tick_size(SYMBOL)
-        slow_print(f"[INFO] Tick Size: {tick_size}")
     except Exception as e:
         slow_print(f"[CRITICAL] {e}")
         return
 
     try:
-        df = get_ohlcv_data(SYMBOL, TIMEFRAME, START_DATE, END_DATE)
+        df_raw = get_ohlcv_data(SYMBOL, TIMEFRAME, START_DATE, END_DATE)
     except Exception as e:
         slow_print(f"[CRITICAL] {e}")
         return
 
-    df_processed, feature_cols = prepare_data(df, tick_size, ROUNDING_MULTIPLIER, LOOKBACK_CANDLES)
+    # Generate Parameter Grid
+    # Range is exclusive at the end, so we add step to include the last number
+    x_values = list(range(X_START, X_END + 1, X_STEP))
+    b_values = list(range(B_START, B_END + 1))
     
-    X = df_processed[feature_cols]
-    y = df_processed['target_derivative'] 
+    total_combinations = len(x_values) * len(b_values)
+    slow_print(f"[INFO] Grid: X({len(x_values)}) * B({len(b_values)}) = {total_combinations} combinations.")
+    slow_print(f"[INFO] Optimizing Score = (Acc * Trades) / Flat_Ratio")
+    slow_print("-" * 40)
+
+    best_score = -1
+    best_params = {}
+    best_metrics = {}
     
-    n = len(df_processed)
+    counter = 0
+    
+    # --- GRID SEARCH LOOP ---
+    for x in x_values:
+        for b in b_values:
+            counter += 1
+            
+            # 1. Prepare Data
+            df_processed, feature_cols = prepare_data(df_raw, tick_size, x, b)
+            
+            X_feat = df_processed[feature_cols]
+            y = df_processed['target_derivative']
+            
+            # 2. Split (Train on 60%, Optimize on Validation 20%)
+            n = len(df_processed)
+            train_end = int(n * 0.60)
+            val_end = int(n * 0.80)
+            
+            X_train = X_feat.iloc[:train_end]
+            y_train = y.iloc[:train_end]
+            X_val = X_feat.iloc[train_end:val_end]
+            y_val = y.iloc[train_end:val_end]
+            
+            # 3. Train Model (Random Forest)
+            # Using slightly lighter params for speed
+            rf = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
+                                       max_depth=RF_MAX_DEPTH, 
+                                       n_jobs=-1, 
+                                       random_state=RANDOM_STATE)
+            rf.fit(X_train, y_train)
+            
+            # 4. Evaluate on Validation Set
+            preds = rf.predict(X_val)
+            acc, flat_ratio, trades, score = calculate_metrics_and_score(y_val, preds)
+            
+            # Print Progress every 10 iterations or if high score
+            if counter % 10 == 0 or score > best_score:
+                print(f"[{counter}/{total_combinations}] X={x}, B={b} | Score: {score:.2f} | Acc: {acc:.1%} | Trades: {trades} | Flat: {flat_ratio:.1%}")
+
+            # 5. Save Best
+            if score > best_score:
+                best_score = score
+                best_params = {'x': x, 'b': b}
+                best_metrics = {'acc': acc, 'trades': trades, 'flat': flat_ratio}
+
+    slow_print("-" * 40)
+    slow_print("--- GRID SEARCH COMPLETE ---")
+    slow_print(f"BEST PARAMETERS FOUND:")
+    slow_print(f"X (Multiplier) : {best_params['x']}")
+    slow_print(f"B (Candles)    : {best_params['b']}")
+    slow_print(f"Validation Score : {best_score:.4f}")
+    slow_print(f" > Accuracy      : {best_metrics['acc']:.2%}")
+    slow_print(f" > Trades        : {best_metrics['trades']}")
+    slow_print(f" > Flat Ratio    : {best_metrics['flat']:.2%}")
+    
+    slow_print("-" * 40)
+    slow_print("--- RUNNING FINAL TEST ON BEST PARAMS ---")
+    
+    # --- FINAL TEST RUN ---
+    # Now we take the best params and run them against the unseen TEST set (last 20%)
+    
+    x_best = best_params['x']
+    b_best = best_params['b']
+    
+    df_final, feat_cols_final = prepare_data(df_raw, tick_size, x_best, b_best)
+    
+    X_f = df_final[feat_cols_final]
+    y_f = df_final['target_derivative']
+    
+    n = len(df_final)
     train_end = int(n * 0.60)
     val_end = int(n * 0.80)
     
-    X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
-    X_test, y_test = X.iloc[val_end:], y.iloc[val_end:]
+    # Train on Train set (or Train+Val? Standard is usually Train, but let's stick to Train for consistency)
+    X_train_final = X_f.iloc[:train_end]
+    y_train_final = y_f.iloc[:train_end]
     
-    slow_print(f"[STATS] Train: {len(X_train)}, Test: {len(X_test)}")
-
-    # --- Linear Regression ---
-    slow_print("--- TRAINING LINEAR REGRESSION ---")
-    lr_model = LinearRegression()
-    lr_model.fit(X_train, y_train)
-    lr_pred = lr_model.predict(X_test)
+    X_test_final = X_f.iloc[val_end:] # The unseen 20%
+    y_test_final = y_f.iloc[val_end:]
     
-    lr_acc, lr_flat_ratio, lr_total_preds = calculate_metrics(y_test, lr_pred)
+    rf_final = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+    rf_final.fit(X_train_final, y_train_final)
     
-    # --- Random Forest ---
-    slow_print("--- TRAINING RANDOM FOREST ---")
-    rf_model = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
-                                     max_depth=RF_MAX_DEPTH, 
-                                     n_jobs=-1, 
-                                     random_state=RANDOM_STATE)
-    rf_model.fit(X_train, y_train)
-    rf_pred = rf_model.predict(X_test)
+    test_preds = rf_final.predict(X_test_final)
+    t_acc, t_flat, t_trades, t_score = calculate_metrics_and_score(y_test_final, test_preds)
     
-    rf_acc, rf_flat_ratio, rf_total_preds = calculate_metrics(y_test, rf_pred)
-
-    # --- REPORTING ---
-    slow_print("--- FINAL PERFORMANCE METRICS ---")
-    slow_print("Metric Definitions:")
-    slow_print("1. Non-Flat Accuracy: When model predicts a move AND market moves, did we get the direction right?")
-    slow_print("2. Flat Outcome Ratio: When model predicts a move, how often did the market actually stay flat?")
-    slow_print("-" * 30)
-
-    slow_print(f"[LINEAR REGRESSION]")
-    slow_print(f"Total Directional Preds: {lr_total_preds}")
-    slow_print(f"Non-Flat Accuracy:       {lr_acc:.2%}")
-    slow_print(f"Flat Outcome Ratio:      {lr_flat_ratio:.2%}")
-    
-    slow_print(f"-" * 15)
-    
-    slow_print(f"[RANDOM FOREST]")
-    slow_print(f"Total Directional Preds: {rf_total_preds}")
-    slow_print(f"Non-Flat Accuracy:       {rf_acc:.2%}")
-    slow_print(f"Flat Outcome Ratio:      {rf_flat_ratio:.2%}")
-    
-    slow_print("--- ANALYSIS COMPLETE ---")
+    slow_print(f"[TEST SET RESULTS]")
+    slow_print(f"Non-Flat Accuracy : {t_acc:.2%}")
+    slow_print(f"Total Trades      : {t_trades}")
+    slow_print(f"Flat Outcome Ratio: {t_flat:.2%}")
+    slow_print(f"Final Score       : {t_score:.4f}")
+    slow_print("--- DONE ---")
 
 if __name__ == "__main__":
     main()
