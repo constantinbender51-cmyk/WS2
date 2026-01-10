@@ -5,22 +5,40 @@ import time
 import os
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error
 
-# --- Configuration ---
-SYMBOL = 'ETH/USDT'
-TIMEFRAME = '15m'
+# =========================================
+# 1. GLOBAL CONFIGURATION
+# =========================================
+
+# --- Exchange & Data Settings ---
+SYMBOL = 'ETH/USDT'            # Pair to fetch
+TIMEFRAME = '15m'              # Candle timeframe
 START_DATE = '2020-01-01 00:00:00'
 END_DATE = '2026-01-01 00:00:00'
-ROUNDING_MULTIPLIER = 10 
-LOOKBACK_CANDLES = 5      
 
-# --- Storage Configuration ---
+# --- Feature Engineering Parameters ---
+ROUNDING_MULTIPLIER = 10       # 'x': Used to calculate step size (x * tick_size)
+LOOKBACK_CANDLES = 5           # 'b': Number of previous candles to use as features
+
+# --- Data Storage ---
 DATA_DIR = '/app/data/'
 FILE_NAME = 'ethusdt_15m_2020_2026.csv'
 FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
-def slow_print(text, delay=0.1):
+# --- Model Hyperparameters ---
+RF_ESTIMATORS = 50             # Random Forest number of trees
+RF_MAX_DEPTH = 10              # Random Forest max depth
+RANDOM_STATE = 42              # Seed for reproducibility
+
+# --- Output Settings ---
+PRINT_DELAY = 0.1              # Delay in seconds for text output
+
+# =========================================
+# 2. UTILITY FUNCTIONS
+# =========================================
+
+def slow_print(text, delay=PRINT_DELAY):
     print(text)
     time.sleep(delay)
 
@@ -32,6 +50,7 @@ def get_tick_size(symbol):
     return markets[symbol]['precision']['price']
 
 def get_ohlcv_data(symbol, timeframe, start_str, end_str):
+    # Check cache
     if os.path.exists(FILE_PATH):
         slow_print(f"[CACHE] Found data at {FILE_PATH}. Loading...")
         df = pd.read_csv(FILE_PATH)
@@ -39,6 +58,7 @@ def get_ohlcv_data(symbol, timeframe, start_str, end_str):
         df.set_index('timestamp', inplace=True)
         return df
 
+    # Fetch from API
     slow_print(f"[API] File not found. Connecting to Binance...")
     exchange = ccxt.binance()
     start_ts = exchange.parse8601(start_str)
@@ -78,13 +98,16 @@ def get_ohlcv_data(symbol, timeframe, start_str, end_str):
 def prepare_data(df, tick_size, x, b):
     slow_print("[PROCESSING] Rounding prices...")
     step_size = x * tick_size
-    df['close_rounded'] = np.round(df['close'] / step_size) * step_size
+    
+    # Calculate the integer "step" index (e.g., price 2000 with step 10 -> index 200)
     df['price_step_index'] = np.round(df['close'] / step_size)
 
     slow_print("[PROCESSING] Computing Log Returns...")
     df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
     slow_print("[PROCESSING] Creating targets and features...")
+    # Target: The change in steps (derivative)
+    # e.g., Index 200 -> Index 202 = Target +2
     df['target_derivative'] = df['price_step_index'].shift(-1) - df['price_step_index']
     
     feature_cols = []
@@ -96,44 +119,44 @@ def prepare_data(df, tick_size, x, b):
     df.dropna(inplace=True)
     return df, feature_cols
 
-def calculate_custom_accuracy(y_true, y_pred_raw):
+def calculate_metrics(y_true, y_pred_raw):
     """
-    Computes custom accuracy metrics based on user requirements.
-    y_true: Actual step changes (integers)
-    y_pred_raw: Raw model predictions (floats)
+    y_true: Actual integer step changes
+    y_pred_raw: Raw float predictions from model
     """
-    # Round predictions to nearest integer (step)
+    # 1. Round predictions to nearest integer
     y_pred = np.round(y_pred_raw)
     
-    # Create DataFrame for easier filtering
     results = pd.DataFrame({'actual': y_true, 'pred': y_pred})
     
-    # 1. Total Directional Predictions (Model predicted != 0)
+    # 2. Filter: Only look at where Model Predicted a Move (Non-Flat)
     directional_preds = results[results['pred'] != 0]
-    total_directional = len(directional_preds)
+    total_predictions = len(directional_preds)
     
-    if total_directional == 0:
+    if total_predictions == 0:
         return 0.0, 0.0
 
-    # 2. "Flat Outcome" Metric
-    # Count where model predicted move, but actual was 0
+    # 3. Metric: Flat Outcome Ratio (Ghost Moves)
+    # Model said move, Market stayed flat (Actual == 0)
     flat_outcomes = directional_preds[directional_preds['actual'] == 0]
-    flat_outcome_ratio = len(flat_outcomes) / total_directional
+    flat_outcome_ratio = len(flat_outcomes) / total_predictions
 
-    # 3. Accuracy Metric
-    # "If non flat prediction results in flat do not count it"
-    # Filter: Pred != 0 AND Actual != 0
+    # 4. Metric: Non-Flat Accuracy
+    # Filter: Model Predicted Move AND Market Moved (Actual != 0)
     valid_scoring_moves = directional_preds[directional_preds['actual'] != 0]
     
     if len(valid_scoring_moves) == 0:
         accuracy = 0.0
     else:
         # Check if signs match (Direction correct)
-        # We use np.sign so +2 and +1 are considered "same direction"
         correct_direction = np.sign(valid_scoring_moves['pred']) == np.sign(valid_scoring_moves['actual'])
         accuracy = correct_direction.sum() / len(valid_scoring_moves)
 
     return accuracy, flat_outcome_ratio
+
+# =========================================
+# 3. MAIN EXECUTION
+# =========================================
 
 def main():
     slow_print("--- INITIALIZING SCRIPT ---")
@@ -154,7 +177,7 @@ def main():
     df_processed, feature_cols = prepare_data(df, tick_size, ROUNDING_MULTIPLIER, LOOKBACK_CANDLES)
     
     X = df_processed[feature_cols]
-    y = df_processed['target_derivative']
+    y = df_processed['target_derivative'] # Integers (-1, 0, 1, 2...)
     
     n = len(df_processed)
     train_end = int(n * 0.60)
@@ -171,30 +194,35 @@ def main():
     lr_model.fit(X_train, y_train)
     lr_pred = lr_model.predict(X_test)
     
-    lr_acc, lr_flat_ratio = calculate_custom_accuracy(y_test, lr_pred)
+    lr_acc, lr_flat_ratio = calculate_metrics(y_test, lr_pred)
     
     # --- Random Forest ---
     slow_print("--- TRAINING RANDOM FOREST ---")
-    rf_model = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
+    rf_model = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
+                                     max_depth=RF_MAX_DEPTH, 
+                                     n_jobs=-1, 
+                                     random_state=RANDOM_STATE)
     rf_model.fit(X_train, y_train)
     rf_pred = rf_model.predict(X_test)
     
-    rf_acc, rf_flat_ratio = calculate_custom_accuracy(y_test, rf_pred)
+    rf_acc, rf_flat_ratio = calculate_metrics(y_test, rf_pred)
 
     # --- REPORTING ---
     slow_print("--- FINAL PERFORMANCE METRICS ---")
-    
+    slow_print("Metric Definitions:")
+    slow_print("1. Non-Flat Accuracy: When model predicts a move AND market moves, did we get the direction right?")
+    slow_print("2. Flat Outcome Ratio: When model predicts a move, how often did the market actually stay flat?")
+    slow_print("-" * 30)
+
     slow_print(f"[LINEAR REGRESSION]")
-    slow_print(f"MSE: {mean_squared_error(y_test, lr_pred):.4f}")
-    slow_print(f"Non-Flat Accuracy: {lr_acc:.2%}")
-    slow_print(f"Flat Outcome Ratio:  {lr_flat_ratio:.2%} (Ghost Moves)")
+    slow_print(f"Non-Flat Accuracy:  {lr_acc:.2%}")
+    slow_print(f"Flat Outcome Ratio:   {lr_flat_ratio:.2%}")
     
-    slow_print(f"-----------------------------")
+    slow_print(f"-" * 15)
     
     slow_print(f"[RANDOM FOREST]")
-    slow_print(f"MSE: {mean_squared_error(y_test, rf_pred):.4f}")
-    slow_print(f"Non-Flat Accuracy: {rf_acc:.2%}")
-    slow_print(f"Flat Outcome Ratio:  {rf_flat_ratio:.2%} (Ghost Moves)")
+    slow_print(f"Non-Flat Accuracy:  {rf_acc:.2%}")
+    slow_print(f"Flat Outcome Ratio:   {rf_flat_ratio:.2%}")
     
     slow_print("--- ANALYSIS COMPLETE ---")
 
