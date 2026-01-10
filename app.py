@@ -31,13 +31,12 @@ FILE_NAME = 'ethusdt_15m_2020_2026.csv'
 FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
 
 # --- Model Settings for Grid Search ---
-# Reduced slightly for speed during search, can be increased for final run
 RF_ESTIMATORS = 30 
 RF_MAX_DEPTH = 8
 RANDOM_STATE = 42
 
 # --- Output Settings ---
-PRINT_DELAY = 0.01  # Faster printing for grid search updates
+PRINT_DELAY = 0.01
 
 # =========================================
 # 2. HELPER FUNCTIONS
@@ -99,19 +98,17 @@ def get_ohlcv_data(symbol, timeframe, start_str, end_str):
     return df
 
 def prepare_data(df_input, tick_size, x, b):
-    # Work on a copy to avoid SettingWithCopy warnings on the main DF
     df = df_input.copy()
-    
     step_size = x * tick_size
     
-    # 1. Round Close price (Target calculation base)
+    # 1. Round Close price
     df['close_rounded'] = np.round(df['close'] / step_size) * step_size
     df['price_step_index'] = np.round(df['close'] / step_size)
 
     # 2. Log Returns
     df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
     
-    # 3. Target
+    # 3. Target: Derivative of steps
     df['target_derivative'] = df['price_step_index'].shift(-1) - df['price_step_index']
     
     # 4. Features
@@ -134,7 +131,6 @@ def calculate_metrics_and_score(y_true, y_pred_raw):
     directional_preds = results[results['pred'] != 0]
     total_trades = len(directional_preds)
     
-    # Default scores if no trades
     if total_trades == 0:
         return 0.0, 0.0, 0, 0.0
 
@@ -150,11 +146,11 @@ def calculate_metrics_and_score(y_true, y_pred_raw):
         correct_direction = np.sign(valid_scoring_moves['pred']) == np.sign(valid_scoring_moves['actual'])
         accuracy = correct_direction.sum() / len(valid_scoring_moves)
 
-    # 3. Custom Score
-    # Score = (Accuracy * Trades) / Flat_Outcome_Ratio
-    # Add epsilon to denominator to avoid division by zero
-    denominator = flat_ratio if flat_ratio > 0 else 1e-9
-    score = (accuracy * total_trades) / denominator
+    # 3. NEW CUSTOM SCORE
+    # Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)
+    # This sets 50% accuracy as the baseline (score 0). 
+    # Below 50% becomes negative score.
+    score = (accuracy - 0.50) * total_trades * (1 - flat_ratio)
 
     return accuracy, flat_ratio, total_trades, score
 
@@ -177,34 +173,31 @@ def main():
         slow_print(f"[CRITICAL] {e}")
         return
 
-    # Generate Parameter Grid
-    # Range is exclusive at the end, so we add step to include the last number
     x_values = list(range(X_START, X_END + 1, X_STEP))
     b_values = list(range(B_START, B_END + 1))
     
     total_combinations = len(x_values) * len(b_values)
     slow_print(f"[INFO] Grid: X({len(x_values)}) * B({len(b_values)}) = {total_combinations} combinations.")
-    slow_print(f"[INFO] Optimizing Score = (Acc * Trades) / Flat_Ratio")
+    slow_print(f"[INFO] Optimizing Score = (Accuracy - 0.5) * Trades * (1 - Flat_Ratio)")
     slow_print("-" * 40)
 
-    best_score = -1
+    best_score = -float('inf') # Initialize to negative infinity since scores can be negative
     best_params = {}
     best_metrics = {}
     
     counter = 0
     
-    # --- GRID SEARCH LOOP ---
     for x in x_values:
         for b in b_values:
             counter += 1
             
-            # 1. Prepare Data
+            # Prepare Data
             df_processed, feature_cols = prepare_data(df_raw, tick_size, x, b)
             
             X_feat = df_processed[feature_cols]
             y = df_processed['target_derivative']
             
-            # 2. Split (Train on 60%, Optimize on Validation 20%)
+            # Split (60/20 Train/Val)
             n = len(df_processed)
             train_end = int(n * 0.60)
             val_end = int(n * 0.80)
@@ -214,23 +207,21 @@ def main():
             X_val = X_feat.iloc[train_end:val_end]
             y_val = y.iloc[train_end:val_end]
             
-            # 3. Train Model (Random Forest)
-            # Using slightly lighter params for speed
+            # Train
             rf = RandomForestRegressor(n_estimators=RF_ESTIMATORS, 
                                        max_depth=RF_MAX_DEPTH, 
                                        n_jobs=-1, 
                                        random_state=RANDOM_STATE)
             rf.fit(X_train, y_train)
             
-            # 4. Evaluate on Validation Set
+            # Validate
             preds = rf.predict(X_val)
             acc, flat_ratio, trades, score = calculate_metrics_and_score(y_val, preds)
             
-            # Print Progress every 10 iterations or if high score
+            # Output
             if counter % 10 == 0 or score > best_score:
                 print(f"[{counter}/{total_combinations}] X={x}, B={b} | Score: {score:.2f} | Acc: {acc:.1%} | Trades: {trades} | Flat: {flat_ratio:.1%}")
 
-            # 5. Save Best
             if score > best_score:
                 best_score = score
                 best_params = {'x': x, 'b': b}
@@ -249,9 +240,6 @@ def main():
     slow_print("-" * 40)
     slow_print("--- RUNNING FINAL TEST ON BEST PARAMS ---")
     
-    # --- FINAL TEST RUN ---
-    # Now we take the best params and run them against the unseen TEST set (last 20%)
-    
     x_best = best_params['x']
     b_best = best_params['b']
     
@@ -264,11 +252,9 @@ def main():
     train_end = int(n * 0.60)
     val_end = int(n * 0.80)
     
-    # Train on Train set (or Train+Val? Standard is usually Train, but let's stick to Train for consistency)
     X_train_final = X_f.iloc[:train_end]
     y_train_final = y_f.iloc[:train_end]
-    
-    X_test_final = X_f.iloc[val_end:] # The unseen 20%
+    X_test_final = X_f.iloc[val_end:] 
     y_test_final = y_f.iloc[val_end:]
     
     rf_final = RandomForestRegressor(n_estimators=50, max_depth=10, n_jobs=-1, random_state=42)
