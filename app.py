@@ -20,8 +20,8 @@ VAL_MONTHS = 4         # Number of months to hold back for validation
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
-BUCKET_COUNTS = range(10, 121, 10)  # 10 to 250
-SEQ_LENGTHS = [3, 4, 5, 6]
+BUCKET_COUNTS = range(10, 91, 10)  # 10 to 250
+SEQ_LENGTHS = [3, 4, 5, 6, 7, 8, 9 ,10]
 MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
 # =========================================
