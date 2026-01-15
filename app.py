@@ -16,7 +16,7 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
 # --- Validation Settings ---
-VAL_MONTHS = 1           # Number of months to hold back for validation
+VAL_MONTHS = 3           # Number of months to hold back for validation
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
