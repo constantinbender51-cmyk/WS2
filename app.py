@@ -16,11 +16,11 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
 # --- Validation Settings ---
-VAL_MONTHS = 3           # Number of months to hold back for validation
+VAL_MONTHS = 3          # Number of months to hold back for validation
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
-BUCKET_COUNTS = range(10, 111, 20)  # 10 to 250
+BUCKET_COUNTS = range(10, 111, 10)  # 10 to 250
 SEQ_LENGTHS = [3, 4, 5, 6, 8]
 MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
@@ -94,7 +94,6 @@ def train_models(train_buckets, seq_len):
     return abs_map, der_map
 
 def get_single_prediction(mode, abs_map, der_map, a_seq, d_seq, last_val):
-    """Helper to get raw predictions for individual components."""
     if mode == "Absolute":
         if a_seq in abs_map:
             return abs_map[a_seq].most_common(1)[0][0]
@@ -105,68 +104,44 @@ def get_single_prediction(mode, abs_map, der_map, a_seq, d_seq, last_val):
     return None
 
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
-    """
-    Returns the predicted next VALUE.
-    Returns None if pattern is unknown or (in Combined mode) if signals conflict.
-    """
+    """Returns the predicted next VALUE or None (Abstain)."""
     
-    # 1. Handle Single Models
     if model_type == "Absolute":
         return get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
         
     elif model_type == "Derivative":
         return get_single_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val)
         
-    # 2. Handle Combined (Voting Logic)
     elif model_type == "Combined":
-        # Get individual predictions
+        # Vote Logic for internal strategy
         pred_abs = get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
         pred_der = get_single_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val)
         
-        # Determine Directions
         dir_abs = 0
         if pred_abs is not None:
-            if pred_abs > last_val: dir_abs = 1
-            elif pred_abs < last_val: dir_abs = -1
+            dir_abs = 1 if pred_abs > last_val else -1 if pred_abs < last_val else 0
             
         dir_der = 0
         if pred_der is not None:
-            if pred_der > last_val: dir_der = 1
-            elif pred_der < last_val: dir_der = -1
+            dir_der = 1 if pred_der > last_val else -1 if pred_der < last_val else 0
             
-        # VOTE LOGIC
+        if dir_abs == 0 and dir_der == 0: return None
+        if dir_abs != 0 and dir_der != 0 and dir_abs != dir_der: return None # Conflict
         
-        # Case A: Both Abstain
-        if dir_abs == 0 and dir_der == 0:
-            return None
-            
-        # Case B: Conflict (One UP, One DOWN) -> ABSTAIN
-        if dir_abs != 0 and dir_der != 0 and dir_abs != dir_der:
-            return None
-            
-        # Case C: Consensus or Solo Signal
-        # If both trigger (and agree), we prefer Absolute target as requested.
-        # If only Abs triggers, use Abs.
-        if dir_abs != 0:
-            return pred_abs
-            
-        # If only Der triggers, use Der.
-        if dir_der != 0:
-            return pred_der
+        if dir_abs != 0: return pred_abs
+        if dir_der != 0: return pred_der
             
     return None
 
 def test_strategy(train_prices, test_prices, bucket_count, seq_len, model_type):
-    # 1. Setup Buckets (Size derived from TRAIN to keep consistency)
+    # Size strictly from TRAIN
     bucket_size = calculate_bucket_size(train_prices, bucket_count)
     
     train_buckets = [get_bucket(p, bucket_size) for p in train_prices]
     test_buckets = [get_bucket(p, bucket_size) for p in test_prices]
     
-    # 2. Train
     abs_map, der_map = train_models(train_buckets, seq_len)
     
-    # 3. Test
     correct = 0
     total_trades = 0
     
@@ -178,18 +153,12 @@ def test_strategy(train_prices, test_prices, bucket_count, seq_len, model_type):
         actual_val = curr_slice[-1]
         last_val = a_seq[-1]
         
-        if seq_len > 1:
-            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
-        else:
-            d_seq = ()
+        d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if seq_len > 1 else ()
             
-        # Predict
         pred_val = get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val)
         
-        if pred_val is None:
-            continue # ABSTAIN
+        if pred_val is None: continue 
             
-        # Check Direction
         pred_diff = pred_val - last_val
         actual_diff = actual_val - last_val
         
@@ -202,7 +171,113 @@ def test_strategy(train_prices, test_prices, bucket_count, seq_len, model_type):
     return accuracy, total_trades
 
 # =========================================
-# 4. MAIN EXECUTION
+# 4. FINAL ENSEMBLE LOGIC
+# =========================================
+
+def run_final_ensemble(train_prices, val_prices, top_configs):
+    print(f"\n=== FINAL COMBINED MODEL (Union of Top {len(top_configs)}) ===")
+    
+    # 1. Train all top models
+    models = []
+    for cfg in top_configs:
+        b_size = calculate_bucket_size(train_prices, cfg['b_count'])
+        t_buckets = [get_bucket(p, b_size) for p in train_prices]
+        v_buckets = [get_bucket(p, b_size) for p in val_prices] # Pre-bucketize Validation
+        
+        abs_map, der_map = train_models(t_buckets, cfg['s_len'])
+        
+        models.append({
+            "cfg": cfg,
+            "b_size": b_size,
+            "val_buckets": v_buckets,
+            "abs_map": abs_map,
+            "der_map": der_map
+        })
+        
+    # 2. Iterate Validation Set
+    # We loop through time indices of the Validation Set.
+    # Each model has a different seq_len, so we must respect the longest one 
+    # to ensure all models *could* have voted (even if some have shorter memory).
+    max_seq = max(m['cfg']['s_len'] for m in models)
+    validation_len = len(val_prices)
+    
+    correct = 0
+    total_trades = 0
+    abstains = 0
+    conflicts = 0
+    
+    # Loop through validation candles
+    for i in range(max_seq, validation_len - 1):
+        
+        active_signals = []
+        
+        # Poll each model
+        for model in models:
+            s_len = model['cfg']['s_len']
+            v_bkts = model['val_buckets']
+            
+            # The sequence ends at current index i. Target is i+1.
+            # Sequence: [i - s_len + 1 ... i]
+            
+            # Extract sequence
+            curr_slice = v_bkts[i - s_len + 1 : i + 1]
+            a_seq = tuple(curr_slice)
+            last_val = a_seq[-1]
+            
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s_len > 1 else ()
+            
+            pred_val = get_prediction(model['cfg']['model'], model['abs_map'], model['der_map'], 
+                                      a_seq, d_seq, last_val)
+            
+            if pred_val is not None:
+                # Check Direction
+                p_diff = pred_val - last_val
+                if p_diff != 0:
+                    direction = 1 if p_diff > 0 else -1
+                    active_signals.append({
+                        "dir": direction,
+                        "b_count": model['cfg']['b_count'], # Lower is better
+                        "pred_val": pred_val,
+                        "last_val": last_val,
+                        "actual_val": v_bkts[i+1] # The reality for THIS bucket size
+                    })
+
+        # --- ENSEMBLE LOGIC ---
+        
+        if not active_signals:
+            abstains += 1
+            continue
+            
+        # Check Conflict
+        directions = {x['dir'] for x in active_signals}
+        if len(directions) > 1:
+            conflicts += 1
+            continue # ABSTAIN (Conflict)
+            
+        # If we are here, all signals agree.
+        # Select strategy with LOWEST BUCKET COUNT.
+        active_signals.sort(key=lambda x: x['b_count']) # Ascending sort
+        winner = active_signals[0]
+        
+        # Verify result
+        w_pred_diff = winner['pred_val'] - winner['last_val']
+        w_act_diff = winner['actual_val'] - winner['last_val']
+        
+        if w_act_diff != 0: # If price actually moved
+            total_trades += 1
+            if (w_pred_diff > 0 and w_act_diff > 0) or (w_pred_diff < 0 and w_act_diff < 0):
+                correct += 1
+
+    acc = (correct / total_trades * 100) if total_trades > 0 else 0
+    print(f"Final Validation Result:")
+    print(f" > Accuracy : {acc:.2f}%")
+    print(f" > Trades   : {total_trades}")
+    print(f" > Conflicts: {conflicts} (Avoided due to disagreement)")
+    print(f" > Abstains : {abstains} (No models found pattern)")
+    print("-" * 60)
+
+# =========================================
+# 5. MAIN EXECUTION
 # =========================================
 
 def run_analysis():
@@ -212,7 +287,7 @@ def run_analysis():
         print("Not enough data.")
         return
 
-    # 2. Split Data (Training vs Validation)
+    # 2. Split Data
     val_len = VAL_MONTHS * HOURS_PER_MONTH
     split_idx = len(prices) - val_len
     
@@ -225,10 +300,9 @@ def run_analysis():
     print(f"Validation Set: {len(val_prices)} candles (Last {VAL_MONTHS} Month(s))")
     print("--------------------------------")
 
-    # 3. Grid Search on TRAINING Data
+    # 3. Grid Search (Training)
     print(f"\n--- Running Grid Search on TRAINING Set ---")
     results = []
-    
     combinations = len(list(BUCKET_COUNTS)) * len(SEQ_LENGTHS) * 3
     counter = 0
     
@@ -240,11 +314,9 @@ def run_analysis():
                     sys.stdout.write(f"\rScanning config {counter}/{combinations}...")
                     sys.stdout.flush()
                 
-                # In-Sample Test
                 acc, trades = test_strategy(train_prices, train_prices, b_count, s_len, m_type)
                 
                 if trades >= MIN_TRADES:
-                    # NEW METRIC: Accuracy * Trades
                     score = (acc / 100) * trades 
                     results.append({
                         "b_count": b_count,
@@ -257,26 +329,23 @@ def run_analysis():
 
     print(f"\nGrid Search Complete. Found {len(results)} valid configurations.")
 
-    # 4. Select Top Strategies by SCORE (Acc * Trades)
+    # 4. Select Top Strategies
     results.sort(key=lambda x: x['score'], reverse=True)
     top_5 = results[:5]
     
-    # 5. Validate Top Strategies
-    print(f"\n=== TOP 5 STRATEGIES (Sorted by Score = Acc * Trades) ===")
-    print(f"{'#':<3} | {'Config':<25} | {'Score':<8} | {'Train Acc':<10} | {'Train Trd':<10} | {'VAL ACC':<10} | {'VAL TRD':<8}")
-    print("-" * 100)
+    # 5. Show Individual Performance
+    print(f"\n=== TOP 5 STRATEGIES (Individual Performance) ===")
+    print(f"{'#':<3} | {'Config':<25} | {'Score':<8} | {'Train Acc':<10} | {'VAL ACC':<10} | {'VAL TRD':<8}")
+    print("-" * 80)
     
     for i, res in enumerate(top_5):
-        # Run Validation Test (Train on Train, Test on Val)
         val_acc, val_trades = test_strategy(train_prices, val_prices, 
                                             res['b_count'], res['s_len'], res['model'])
-        
         config_str = f"B={res['b_count']} L={res['s_len']} ({res['model'][0:3]})"
-        score_val = res['score']
-        
-        print(f"{i+1:<3} | {config_str:<25} | {score_val:<8.1f} | {res['train_acc']:.1f}%     | {res['train_trades']:<10} | {val_acc:.1f}%     | {val_trades:<8}")
+        print(f"{i+1:<3} | {config_str:<25} | {res['score']:<8.1f} | {res['train_acc']:.1f}%     | {val_acc:.1f}%     | {val_trades:<8}")
 
-    print("-" * 100)
+    # 6. Run Final Combined Model
+    run_final_ensemble(train_prices, val_prices, top_5)
 
 if __name__ == "__main__":
     run_analysis()
