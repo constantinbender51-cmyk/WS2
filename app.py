@@ -2,6 +2,7 @@ import random
 import time
 import sys
 import json
+import os
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -28,9 +29,21 @@ MIN_TRADES = 20          # Min trades to consider a strategy valid during traini
 # =========================================
 # 2. DATA UTILITIES
 # =========================================
-
 def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE):
-    """Fetches historical kline data from Binance public API."""
+    """Fetches data from Binance or loads from local cache if available."""
+    
+    # Define file path
+    data_dir = "/app/data"
+    file_name = f"{symbol}_{interval}_{start_str}.json"
+    full_path = os.path.join(data_dir, file_name)
+
+    # 1. Check if local cache exists
+    if os.path.exists(full_path):
+        print(f"--- Loading {symbol} {interval} data from local cache ---")
+        with open(full_path, 'r') as f:
+            return json.load(f)
+
+    # 2. Fetch if not present
     print(f"\n--- Fetching {symbol} {interval} data from Binance ---")
     
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
@@ -61,6 +74,18 @@ def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE):
             break
             
     print(f"\nTotal data points fetched: {len(all_prices)}")
+
+    # 3. Save to local cache
+    if all_prices:
+        try:
+            if not os.path.exists(data_dir):
+                os.makedirs(data_dir)
+            with open(full_path, 'w') as f:
+                json.dump(all_prices, f)
+            print(f"Data cached to {full_path}")
+        except Exception as e:
+            print(f"Warning: Could not save cache: {e}")
+
     return all_prices
 
 # =========================================
