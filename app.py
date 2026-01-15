@@ -17,7 +17,7 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
 # --- Data Split Settings ---
-VAL_MONTHS = 6           # Final Holdout (The real test)
+VAL_MONTHS = 1           # Final Holdout (The real test)
 PRE_VAL_MONTHS = 24      # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
