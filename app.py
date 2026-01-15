@@ -21,7 +21,7 @@ PRE_VAL_MONTHS = 6      # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
-BUCKET_COUNTS = range(10, 150, 10)  # 10 to 250
+BUCKET_COUNTS = range(10, 131, 10)  # 10 to 250
 SEQ_LENGTHS = [3, 4, 5, 6, 8]
 MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
