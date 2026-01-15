@@ -16,13 +16,13 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
 # --- Data Split Settings ---
-VAL_MONTHS = 6        # Final Holdout (The real test)
+VAL_MONTHS = 6         # Final Holdout (The real test)
 PRE_VAL_MONTHS = 6       # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
-BUCKET_COUNTS = range(10, 201, 20)  # 10 to 250
-SEQ_LENGTHS = [3, 5, 7, 12, 20]
+BUCKET_COUNTS = range(10, 111, 10)  # 10 to 250
+SEQ_LENGTHS = [3, 4, 5, 6, 8]
 MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
 # =========================================
@@ -81,7 +81,6 @@ def calculate_bucket_size(prices, bucket_count):
 def train_models(train_buckets, seq_len):
     """
     Builds the probability maps from the training buckets.
-    This is the 'Fit' step.
     """
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
@@ -160,7 +159,6 @@ def test_strategy(train_prices, test_prices, bucket_count, seq_len, model_type):
     abstains = 0
     
     # We loop through the test set. 
-    # Note: For strict testing, we treat test_buckets as a new stream.
     loop_range = len(test_buckets) - seq_len
     
     for i in range(loop_range):
@@ -326,9 +324,9 @@ def run_analysis():
                 p_acc, p_trades, p_abst = test_strategy(train_prices, preval_prices, b_count, s_len, m_type)
                 
                 if t_trades >= MIN_TRADES and p_trades > 0:
-                    # OPTIMIZATION METRIC: Train(Acc * Trades) * PreVal(Acc)
-                    # We normalize acc to 0-1 for multiplication
-                    score = (t_acc / 100) * t_trades * (p_acc / 100)
+                    # OPTIMIZATION METRIC: TrainAcc * PreValAcc
+                    # Removing "trades" from the equation
+                    score = (t_acc / 100.0) * (p_acc / 100.0)
                     
                     results.append({
                         "b_count": b_count,
@@ -347,7 +345,7 @@ def run_analysis():
     results.sort(key=lambda x: x['score'], reverse=True)
     top_5 = results[:5]
     
-    print(f"\n=== TOP 5 STRATEGIES (Sorted by TrainPerformance * PreValAcc) ===")
+    print(f"\n=== TOP 5 STRATEGIES (Sorted by TrainAcc * PreValAcc) ===")
     print(f"{'#':<3} | {'Config':<22} | {'Score':<6} | {'TRAIN Acc':<9} {'Trds':<5} | {'PRE-VAL Acc':<11} {'Trds':<5} | {'FINAL VAL Acc':<13} {'Trds':<5}")
     print("-" * 115)
     
@@ -361,7 +359,7 @@ def run_analysis():
         
         config_str = f"B={res['b_count']} L={res['s_len']} ({res['model'][0:3]})"
         
-        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.1f} | {t_acc:.1f}%     {t_trd:<5} | {p_acc:.1f}%       {p_trd:<5} | {v_acc:.1f}%         {v_trades:<5}")
+        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.4f} | {t_acc:.1f}%     {t_trd:<5} | {p_acc:.1f}%       {p_trd:<5} | {v_acc:.1f}%         {v_trades:<5}")
 
     run_final_ensemble(train_prices, val_prices, top_5)
 
