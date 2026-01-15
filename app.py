@@ -18,7 +18,7 @@ START_DATE = "2020-01-01"
 
 # --- Data Split Settings ---
 VAL_MONTHS = 1           # Final Holdout (The real test)
-PRE_VAL_MONTHS = 24      # Pre-Validation (Used for scoring/selection)
+PRE_VAL_MONTHS = 2      # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
