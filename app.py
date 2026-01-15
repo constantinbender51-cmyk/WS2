@@ -23,7 +23,7 @@ HOURS_PER_MONTH = 720    # Approx candles per month
 # --- Grid Search Ranges ---
 BUCKET_COUNTS = range(10, 111, 10)  # 10 to 250
 SEQ_LENGTHS = [3, 4, 5, 6, 8]
-MIN_TRADES = 200         # Min trades to consider a strategy valid during training
+MIN_TRADES = 500         # Min trades to consider a strategy valid during training
 
 # =========================================
 # 2. DATA UTILITIES
