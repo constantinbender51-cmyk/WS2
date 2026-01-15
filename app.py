@@ -16,14 +16,14 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
 # --- Data Split Settings ---
-VAL_MONTHS = 6         # Final Holdout (The real test)
-PRE_VAL_MONTHS = 6       # Pre-Validation (Used for scoring/selection)
+VAL_MONTHS = 6           # Final Holdout (The real test)
+PRE_VAL_MONTHS = 6      # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
-BUCKET_COUNTS = range(10, 111, 10)  # 10 to 250
+BUCKET_COUNTS = range(10, 150, 10)  # 10 to 250
 SEQ_LENGTHS = [3, 4, 5, 6, 8]
-MIN_TRADES = 500         # Min trades to consider a strategy valid during training
+MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
 # =========================================
 # 2. DATA UTILITIES
@@ -324,9 +324,9 @@ def run_analysis():
                 p_acc, p_trades, p_abst = test_strategy(train_prices, preval_prices, b_count, s_len, m_type)
                 
                 if t_trades >= MIN_TRADES and p_trades > 0:
-                    # OPTIMIZATION METRIC: TrainAcc * PreValAcc
-                    # Removing "trades" from the equation
-                    score = (t_acc / 100.0) * (p_acc / 100.0)
+                    # OPTIMIZATION METRIC: TrainAcc * PreValAcc * PreValTrades
+                    # This ensures the strategy is active AND accurate in recent times.
+                    score = (t_acc / 100.0) * (p_acc / 100.0) * p_trades
                     
                     results.append({
                         "b_count": b_count,
@@ -345,7 +345,7 @@ def run_analysis():
     results.sort(key=lambda x: x['score'], reverse=True)
     top_5 = results[:5]
     
-    print(f"\n=== TOP 5 STRATEGIES (Sorted by TrainAcc * PreValAcc) ===")
+    print(f"\n=== TOP 5 STRATEGIES (Sorted by TrainAcc * PreValAcc * PreValTrades) ===")
     print(f"{'#':<3} | {'Config':<22} | {'Score':<6} | {'TRAIN Acc':<9} {'Trds':<5} | {'PRE-VAL Acc':<11} {'Trds':<5} | {'FINAL VAL Acc':<13} {'Trds':<5}")
     print("-" * 115)
     
@@ -359,7 +359,7 @@ def run_analysis():
         
         config_str = f"B={res['b_count']} L={res['s_len']} ({res['model'][0:3]})"
         
-        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.4f} | {t_acc:.1f}%     {t_trd:<5} | {p_acc:.1f}%       {p_trd:<5} | {v_acc:.1f}%         {v_trades:<5}")
+        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.1f} | {t_acc:.1f}%     {t_trd:<5} | {p_acc:.1f}%       {p_trd:<5} | {v_acc:.1f}%         {v_trades:<5}")
 
     run_final_ensemble(train_prices, val_prices, top_5)
 
