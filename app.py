@@ -16,13 +16,13 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
 # --- Data Split Settings ---
-VAL_MONTHS = 5          # Final Holdout (The real test)
-PRE_VAL_MONTHS = 2       # Pre-Validation (Used for scoring/selection)
+VAL_MONTHS = 6        # Final Holdout (The real test)
+PRE_VAL_MONTHS = 6       # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
-BUCKET_COUNTS = range(10, 91, 10)  # 10 to 250
-SEQ_LENGTHS = [5, 6, 8, 9, 10, 12, 20]
+BUCKET_COUNTS = range(10, 201, 20)  # 10 to 250
+SEQ_LENGTHS = [3, 5, 7, 12, 20]
 MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
 # =========================================
