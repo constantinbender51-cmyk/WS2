@@ -15,13 +15,14 @@ SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
 START_DATE = "2020-01-01" 
 
-# --- Validation Settings ---
-VAL_MONTHS = 4         # Number of months to hold back for validation
+# --- Data Split Settings ---
+VAL_MONTHS = 5          # Final Holdout (The real test)
+PRE_VAL_MONTHS = 2       # Pre-Validation (Used for scoring/selection)
 HOURS_PER_MONTH = 720    # Approx candles per month
 
 # --- Grid Search Ranges ---
 BUCKET_COUNTS = range(10, 91, 10)  # 10 to 250
-SEQ_LENGTHS = [3, 4, 5, 6, 7, 8, 9 ,10]
+SEQ_LENGTHS = [5, 6, 8, 9, 10, 12, 20]
 MIN_TRADES = 20          # Min trades to consider a strategy valid during training
 
 # =========================================
@@ -78,6 +79,10 @@ def calculate_bucket_size(prices, bucket_count):
     return size if size > 0 else 0.01
 
 def train_models(train_buckets, seq_len):
+    """
+    Builds the probability maps from the training buckets.
+    This is the 'Fit' step.
+    """
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
     
@@ -134,18 +139,28 @@ def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
     return None
 
 def test_strategy(train_prices, test_prices, bucket_count, seq_len, model_type):
-    # Size strictly from TRAIN
+    """
+    Standardizes the evaluation process.
+    - Uses bucket_size derived from TRAIN prices (Simulating real deployment)
+    - Trains on TRAIN prices
+    - Tests on TEST prices (which can be Train, PreVal, or Val)
+    """
+    # 1. Setup Buckets (Size strictly from TRAIN to avoid look-ahead bias)
     bucket_size = calculate_bucket_size(train_prices, bucket_count)
     
     train_buckets = [get_bucket(p, bucket_size) for p in train_prices]
     test_buckets = [get_bucket(p, bucket_size) for p in test_prices]
     
+    # 2. Train Model
     abs_map, der_map = train_models(train_buckets, seq_len)
     
+    # 3. Test Model
     correct = 0
     total_trades = 0
     abstains = 0
     
+    # We loop through the test set. 
+    # Note: For strict testing, we treat test_buckets as a new stream.
     loop_range = len(test_buckets) - seq_len
     
     for i in range(loop_range):
@@ -180,7 +195,6 @@ def test_strategy(train_prices, test_prices, bucket_count, seq_len, model_type):
 def run_final_ensemble(train_prices, val_prices, top_configs):
     print(f"\n=== FINAL COMBINED MODEL (Union of Top {len(top_configs)}) ===")
     
-    # 1. Train all top models
     models = []
     for cfg in top_configs:
         b_size = calculate_bucket_size(train_prices, cfg['b_count'])
@@ -191,7 +205,6 @@ def run_final_ensemble(train_prices, val_prices, top_configs):
         
         models.append({
             "cfg": cfg,
-            "b_size": b_size,
             "val_buckets": v_buckets,
             "abs_map": abs_map,
             "der_map": der_map
@@ -211,9 +224,12 @@ def run_final_ensemble(train_prices, val_prices, top_configs):
         for model in models:
             s_len = model['cfg']['s_len']
             v_bkts = model['val_buckets']
+            
+            # Lookback window for this specific model
             curr_slice = v_bkts[i - s_len + 1 : i + 1]
             a_seq = tuple(curr_slice)
             last_val = a_seq[-1]
+            
             d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s_len > 1 else ()
             
             pred_val = get_prediction(model['cfg']['model'], model['abs_map'], model['der_map'], 
@@ -255,8 +271,8 @@ def run_final_ensemble(train_prices, val_prices, top_configs):
     print(f"Final Validation Result:")
     print(f" > Accuracy : {acc:.2f}%")
     print(f" > Trades   : {total_trades}")
-    print(f" > Conflicts: {conflicts} (Avoided due to disagreement)")
-    print(f" > Abstains : {abstains} (No models found pattern)")
+    print(f" > Conflicts: {conflicts}")
+    print(f" > Abstains : {abstains}")
     print("-" * 60)
 
 # =========================================
@@ -265,23 +281,32 @@ def run_final_ensemble(train_prices, val_prices, top_configs):
 
 def run_analysis():
     prices = get_binance_data()
-    if len(prices) < 1000:
+    if len(prices) < 2000:
         print("Not enough data.")
         return
 
-    val_len = VAL_MONTHS * HOURS_PER_MONTH
-    split_idx = len(prices) - val_len
+    # --- 3-Way Split ---
+    val_points = VAL_MONTHS * HOURS_PER_MONTH
+    preval_points = PRE_VAL_MONTHS * HOURS_PER_MONTH
     
-    train_prices = prices[:split_idx]
-    val_prices = prices[split_idx:]
+    # Indices
+    end_idx = len(prices)
+    val_start_idx = end_idx - val_points
+    preval_start_idx = val_start_idx - preval_points
+    
+    # Slices
+    train_prices = prices[:preval_start_idx]     # 2020 -> late 2025
+    preval_prices = prices[preval_start_idx:val_start_idx] # The "Dev" Set
+    val_prices = prices[val_start_idx:]          # The "Test" Set (Dec 2025/Jan 2026)
     
     print(f"\n=== DATA SPLIT CONFIGURATION ===")
     print(f"Total Candles : {len(prices)}")
-    print(f"Training Set  : {len(train_prices)} candles")
-    print(f"Validation Set: {len(val_prices)} candles (Last {VAL_MONTHS} Month(s))")
+    print(f"1. Training Set  : {len(train_prices)} candles")
+    print(f"2. Pre-Validation: {len(preval_prices)} candles ({PRE_VAL_MONTHS} Months)")
+    print(f"3. Validation Set: {len(val_prices)} candles ({VAL_MONTHS} Months)")
     print("--------------------------------")
 
-    print(f"\n--- Running Grid Search on TRAINING Set ---")
+    print(f"\n--- Running Grid Search ---")
     results = []
     combinations = len(list(BUCKET_COUNTS)) * len(SEQ_LENGTHS) * 3
     counter = 0
@@ -294,38 +319,49 @@ def run_analysis():
                     sys.stdout.write(f"\rScanning config {counter}/{combinations}...")
                     sys.stdout.flush()
                 
-                # In-Sample (Train)
-                acc, trades, _ = test_strategy(train_prices, train_prices, b_count, s_len, m_type)
+                # 1. Performance on TRAIN
+                t_acc, t_trades, t_abst = test_strategy(train_prices, train_prices, b_count, s_len, m_type)
                 
-                if trades >= MIN_TRADES:
-                    score = (acc / 100) * trades 
+                # 2. Performance on PRE-VAL
+                p_acc, p_trades, p_abst = test_strategy(train_prices, preval_prices, b_count, s_len, m_type)
+                
+                if t_trades >= MIN_TRADES and p_trades > 0:
+                    # OPTIMIZATION METRIC: Train(Acc * Trades) * PreVal(Acc)
+                    # We normalize acc to 0-1 for multiplication
+                    score = (t_acc / 100) * t_trades * (p_acc / 100)
+                    
                     results.append({
                         "b_count": b_count,
                         "s_len": s_len,
                         "model": m_type,
-                        "train_acc": acc,
-                        "train_trades": trades,
-                        "score": score
+                        "score": score,
+                        "stats": {
+                            "train": (t_acc, t_trades, t_abst),
+                            "preval": (p_acc, p_trades, p_abst)
+                        }
                     })
 
     print(f"\nGrid Search Complete. Found {len(results)} valid configurations.")
 
+    # Select Top Strategies
     results.sort(key=lambda x: x['score'], reverse=True)
     top_5 = results[:5]
     
-    print(f"\n=== TOP 5 STRATEGIES (Individual Performance) ===")
-    # Updated Header
-    print(f"{'#':<3} | {'Config':<25} | {'Score':<8} | {'Train Acc':<10} | {'VAL ACC':<10} | {'VAL TRD':<8} | {'VAL ABST':<8}")
-    print("-" * 100)
+    print(f"\n=== TOP 5 STRATEGIES (Sorted by TrainPerformance * PreValAcc) ===")
+    print(f"{'#':<3} | {'Config':<22} | {'Score':<6} | {'TRAIN Acc':<9} {'Trds':<5} | {'PRE-VAL Acc':<11} {'Trds':<5} | {'FINAL VAL Acc':<13} {'Trds':<5}")
+    print("-" * 115)
     
     for i, res in enumerate(top_5):
-        # Out-of-Sample (Validation)
-        val_acc, val_trades, val_abstains = test_strategy(train_prices, val_prices, 
+        # Run Final Validation
+        v_acc, v_trades, v_abst = test_strategy(train_prices, val_prices, 
                                             res['b_count'], res['s_len'], res['model'])
+        
+        t_acc, t_trd, _ = res['stats']['train']
+        p_acc, p_trd, _ = res['stats']['preval']
         
         config_str = f"B={res['b_count']} L={res['s_len']} ({res['model'][0:3]})"
         
-        print(f"{i+1:<3} | {config_str:<25} | {res['score']:<8.1f} | {res['train_acc']:.1f}%     | {val_acc:.1f}%     | {val_trades:<8} | {val_abstains:<8}")
+        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.1f} | {t_acc:.1f}%     {t_trd:<5} | {p_acc:.1f}%       {p_trd:<5} | {v_acc:.1f}%         {v_trades:<5}")
 
     run_final_ensemble(train_prices, val_prices, top_5)
 
