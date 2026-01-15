@@ -351,7 +351,7 @@ def run_analysis():
                     # --- NEW COST FUNCTION ---
                     # (PreValAcc % / 100 - 0.5) * PreValTrades
                     # This measures "Excess Accuracy" weighted by volume.
-                    score = ((p_acc / 100.0) - 0.5) * p_trades
+                    score = ((p_acc / 100.0) - 0.65) * p_trades
                     
                     results.append({
                         "b_count": b_count,
