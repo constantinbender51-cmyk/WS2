@@ -287,22 +287,19 @@ def run_analysis():
     val_points = VAL_MONTHS * HOURS_PER_MONTH
     preval_points = PRE_VAL_MONTHS * HOURS_PER_MONTH
     
-    # Indices
     end_idx = len(prices)
     val_start_idx = end_idx - val_points
     preval_start_idx = val_start_idx - preval_points
     
-    # Slices
-    train_prices = prices[:preval_start_idx]     # 2020 -> late 2025
-    preval_prices = prices[preval_start_idx:val_start_idx] # The "Dev" Set
-    val_prices = prices[val_start_idx:]          # The "Test" Set (Dec 2025/Jan 2026)
+    train_prices = prices[:preval_start_idx]     
+    preval_prices = prices[preval_start_idx:val_start_idx] 
+    val_prices = prices[val_start_idx:]          
     
     print(f"\n=== DATA SPLIT CONFIGURATION ===")
     print(f"Total Candles : {len(prices)}")
     print(f"1. Training Set  : {len(train_prices)} candles")
-    print(f"2. Pre-Validation: {len(preval_prices)} candles ({PRE_VAL_MONTHS} Months)")
-    print(f"3. Validation Set: {len(val_prices)} candles ({VAL_MONTHS} Months)")
-    print("--------------------------------")
+    print(f"2. Pre-Validation: {len(preval_prices)} candles")
+    print(f"3. Validation Set: {len(val_prices)} candles")
 
     print(f"\n--- Running Grid Search ---")
     results = []
@@ -323,10 +320,13 @@ def run_analysis():
                 # 2. Performance on PRE-VAL
                 p_acc, p_trades, p_abst = test_strategy(train_prices, preval_prices, b_count, s_len, m_type)
                 
+                # Filter by minimum trades on train to ensure statistical significance
                 if t_trades >= MIN_TRADES and p_trades > 0:
-                    # OPTIMIZATION METRIC: TrainAcc * PreValAcc * PreValTrades
-                    # This ensures the strategy is active AND accurate in recent times.
-                    score = (t_acc / 100.0) * (p_acc / 100.0) * p_trades
+                    
+                    # --- NEW COST FUNCTION ---
+                    # (PreValAcc % / 100 - 0.5) * PreValTrades
+                    # This measures "Excess Accuracy" weighted by volume.
+                    score = ((p_acc / 100.0) - 0.5) * p_trades
                     
                     results.append({
                         "b_count": b_count,
@@ -341,25 +341,19 @@ def run_analysis():
 
     print(f"\nGrid Search Complete. Found {len(results)} valid configurations.")
 
-    # Select Top Strategies
+    # Select Top Strategies (Sorting by the new score)
     results.sort(key=lambda x: x['score'], reverse=True)
     top_5 = results[:5]
     
-    print(f"\n=== TOP 5 STRATEGIES (Sorted by TrainAcc * PreValAcc * PreValTrades) ===")
-    print(f"{'#':<3} | {'Config':<22} | {'Score':<6} | {'TRAIN Acc':<9} {'Trds':<5} | {'PRE-VAL Acc':<11} {'Trds':<5} | {'FINAL VAL Acc':<13} {'Trds':<5}")
-    print("-" * 115)
+    print(f"\n=== TOP 5 STRATEGIES (Sorted by (Acc-0.5)*Trades) ===")
+    print(f"{'#':<3} | {'Config':<22} | {'Score':<6} | {'TRAIN Acc':<9} | {'PRE-VAL Acc':<11} {'Trds':<5}")
+    print("-" * 85)
     
     for i, res in enumerate(top_5):
-        # Run Final Validation
-        v_acc, v_trades, v_abst = test_strategy(train_prices, val_prices, 
-                                            res['b_count'], res['s_len'], res['model'])
-        
         t_acc, t_trd, _ = res['stats']['train']
         p_acc, p_trd, _ = res['stats']['preval']
-        
         config_str = f"B={res['b_count']} L={res['s_len']} ({res['model'][0:3]})"
-        
-        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.1f} | {t_acc:.1f}%     {t_trd:<5} | {p_acc:.1f}%       {p_trd:<5} | {v_acc:.1f}%         {v_trades:<5}")
+        print(f"{i+1:<3} | {config_str:<22} | {res['score']:<6.2f} | {t_acc:.1f}%      | {p_acc:.1f}%       {p_trd:<5}")
 
     run_final_ensemble(train_prices, val_prices, top_5)
 
