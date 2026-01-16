@@ -18,6 +18,7 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01"
 END_DATE = "2026-01-01"
 PORT = 8000
+STEP_SIZE = 0.1  # New step size
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -94,39 +95,37 @@ def process_and_plot(df):
     df['pct_change'] = df['close'].pct_change() * 100
     df = df.dropna()
 
-    # 2. Binning (Symmetric Truncation / Absolute Rounding)
-    # np.trunc cuts off the decimal part towards zero.
-    # 0.4*2 = 0.8 -> trunc -> 0.0 -> /2 -> 0.0
-    # -0.4*2 = -0.8 -> trunc -> 0.0 -> /2 -> 0.0
-    df['binned_change'] = np.trunc(df['pct_change'] * 2) / 2
+    # 2. Binning (Symmetric Truncation to 0.1 steps)
+    # 0.19 -> 0.1, -0.19 -> -0.1
+    inv_step = int(1 / STEP_SIZE) # 10
+    df['binned_change'] = np.trunc(df['pct_change'] * inv_step) / inv_step
 
-    # 3. Compute Stats using BINNED data (Symmetric)
+    # 3. Compute Stats using BINNED data
     mu_binned = df['binned_change'].mean()
     sigma_binned = df['binned_change'].std()
 
     # Prepare distribution for plotting
     distribution = df['binned_change'].value_counts().sort_index()
-    plot_data = distribution.loc[-10:10] 
+    # Filter range to keep plot readable (e.g. -5% to +5% is usually sufficient for 1h candles)
+    plot_data = distribution.loc[-5:5] 
 
-    # 4. Generate Normal Distribution Curve (using Binned Params)
-    x_range = np.linspace(-10, 10, 1000)
+    # 4. Generate Normal Distribution Curve
+    x_range = np.linspace(-5, 5, 1000)
     pdf = norm.pdf(x_range, mu_binned, sigma_binned)
     
-    # Scale PDF to match histogram
-    # Since we are binning in 0.5 steps, we multiply by that bin width
-    scaling_factor = len(df) * 0.5 
+    # Scale PDF: Total Count * Bin Width (0.1)
+    scaling_factor = len(df) * STEP_SIZE 
     y_curve = pdf * scaling_factor
 
     # 5. Plotting
     plt.figure(figsize=(12, 6))
     
     # Histogram
-    # Note: The bar at 0.0 includes data from [-0.5, 0.5) effectively
-    plt.bar(plot_data.index, plot_data.values, width=0.4, align='center', 
-            color='skyblue', edgecolor='black', label='Binned Data (Abs Trunc)')
+    plt.bar(plot_data.index, plot_data.values, width=STEP_SIZE*0.8, align='center', 
+            color='skyblue', edgecolor='black', linewidth=0.5, label=f'Binned ({STEP_SIZE})')
     
     # Normal Distribution Line
-    plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (Binned Fit)')
+    plt.plot(x_range, y_curve, 'r-', linewidth=1.5, label='Normal Dist')
     
     # Stats Text Box
     textstr = '\n'.join((
@@ -137,11 +136,13 @@ def process_and_plot(df):
             verticalalignment='top', horizontalalignment='right', bbox=props)
 
     plt.title(f'{SYMBOL} Hourly Price Change Distribution ({START_DATE} to {END_DATE})')
-    plt.xlabel('Price Change % (Rounded to lowest absolute 0.5 step)')
+    plt.xlabel(f'Price Change % (Rounded to lowest absolute {STEP_SIZE} step)')
     plt.ylabel('Frequency')
     plt.legend()
-    plt.grid(axis='y', alpha=0.5)
-    plt.xticks(np.arange(-10, 10.5, 1))
+    plt.grid(axis='y', alpha=0.3)
+    
+    # Finer x-ticks for 0.1 steps
+    plt.xticks(np.arange(-5, 5.5, 0.5))
     
     print(f"Saving plot to {IMAGE_PATH}...")
     plt.savefig(IMAGE_PATH)
