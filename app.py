@@ -29,7 +29,7 @@ END_TRAIN = "2025-01-01 00:00:00"
 END_TEST = "2026-01-01 00:00:00"
 
 # Grid Search Parameters
-K_VALUES = [0.05, 0.1, 0.2, 0.4, 0.5, 0.8, 1, 1.5, 2, 3]
+K_VALUES = [1, 2, 4, 8, 16]
 SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
 MIN_CORRECT_PREDICTIONS = 200
 
