@@ -30,7 +30,7 @@ END_TEST = "2026-01-01 00:00:00"
 
 # Grid Search Parameters
 # k now represents the multiplier for the threshold of a "directional move"
-K_VALUES = [0.1, 0.2, 0.5, 0.8, 1.0] 
+K_VALUES = [0.1, 0.2, 0.5, 0.8, 1.0, 2, 3, 6, 12] 
 SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
 MIN_CORRECT_PREDICTIONS = 100 
 
