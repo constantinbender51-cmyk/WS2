@@ -1,6 +1,4 @@
-ccxt
-numpy
-pandas
-python-dotenv
-requests
-scikit-learn
+pandas 
+ccxt 
+numpy 
+tqdm
