@@ -7,18 +7,26 @@ import pickle
 import requests
 from datetime import datetime, timedelta
 
+
+# --- Usage ---
+# Run: python inference.py BTC
+# Run: python inference.py SOL
+# Run: python inference.py (Defaults to ETH)
+
 TICKER = sys.argv[1] if len(sys.argv) > 1 else "ETH"
 MODEL_FILENAME = f"model_{TICKER}.pkl"
 GITHUB_URL = f"https://raw.githubusercontent.com/constantinbender51-cmyk/model-2/main/{MODEL_FILENAME}"
 
 def load_model():
     if not os.path.exists(MODEL_FILENAME):
+        print(f"Downloading {MODEL_FILENAME} from GitHub...")
         try:
             r = requests.get(GITHUB_URL)
             r.raise_for_status()
             with open(MODEL_FILENAME, "wb") as f:
                 f.write(r.content)
         except Exception as e:
+            print(f"Could not download model for {TICKER}: {e}")
             sys.exit(1)
 
     with open(MODEL_FILENAME, "rb") as f:
@@ -26,6 +34,7 @@ def load_model():
 
 def fetch_recent_data(symbol):
     exchange = ccxt.binance()
+    # Fetch data
     since = exchange.milliseconds() - (5 * 24 * 60 * 60 * 1000)
     candles = exchange.fetch_ohlcv(symbol, '15m', since=since, limit=1000)
     
@@ -33,13 +42,21 @@ def fetch_recent_data(symbol):
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
 
-    now = datetime.utcnow()
-    minute_floor = (now.minute // 15) * 15
+    # --- SAFETY CHECK: DROP STUB CANDLE ---
+    # Calculate the timestamp of the currently OPEN candle
+    now = datetime.utcnow() # Use UTC to match Binance timestamps
+    current_minute = now.minute
+    # Round down to the nearest 15m block (00, 15, 30, 45)
+    minute_floor = (current_minute // 15) * 15
     current_open_candle_time = now.replace(minute=minute_floor, second=0, microsecond=0)
 
+    # If the last candle in our data matches the current OPEN time, drop it.
     if not df.empty and df.index[-1] >= current_open_candle_time:
+        # print(f"Dropping incomplete stub candle: {df.index[-1]}")
         df = df.iloc[:-1]
+
     return df
+
 
 def get_current_offset_data(df_15m, target_seqlen):
     last_time = df_15m.index[-1]
@@ -49,13 +66,17 @@ def get_current_offset_data(df_15m, target_seqlen):
     return df_resampled
 
 def main():
-    print(f"--- 🚀 DIRECTIONAL INFERENCE: {TICKER}/USDT ---")
+    print(f"--- 🚀 INFERENCE: {TICKER}/USDT ---")
     
+    # 1. Load Model
     model = load_model()
     cfg = model['config']
     weights = model['weights']
     
-    symbol = cfg['symbol']
+    print(f"Model Config: K={cfg['k']} | SeqLen={cfg['seqlen']} | BucketSize={cfg['bucket_size']:.6f}")
+    
+    # 2. Fetch Data
+    symbol = cfg['symbol'] # e.g. 'BTC/USDT'
     df_15m = fetch_recent_data(symbol)
     df_hourly = get_current_offset_data(df_15m, cfg['seqlen'])
     
@@ -63,12 +84,14 @@ def main():
         print("Not enough history.")
         return
 
-    # UPDATED: Use raw returns (no .abs()) for directional bucketing
+    # 3. Tokenize
     returns = df_hourly['close'].pct_change().fillna(0)
-    buckets = np.floor(returns / cfg['bucket_size']).astype(int).tolist()
+    buckets = (np.floor(returns.abs() / cfg['bucket_size']).astype(int) + 1).tolist()
     
+    # 4. Predict
     prefix_len = cfg['seqlen'] - 1
     current_prefix = tuple(buckets[-prefix_len:])
+    last_bucket = current_prefix[-1]
     
     if current_prefix in weights:
         candidates = weights[current_prefix]
@@ -76,17 +99,17 @@ def main():
         confidence = candidates[prediction] / sum(candidates.values())
         
         print(f"\nSequence: {current_prefix}")
-        print(f"PREDICTION BUCKET: {prediction} (Conf: {confidence:.1%})")
+        print(f"Current Bucket: {last_bucket}")
+        print(f"PREDICTION: {prediction} (Conf: {confidence:.1%})")
         
-        # UPDATED: Directional Logic
         if prediction > 0:
-            print(">> SIGNAL: BULLISH (Expected Price Up)")
+            print(">> SIGNAL: BUY")
         elif prediction < 0:
-            print(">> SIGNAL: BEARISH (Expected Price Down)")
+            print(">> SIGNAL: SELL")
         else:
-            print(">> SIGNAL: NEUTRAL (No significant movement)")
+            print(">> SIGNAL: X")
     else:
-        print(f"\nSequence {current_prefix} not seen in training.")
+        print(f"\nSequence {current_prefix} not seen in training. No prediction.")
 
 if __name__ == "__main__":
     main()
