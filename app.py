@@ -6,10 +6,28 @@ from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from itertools import product
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
-def fetch_binance_data(symbol='ETH/USDT', timeframe='30m', start_date='2020-01-01', end_date='2026-01-01'):
-    """Fetch OHLC data from Binance"""
+def fetch_binance_data(symbol='ETH/USDT', timeframe='30m', start_date='2020-01-01', end_date='2026-01-01', cache_dir='/app/data/'):
+    """Fetch OHLC data from Binance with caching"""
+    
+    # Create cache directory if it doesn't exist
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Create filename based on parameters
+    filename = f"{symbol.replace('/', '_')}_{timeframe}_{start_date}_{end_date}.csv"
+    filepath = os.path.join(cache_dir, filename)
+    
+    # Check if cached data exists
+    if os.path.exists(filepath):
+        print(f"Loading cached data from {filepath}...")
+        df = pd.read_csv(filepath)
+        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)  # Remove timezone info
+        print(f"Loaded {len(df)} candles from cache")
+        return df
+    
+    # If not cached, fetch from Binance
     print(f"Fetching {symbol} {timeframe} data from {start_date} to {end_date}...")
     
     exchange = ccxt.binance({
@@ -41,10 +59,19 @@ def fetch_binance_data(symbol='ETH/USDT', timeframe='30m', start_date='2020-01-0
             break
     
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df = df[df['timestamp'] < end_ts]
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_localize(None)  # Remove timezone
+    
+    # Filter by end date
+    end_date_dt = pd.to_datetime(end_date)
+    df = df[df['timestamp'] < end_date_dt]
     
     print(f"\nFetched {len(df)} candles total")
+    
+    # Save to cache
+    print(f"Saving data to {filepath}...")
+    df.to_csv(filepath, index=False)
+    print("Data saved successfully")
+    
     return df
 
 def create_datasets(df):
@@ -234,13 +261,17 @@ def grid_search(train_original, train_base, val_original, val_base, k_values, se
     return results
 
 def main():
-    # 1. Fetch data
+    # 1. Fetch data (with caching)
     df = fetch_binance_data(symbol='ETH/USDT', timeframe='30m', 
-                           start_date='2020-01-01', end_date='2026-01-17')
+                           start_date='2020-01-01', end_date='2026-01-17',
+                           cache_dir='/app/data/')
     
     # Split into training (2020-2025) and validation (2025-2026)
-    train_df = df[df['timestamp'] < '2025-01-01'].copy()
-    val_df = df[df['timestamp'] >= '2025-01-01'].copy()
+    # Convert to timezone-naive datetime for comparison
+    split_date = pd.to_datetime('2025-01-01')
+    
+    train_df = df[df['timestamp'] < split_date].copy()
+    val_df = df[df['timestamp'] >= split_date].copy()
     
     print(f"\nTraining period: {train_df['timestamp'].min()} to {train_df['timestamp'].max()}")
     print(f"Validation period: {val_df['timestamp'].min()} to {val_df['timestamp'].max()}")
