@@ -30,7 +30,7 @@ END_TEST = "2026-01-01 00:00:00"
 
 # Grid Search Parameters
 K_VALUES = [6, 7, 8, 9, 10]
-SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
+SEQLEN_VALUES = [3, 4, 5, 6, 7, 8, 10, 12]
 MIN_CORRECT_PREDICTIONS = 200
 
 DATA_DIR = "/app/data/"
