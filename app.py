@@ -1,241 +1,390 @@
-import os
-import ccxt
 import pandas as pd
 import numpy as np
-import pickle
-import requests
-import base64
-import json
-from datetime import datetime
-from tqdm import tqdm
-from dotenv import load_dotenv
+import ccxt
+from datetime import datetime, timedelta
+import time
+from typing import List, Tuple, Dict, Optional
+from collections import Counter, defaultdict
+import warnings
+warnings.filterwarnings('ignore')
 
-# --- Load Secrets ---
-load_dotenv()
-GITHUB_TOKEN = os.getenv("GITHUB_PAT")
-
-# --- Configuration ---
-GITHUB_OWNER = "constantinbender51-cmyk"
-GITHUB_REPO = "model-2"
-GITHUB_BRANCH = "main"
-
-# The "Big 3" Assets
-SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-TIMEFRAME = '15m'
-
-# Date Ranges
-START_TRAIN = "2020-01-01 00:00:00"
-END_TRAIN = "2025-01-01 00:00:00"
-END_TEST = "2026-01-01 00:00:00"
-
-# Grid Search Parameters
-K_VALUES = [6, 7, 8, 9, 10]
-SEQLEN_VALUES = [3, 4, 5, 6, 7, 8, 10, 12]
-MIN_CORRECT_PREDICTIONS = 200
-
-DATA_DIR = "/app/data/"
-
-def ensure_dir(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-def fetch_binance_data(symbol, timeframe, start_str, end_str):
-    ensure_dir(DATA_DIR)
-    # create a safe filename from the symbol (BTC/USDT -> BTC_USDT)
-    safe_symbol = symbol.replace('/', '_')
-    filename = f"{safe_symbol}_{timeframe}_{start_str[:4]}_{end_str[:4]}.csv"
-    filepath = os.path.join(DATA_DIR, filename)
-
-    if os.path.exists(filepath):
-        print(f"Loading {filename} from disk...")
-        df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+class ETHDataProcessor:
+    def __init__(self):
+        self.exchange = ccxt.binance({
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot'
+            }
+        })
+        
+    def fetch_ohlcv_data(self, start_date: str, end_date: str, timeframe: str = '30m') -> pd.DataFrame:
+        """Fetch OHLCV data from Binance"""
+        print(f"Fetching ETH/USDT data from {start_date} to {end_date} ({timeframe})")
+        
+        since = self.exchange.parse8601(start_date + ' 00:00:00')
+        until = self.exchange.parse8601(end_date + ' 23:59:59')
+        
+        all_data = []
+        current_since = since
+        
+        while current_since < until:
+            try:
+                ohlcv = self.exchange.fetch_ohlcv('ETH/USDT', timeframe, since=current_since, limit=1000)
+                if not ohlcv:
+                    break
+                    
+                all_data.extend(ohlcv)
+                current_since = ohlcv[-1][0] + 1
+                
+                print(f"Fetched {len(ohlcv)} candles, total: {len(all_data)}")
+                time.sleep(0.2)
+                
+            except Exception as e:
+                print(f"Error: {e}, retrying...")
+                time.sleep(2)
+                
+        df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        
         return df
 
-    print(f"Fetching {symbol} {timeframe} data ({start_str} to {end_str})...")
-    exchange = ccxt.binance()
-    start_ts = exchange.parse8601(start_str)
-    end_ts = exchange.parse8601(end_str)
-    
-    ohlcv = []
-    current_ts = start_ts
-    
-    pbar = tqdm()
-    while current_ts < end_ts:
-        try:
-            candles = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
-            if not candles: break
-            candles = [c for c in candles if c[0] < end_ts]
-            if not candles: break
-            current_ts = candles[-1][0] + 1
-            ohlcv.extend(candles)
-            pbar.update(len(candles))
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            break
-    pbar.close()
-
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df.to_csv(filepath)
-    return df
-
-def resample_dataset(df_15m, offset_minutes=0):
-    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-    offset_str = f'{offset_minutes}min'
-    df_resampled = df_15m.resample('1h', offset=offset_str, closed='left', label='left').agg(agg_dict)
-    df_resampled.dropna(inplace=True)
-    return df_resampled
-
-def prepare_buckets(train_df_list, test_df_list, k):
-    all_train_returns = []
-    for df in train_df_list:
-        all_train_returns.append(df['close'].pct_change().fillna(0))
-    
-    combined_train_returns = pd.concat(all_train_returns)
-    avg_abs_return = combined_train_returns.abs().mean()
-    
-    bucket_size = avg_abs_return * k
-    if bucket_size == 0: bucket_size = 1e-9 
-
-    def get_buckets(df):
-        returns = df['close'].pct_change().fillna(0)
-        return np.floor(returns / bucket_size).astype(int) + 1
-
-    train_buckets_list = [get_buckets(df) for df in train_df_list]
-    test_buckets_list = [get_buckets(df) for df in test_df_list]
-    
-    return train_buckets_list, test_buckets_list, bucket_size
-
-def build_frequency_map(sequences_list, seqlen):
-    freq_map = {}
-    for sequence in sequences_list:
-        seq_array = sequence.tolist()
-        for i in range(len(seq_array) - seqlen + 1):
-            window = tuple(seq_array[i : i + seqlen])
-            prefix = window[:-1]
-            target = window[-1]
-            if prefix not in freq_map: freq_map[prefix] = {}
-            if target not in freq_map[prefix]: freq_map[prefix][target] = 0
-            freq_map[prefix][target] += 1
-    return freq_map
-
-def predict_most_frequent(prefix, freq_map):
-    if prefix not in freq_map: return None
-    candidates = freq_map[prefix]
-    return max(candidates, key=candidates.get)
-
-def evaluate_prediction(test_buckets_list, freq_map, seqlen):
-    total_correct = 0
-    total_incorrect = 0
-    for test_buckets in test_buckets_list:
-        test_seq = test_buckets.tolist()
-        for i in range(seqlen - 1, len(test_seq)):
-            current_idx = i - 1 
-            current_bucket = test_seq[current_idx]
-            prefix = tuple(test_seq[i - (seqlen - 1) : i])
-            predicted_bucket = predict_most_frequent(prefix, freq_map)
-            actual_next_bucket = test_seq[i]
-            if predicted_bucket is not None:
-                if predicted_bucket > 0: # Model predicts UP
-                    if actual_next_bucket > 0:
-                        total_correct += 1
-                    else:
-                        total_incorrect += 1
-                elif predicted_bucket < 0: # Model predicts DOWN
-                    if actual_next_bucket < 0:
-                        total_correct += 1
-                    else:
-                        total_incorrect += 1
-    total_valid = total_correct + total_incorrect
-    if total_valid == 0: return 0.0, 0
-    return total_correct / total_valid, total_correct
-
-def upload_to_github(file_path, repo_owner, repo_name, token, branch="main"):
-    if not token:
-        print("Error: GITHUB_PAT not found in .env")
-        return
-    file_name = os.path.basename(file_path)
-    print(f"Uploading {file_name}...")
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{file_name}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    
-    with open(file_path, "rb") as f:
-        content = f.read()
-    content_b64 = base64.b64encode(content).decode("utf-8")
-
-    sha = None
-    r_check = requests.get(api_url, headers=headers, params={"ref": branch})
-    if r_check.status_code == 200:
-        sha = r_check.json().get("sha")
-
-    data = {
-        "message": f"Update model {file_name} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "content": content_b64,
-        "branch": branch
-    }
-    if sha: data["sha"] = sha
-    
-    requests.put(api_url, headers=headers, data=json.dumps(data))
-    print(f"✅ Uploaded {file_name}")
-
-def run_multi_asset_search():
-    print(f"Starting Multi-Asset Grid Search for: {SYMBOLS}")
-    
-    for symbol in SYMBOLS:
-        print(f"\n{'='*60}")
-        print(f"PROCESSING ASSET: {symbol}")
-        print(f"{'='*60}")
+class BucketSequenceGenerator:
+    def __init__(self, k: float = 1.0):
+        self.k = k
         
-        # Fetch Data
-        df_train_raw = fetch_binance_data(symbol, TIMEFRAME, START_TRAIN, END_TRAIN)
-        df_test_raw = fetch_binance_data(symbol, TIMEFRAME, END_TRAIN, END_TEST)
+    def calculate_bucket_size(self, returns: pd.Series) -> float:
+        """Calculate bucket size based on average absolute return"""
+        avg_abs_return = returns.abs().mean()
+        bucket_size = avg_abs_return * self.k
+        return bucket_size
+    
+    def create_buckets(self, returns: pd.Series) -> Tuple[np.ndarray, float]:
+        """Create bucket sequence from returns"""
+        bucket_size = self.calculate_bucket_size(returns)
         
-        # Resample
-        offsets = [0, 15, 30, 45]
-        train_dfs = [resample_dataset(df_train_raw, offset) for offset in offsets]
-        test_dfs = [resample_dataset(df_test_raw, offset) for offset in offsets]
+        # Create buckets: 0, bucket_size, 2*bucket_size, etc.
+        buckets = np.zeros(len(returns))
         
-        best_acc = -1
-        best_model_data = None
+        for i, ret in enumerate(returns):
+            abs_ret = abs(ret)
+            if abs_ret == 0:
+                bucket = 1
+            else:
+                bucket = int(np.ceil(abs_ret / bucket_size)) + 1
+            buckets[i] = bucket
+            
+        return buckets, bucket_size
+    
+    def create_derivative_sequence(self, bucket_sequence: np.ndarray) -> np.ndarray:
+        """Create derivative sequence (bucket - previous bucket)"""
+        derivative = np.zeros(len(bucket_sequence))
+        derivative[0] = 0  # First element is 0
         
-        # Grid Search
-        print(f"{'K':<10} {'SeqLen':<10} {'Accuracy':<10} {'Correct':<10}")
-        print("-" * 45)
+        for i in range(1, len(bucket_sequence)):
+            derivative[i] = bucket_sequence[i] - bucket_sequence[i-1]
+            
+        return derivative
+
+class SubsequenceAnalyzer:
+    def __init__(self, sequence: np.ndarray, min_length: int = 2, max_length: int = 10):
+        self.sequence = sequence
+        self.min_length = min_length
+        self.max_length = max_length
+        self.subsequence_freq = self._calculate_subsequence_frequencies()
+        self.completion_map = self._build_completion_map()
         
-        for k in K_VALUES:
-            train_buckets_list, test_buckets_list, bucket_size = prepare_buckets(train_dfs, test_dfs, k)
-            for seqlen in SEQLEN_VALUES:
-                freq_map = build_frequency_map(train_buckets_list, seqlen)
-                acc, correct_count = evaluate_prediction(test_buckets_list, freq_map, seqlen)
-                print(f"{k:<10} {seqlen:<10} {acc:.4f}     {correct_count:<10}")
+    def _calculate_subsequence_frequencies(self) -> Dict[str, int]:
+        """Calculate frequencies of all subsequences"""
+        seq_str = ''.join(str(int(x)) for x in self.sequence)
+        frequencies = {}
+        
+        for length in range(self.min_length, self.max_length + 1):
+            for i in range(len(seq_str) - length + 1):
+                substr = seq_str[i:i+length]
+                frequencies[substr] = frequencies.get(substr, 0) + 1
                 
-                if correct_count >= MIN_CORRECT_PREDICTIONS and acc > best_acc:
-                    best_acc = acc
-                    best_model_data = {
-                        "weights": freq_map,
-                        "config": {
-                            "symbol": symbol,
-                            "k": k,
-                            "seqlen": seqlen,
-                            "bucket_size": bucket_size, # This will differ per asset!
-                        },
-                        "metrics": {"accuracy": acc, "correct": correct_count}
-                    }
+        return frequencies
+    
+    def _build_completion_map(self) -> Dict[str, Dict[str, int]]:
+        """Build map of incomplete sequences to possible completions"""
+        completion_map = defaultdict(lambda: defaultdict(int))
+        
+        for subsequence, freq in self.subsequence_freq.items():
+            for i in range(1, len(subsequence)):
+                prefix = subsequence[:i]
+                next_char = subsequence[i:i+1]
+                completion_map[prefix][next_char] += freq
+                
+        return completion_map
+    
+    def get_completion(self, incomplete_seq: str) -> Tuple[str, int]:
+        """Get most probable completion for incomplete sequence"""
+        if incomplete_seq not in self.completion_map:
+            return "", 0
+            
+        completions = self.completion_map[incomplete_seq]
+        if not completions:
+            return "", 0
+            
+        # Find completion with highest frequency
+        best_completion = max(completions.items(), key=lambda x: x[1])
+        return best_completion[0], best_completion[1]
 
-        # Save and Upload for THIS symbol
-        if best_model_data:
-            ticker = symbol.split('/')[0] # BTC, ETH, SOL
-            filename = f"model_{ticker}.pkl"
+class BucketPredictor:
+    def __init__(self, train_bucket_seq: np.ndarray, train_derivative_seq: np.ndarray):
+        self.train_bucket_seq = train_bucket_seq
+        self.train_derivative_seq = train_derivative_seq
+        
+    def predict_validation(self, k: float, seq_len: int) -> float:
+        """Test predictions on validation set with given parameters"""
+        # Create sequences for training
+        train_bucket_str = ''.join(str(int(x)) for x in self.train_bucket_seq)
+        train_derivative_str = ''.join(str(int(x)) for x in self.train_derivative_seq)
+        
+        # Analyze training sequences
+        bucket_analyzer = SubsequenceAnalyzer(
+            self.train_bucket_seq, 
+            min_length=seq_len, 
+            max_length=seq_len + 3
+        )
+        
+        derivative_analyzer = SubsequenceAnalyzer(
+            self.train_derivative_seq,
+            min_length=seq_len,
+            max_length=seq_len + 3
+        )
+        
+        # For validation, we'll use a sliding window approach
+        # In practice, you would have separate validation data
+        # For this example, we'll use the last portion of training data
+        val_size = len(self.train_bucket_seq) // 10
+        val_seq = self.train_bucket_seq[-val_size:]
+        val_derivative = self.train_derivative_seq[-val_size:]
+        
+        correct_predictions = 0
+        total_predictions = 0
+        
+        # Test predictions on validation sequence
+        for i in range(len(val_seq) - seq_len):
+            # Get incomplete sequence
+            incomplete_bucket = ''.join(str(int(x)) for x in val_seq[i:i+seq_len])
+            incomplete_derivative = ''.join(str(int(x)) for x in val_derivative[i:i+seq_len])
             
-            print(f"\n🏆 Best {symbol} Model: Acc {best_acc:.4f} | K {best_model_data['config']['k']}")
+            # Get predictions
+            bucket_pred, _ = bucket_analyzer.get_completion(incomplete_bucket)
+            derivative_pred, _ = derivative_analyzer.get_completion(incomplete_derivative)
             
-            with open(filename, "wb") as f:
-                pickle.dump(best_model_data, f)
+            # Check if predictions are available
+            if bucket_pred:
+                # Convert prediction to compare with actual
+                pred_value = int(bucket_pred)
+                actual_value = int(val_seq[i+seq_len])
+                
+                if pred_value == actual_value:
+                    correct_predictions += 1
+                total_predictions += 1
+                
+            if derivative_pred and total_predictions < len(val_seq) - seq_len:
+                # For derivative predictions
+                pred_value = int(derivative_pred)
+                actual_value = int(val_derivative[i+seq_len])
+                
+                if pred_value == actual_value:
+                    correct_predictions += 0.5  # Half weight for derivative predictions
+                total_predictions += 0.5
+                
+        accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
+        return accuracy
+
+def main():
+    # Initialize data processor
+    processor = ETHDataProcessor()
+    
+    # 1. Fetch and prepare data
+    print("=" * 60)
+    print("STEP 1: Fetching and preparing data")
+    print("=" * 60)
+    
+    # Fetch 30m data
+    eth_data = processor.fetch_ohlcv_data('2020-01-01', '2026-01-01', '30m')
+    
+    if eth_data.empty:
+        print("No data fetched. Using sample data for demonstration.")
+        # Create sample data for demonstration
+        dates = pd.date_range('2020-01-01', '2026-01-01', freq='30min')
+        np.random.seed(42)
+        prices = np.random.lognormal(mean=0.0001, sigma=0.01, size=len(dates)).cumsum() + 200
+        eth_data = pd.DataFrame({
+            'open': prices,
+            'high': prices * (1 + np.random.random(len(dates)) * 0.02),
+            'low': prices * (1 - np.random.random(len(dates)) * 0.02),
+            'close': prices,
+            'volume': np.random.random(len(dates)) * 10000
+        }, index=dates)
+    
+    print(f"\nTotal data points: {len(eth_data)}")
+    print(f"Date range: {eth_data.index[0]} to {eth_data.index[-1]}")
+    
+    # 2. Create two datasets: original and base 30 (starting at candle 2)
+    print("\n" + "=" * 60)
+    print("STEP 2: Creating datasets")
+    print("=" * 60)
+    
+    # Original dataset
+    original_data = eth_data.copy()
+    
+    # Base 30 dataset (starting at candle 2)
+    base_30_data = eth_data.iloc[1:].copy().reset_index(drop=False)
+    print(f"Original dataset shape: {original_data.shape}")
+    print(f"Base 30 dataset shape: {base_30_data.shape}")
+    
+    # 3. Resample both to 1h
+    print("\n" + "=" * 60)
+    print("STEP 3: Resampling to 1h")
+    print("=" * 60)
+    
+    # Resample original data to 1h
+    original_1h = original_data.resample('1h').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).dropna()
+    
+    # Resample base 30 data to 1h
+    base_30_data.set_index('timestamp', inplace=True)
+    base_30_1h = base_30_data.resample('1h').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).dropna()
+    
+    print(f"Original 1h dataset shape: {original_1h.shape}")
+    print(f"Base 30 1h dataset shape: {base_30_1h.shape}")
+    
+    # Split data into training (2020-2025) and validation (2025-2026)
+    print("\n" + "=" * 60)
+    print("STEP 4: Splitting data into training and validation")
+    print("=" * 60)
+    
+    train_mask = original_1h.index < '2025-01-01'
+    val_mask = (original_1h.index >= '2025-01-01') & (original_1h.index < '2026-01-01')
+    
+    train_data = original_1h[train_mask]
+    val_data = original_1h[val_mask]
+    
+    print(f"Training data: {train_data.shape[0]} candles ({train_data.index[0]} to {train_data.index[-1]})")
+    print(f"Validation data: {val_data.shape[0]} candles ({val_data.index[0]} to {val_data.index[-1]})")
+    
+    # Calculate returns for training data
+    train_returns = train_data['close'].pct_change().dropna()
+    
+    # 4. Grid search for optimal k and sequence length
+    print("\n" + "=" * 60)
+    print("STEP 5: Grid search for optimal parameters")
+    print("=" * 60)
+    
+    # Parameter grid
+    k_values = [0.5, 1.0, 1.5, 2.0, 2.5]
+    seq_lengths = [2, 3, 4, 5, 6, 7, 8]
+    
+    best_accuracy = 0
+    best_params = {}
+    results = []
+    
+    bucket_generator = BucketSequenceGenerator()
+    
+    for k in k_values:
+        bucket_generator.k = k
+        
+        # Create bucket sequence for training data
+        train_buckets, bucket_size = bucket_generator.create_buckets(train_returns)
+        train_derivative = bucket_generator.create_derivative_sequence(train_buckets)
+        
+        predictor = BucketPredictor(train_buckets, train_derivative)
+        
+        for seq_len in seq_lengths:
+            # Skip if sequence length is too long for validation
+            if len(train_buckets) < seq_len * 10:
+                continue
+                
+            accuracy = predictor.predict_validation(k, seq_len)
+            results.append({
+                'k': k,
+                'seq_len': seq_len,
+                'accuracy': accuracy,
+                'bucket_size': bucket_size
+            })
             
-            upload_to_github(filename, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, GITHUB_BRANCH)
-        else:
-            print(f"❌ No valid model found for {symbol}")
+            print(f"k={k:.1f}, seq_len={seq_len}: accuracy={accuracy:.4f}")
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_params = {
+                    'k': k,
+                    'seq_len': seq_len,
+                    'accuracy': accuracy,
+                    'bucket_size': bucket_size
+                }
+    
+    # 5. Display results
+    print("\n" + "=" * 60)
+    print("RESULTS")
+    print("=" * 60)
+    
+    # Create results DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Sort by accuracy
+    results_df = results_df.sort_values('accuracy', ascending=False)
+    
+    print("\nTop 10 configurations:")
+    print(results_df.head(10).to_string(index=False))
+    
+    print("\n" + "=" * 60)
+    print("WINNING CONFIGURATION")
+    print("=" * 60)
+    print(f"Best k value: {best_params['k']:.2f}")
+    print(f"Best sequence length: {best_params['seq_len']}")
+    print(f"Best accuracy: {best_params['accuracy']:.4%}")
+    print(f"Bucket size: {best_params['bucket_size']:.6f}")
+    
+    # 6. Additional analysis
+    print("\n" + "=" * 60)
+    print("ADDITIONAL ANALYSIS")
+    print("=" * 60)
+    
+    # Create bucket sequence with best k
+    bucket_generator.k = best_params['k']
+    train_buckets, _ = bucket_generator.create_buckets(train_returns)
+    
+    # Analyze subsequence frequencies
+    analyzer = SubsequenceAnalyzer(train_buckets, min_length=2, max_length=5)
+    
+    print("\nMost common subsequences (length 3):")
+    sorted_freq = sorted(analyzer.subsequence_freq.items(), 
+                        key=lambda x: x[1], 
+                        reverse=True)
+    
+    for i, (seq, freq) in enumerate(sorted_freq[:10]):
+        if len(seq) == 3:
+            print(f"  {seq}: {freq} occurrences")
+    
+    # Test some predictions
+    print("\nSample predictions with best configuration:")
+    sample_incomplete = ''.join(str(int(x)) for x in train_buckets[:best_params['seq_len']])
+    completion, freq = analyzer.get_completion(sample_incomplete)
+    
+    if completion:
+        print(f"Incomplete sequence: {sample_incomplete}")
+        print(f"Most probable completion: {completion}")
+        print(f"Frequency: {freq}")
+    else:
+        print("No completion found for sample sequence")
 
 if __name__ == "__main__":
-    run_multi_asset_search()
+    main()
