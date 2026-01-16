@@ -94,12 +94,15 @@ def process_and_plot(df):
     df['pct_change'] = df['close'].pct_change() * 100
     df = df.dropna()
 
-    # 2. Binning (Symmetric Truncation towards Zero)
-    # 0.4 -> 0.0, -0.4 -> 0.0
-    # 0.9 -> 0.5, -0.9 -> -0.5
-    df['binned_change'] = np.trunc(df['pct_change'] * 2) / 2
+    # 2. Binning (REVERTED to Floor as per original)
+    # 0.4 -> 0.0, 0.9 -> 0.5
+    # -0.4 -> -0.5, -0.9 -> -1.0
+    df['binned_change'] = np.floor(df['pct_change'] * 2) / 2
 
-    # 3. Compute Stats using BINNED data (As requested)
+    # 3. Compute Stats using BINNED data
+    # Because we use 'floor', the mean will naturally shift left (~ -0.25).
+    # By using this shifted mean for the curve, the curve will shift left too,
+    # ensuring it aligns perfectly with the shifted bars.
     mu_binned = df['binned_change'].mean()
     sigma_binned = df['binned_change'].std()
 
@@ -107,11 +110,16 @@ def process_and_plot(df):
     distribution = df['binned_change'].value_counts().sort_index()
     plot_data = distribution.loc[-10:10] 
 
-    # 4. Generate Normal Distribution Curve (using Binned Params)
+    # 4. Generate Normal Distribution Curve
+    # We add 0.2 to the x_range because matplotlib bars with align='edge' 
+    # and width=0.4 appear visually centered at x + 0.2.
+    # However, since we want to fit the DISTRIBUTION of the values,
+    # we just plot the PDF of the values directly.
     x_range = np.linspace(-10, 10, 1000)
     pdf = norm.pdf(x_range, mu_binned, sigma_binned)
     
     # Scale PDF to match histogram
+    # Factor = Total Count * Bin Width (0.5)
     scaling_factor = len(df) * 0.5 
     y_curve = pdf * scaling_factor
 
@@ -119,8 +127,9 @@ def process_and_plot(df):
     plt.figure(figsize=(12, 6))
     
     # Histogram
+    # Note: Bin "0.0" (covering 0.0 to 0.49) is drawn at x=0.0
     plt.bar(plot_data.index, plot_data.values, width=0.4, align='edge', 
-            color='skyblue', edgecolor='black', label='Binned Data (Truncated)')
+            color='skyblue', edgecolor='black', label='Binned Data (Floored)')
     
     # Normal Distribution Line
     plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (Binned Fit)')
@@ -134,7 +143,7 @@ def process_and_plot(df):
             verticalalignment='top', horizontalalignment='right', bbox=props)
 
     plt.title(f'{SYMBOL} Hourly Price Change Distribution ({START_DATE} to {END_DATE})')
-    plt.xlabel('Price Change % (Rounded 0.5 steps towards zero)')
+    plt.xlabel('Price Change % (Floored to 0.5 steps)')
     plt.ylabel('Frequency')
     plt.legend()
     plt.grid(axis='y', alpha=0.5)
