@@ -1,0 +1,6 @@
+python-dotenv
+pandas
+ccxt
+numpy
+tqdm
+requests
