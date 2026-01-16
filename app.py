@@ -94,21 +94,22 @@ def process_and_plot(df):
     df['pct_change'] = df['close'].pct_change() * 100
     df = df.dropna()
 
-    # 2. Binning (Round down to 0.5 steps)
-    df['binned_change'] = np.floor(df['pct_change'] * 2) / 2
+    # 2. Binning (Symmetric Truncation towards Zero)
+    # 0.4 -> 0.0, -0.4 -> 0.0
+    # 0.9 -> 0.5, -0.9 -> -0.5
+    df['binned_change'] = np.trunc(df['pct_change'] * 2) / 2
 
-    # 3. Compute Stats using RAW data (This fixes the curve alignment)
-    #    The visual fit requires the "True" mean, not the "Floored" mean.
-    mu_raw = df['pct_change'].mean()
-    sigma_raw = df['pct_change'].std()
+    # 3. Compute Stats using BINNED data (As requested)
+    mu_binned = df['binned_change'].mean()
+    sigma_binned = df['binned_change'].std()
 
-    # Prepare distribution for plotting (using Binned data for bars)
+    # Prepare distribution for plotting
     distribution = df['binned_change'].value_counts().sort_index()
     plot_data = distribution.loc[-10:10] 
 
-    # 4. Generate Normal Distribution Curve (using Raw Params)
+    # 4. Generate Normal Distribution Curve (using Binned Params)
     x_range = np.linspace(-10, 10, 1000)
-    pdf = norm.pdf(x_range, mu_raw, sigma_raw)
+    pdf = norm.pdf(x_range, mu_binned, sigma_binned)
     
     # Scale PDF to match histogram
     scaling_factor = len(df) * 0.5 
@@ -117,23 +118,23 @@ def process_and_plot(df):
     # 5. Plotting
     plt.figure(figsize=(12, 6))
     
-    # Histogram (Binned Data)
+    # Histogram
     plt.bar(plot_data.index, plot_data.values, width=0.4, align='edge', 
-            color='skyblue', edgecolor='black', label='Binned Data (0.5 steps)')
+            color='skyblue', edgecolor='black', label='Binned Data (Truncated)')
     
-    # Normal Distribution Line (Raw Data fit)
-    plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (True Fit)')
+    # Normal Distribution Line
+    plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (Binned Fit)')
     
     # Stats Text Box
     textstr = '\n'.join((
-        r'$\mu_{raw}=%.4f$' % (mu_raw, ),
-        r'$\sigma_{raw}=%.4f$' % (sigma_raw, )))
+        r'$\mu_{binned}=%.4f$' % (mu_binned, ),
+        r'$\sigma_{binned}=%.4f$' % (sigma_binned, )))
     props = dict(boxstyle='round', facecolor='white', alpha=0.8)
     plt.gca().text(0.95, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
             verticalalignment='top', horizontalalignment='right', bbox=props)
 
     plt.title(f'{SYMBOL} Hourly Price Change Distribution ({START_DATE} to {END_DATE})')
-    plt.xlabel('Price Change % (Rounded down to 0.5 steps)')
+    plt.xlabel('Price Change % (Rounded 0.5 steps towards zero)')
     plt.ylabel('Frequency')
     plt.legend()
     plt.grid(axis='y', alpha=0.5)
