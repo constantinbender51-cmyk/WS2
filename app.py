@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.stats import norm
+from scipy.stats import t  # Changed from norm to t (Student's t-distribution)
 
 # Configuration
 DATA_DIR = "/app/data/"
@@ -18,7 +18,7 @@ INTERVAL = "1h"
 START_DATE = "2020-01-01"
 END_DATE = "2026-01-01"
 PORT = 8000
-STEP_SIZE = 0.1  # New step size
+STEP_SIZE = 0.1
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -96,24 +96,25 @@ def process_and_plot(df):
     df = df.dropna()
 
     # 2. Binning (Symmetric Truncation to 0.1 steps)
-    # 0.19 -> 0.1, -0.19 -> -0.1
-    inv_step = int(1 / STEP_SIZE) # 10
+    inv_step = int(1 / STEP_SIZE) 
     df['binned_change'] = np.trunc(df['pct_change'] * inv_step) / inv_step
 
-    # 3. Compute Stats using BINNED data
-    mu_binned = df['binned_change'].mean()
-    sigma_binned = df['binned_change'].std()
+    # 3. Fit Student's t-distribution
+    # We fit on the RAW data to get the true shape parameters (df, loc, scale)
+    # df (degrees of freedom) controls the "fatness" of the tails. 
+    # Lower df = fatter tails/sharper peak.
+    param = t.fit(df['pct_change'])
+    df_fit, loc_fit, scale_fit = param
 
     # Prepare distribution for plotting
     distribution = df['binned_change'].value_counts().sort_index()
-    # Filter range to keep plot readable (e.g. -5% to +5% is usually sufficient for 1h candles)
     plot_data = distribution.loc[-5:5] 
 
-    # 4. Generate Normal Distribution Curve
+    # 4. Generate t-distribution Curve
     x_range = np.linspace(-5, 5, 1000)
-    pdf = norm.pdf(x_range, mu_binned, sigma_binned)
+    pdf = t.pdf(x_range, df_fit, loc_fit, scale_fit)
     
-    # Scale PDF: Total Count * Bin Width (0.1)
+    # Scale PDF
     scaling_factor = len(df) * STEP_SIZE 
     y_curve = pdf * scaling_factor
 
@@ -122,26 +123,25 @@ def process_and_plot(df):
     
     # Histogram
     plt.bar(plot_data.index, plot_data.values, width=STEP_SIZE*0.8, align='center', 
-            color='skyblue', edgecolor='black', linewidth=0.5, label=f'Binned ({STEP_SIZE})')
+            color='skyblue', edgecolor='black', linewidth=0.5, label='Actual Data')
     
-    # Normal Distribution Line
-    plt.plot(x_range, y_curve, 'r-', linewidth=1.5, label='Normal Dist')
+    # t-distribution Line
+    plt.plot(x_range, y_curve, 'r-', linewidth=2, label=f"Student's t-dist (df={df_fit:.2f})")
     
     # Stats Text Box
     textstr = '\n'.join((
-        r'$\mu_{binned}=%.4f$' % (mu_binned, ),
-        r'$\sigma_{binned}=%.4f$' % (sigma_binned, )))
+        r'$\mu \approx %.4f$' % (loc_fit, ),
+        r'$\sigma \approx %.4f$' % (scale_fit, ),
+        r'$d.o.f.=%.2f$' % (df_fit, )))
     props = dict(boxstyle='round', facecolor='white', alpha=0.8)
     plt.gca().text(0.95, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
             verticalalignment='top', horizontalalignment='right', bbox=props)
 
-    plt.title(f'{SYMBOL} Hourly Price Change Distribution ({START_DATE} to {END_DATE})')
+    plt.title(f'{SYMBOL} Hourly Returns vs Student\'s t-Distribution ({START_DATE} to {END_DATE})')
     plt.xlabel(f'Price Change % (Rounded to lowest absolute {STEP_SIZE} step)')
     plt.ylabel('Frequency')
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
-    
-    # Finer x-ticks for 0.1 steps
     plt.xticks(np.arange(-5, 5.5, 0.5))
     
     print(f"Saving plot to {IMAGE_PATH}...")
