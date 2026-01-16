@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.stats import norm
 
 # Configuration
 DATA_DIR = "/app/data/"
@@ -93,32 +94,39 @@ def process_and_plot(df):
     df['pct_change'] = df['close'].pct_change() * 100
     df = df.dropna()
 
-    # 2. Compute Statistics (Mean and Std Dev)
-    mu = df['pct_change'].mean()
-    sigma = df['pct_change'].std()
-
-    # 3. Binning: Floor to 0.5 step
+    # 2. Binning (Round down to 0.5 steps)
     df['binned_change'] = np.floor(df['pct_change'] * 2) / 2
+
+    # 3. Compute Statistics ON THE BINNED DATA
+    mu = df['binned_change'].mean()
+    sigma = df['binned_change'].std()
+
+    # Prepare distribution for plotting
     distribution = df['binned_change'].value_counts().sort_index()
-    
-    # Filter for plotting clarity (-10% to +10%)
     plot_data = distribution.loc[-10:10] 
 
-    # 4. Plotting
+    # 4. Generate Normal Distribution Curve (using binned stats)
+    x_range = np.linspace(-10, 10, 1000)
+    pdf = norm.pdf(x_range, mu, sigma)
+    
+    # Scale PDF: Total Count * Bin Width (0.5)
+    scaling_factor = len(df) * 0.5 
+    y_curve = pdf * scaling_factor
+
+    # 5. Plotting
     plt.figure(figsize=(12, 6))
     
     # Histogram
-    plt.bar(plot_data.index, plot_data.values, width=0.4, align='edge', color='skyblue', edgecolor='black')
+    plt.bar(plot_data.index, plot_data.values, width=0.4, align='edge', 
+            color='skyblue', edgecolor='black', label='Binned Data')
     
-    # Vertical line for Mean
-    plt.axvline(mu, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {mu:.2f}%')
+    # Normal Distribution Line
+    plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (Binned Params)')
     
-    # Add Text Box with stats
+    # Stats Text Box
     textstr = '\n'.join((
-        r'$\mu=%.4f$' % (mu, ),
-        r'$\sigma=%.4f$' % (sigma, )))
-    
-    # Place text box in top right
+        r'$\mu_{binned}=%.4f$' % (mu, ),
+        r'$\sigma_{binned}=%.4f$' % (sigma, )))
     props = dict(boxstyle='round', facecolor='white', alpha=0.8)
     plt.gca().text(0.95, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
             verticalalignment='top', horizontalalignment='right', bbox=props)
