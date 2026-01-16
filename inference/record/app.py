@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # --- CONFIGURATION ---
 SIGNAL_URL = "http://signalsexec.up.railway.app"
 CSV_FILE = "pnl_log.csv"
-SERVER_PORT = 8081  # Port to serve the CSV (different from scheduler)
+SERVER_PORT = 8081
 TICKERS = ["BTC", "ETH", "SOL"]
 
 # Map internal tickers to Binance US Tether pairs
@@ -27,10 +27,8 @@ class CSVRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Serve the CSV file content and a summary."""
         if self.path == '/csv':
-            # Serve raw CSV for downloading/parsing
             self._serve_file()
         else:
-            # Serve a dashboard text view
             self._serve_dashboard()
 
     def _serve_file(self):
@@ -54,20 +52,17 @@ class CSVRequestHandler(BaseHTTPRequestHandler):
         
         # Calculate stats on the fly
         stats = self._calculate_stats()
-        response_lines.append(f"Total Trades: {stats['trades']}")
+        response_lines.append(f"Total Trades: {stats['trades']} (Active: {stats['active_trades']})")
         response_lines.append(f"Total PnL:    {stats['pnl']:.4f}")
-        response_lines.append(f"Accuracy:     {stats['accuracy']:.2f}%")
+        response_lines.append(f"Accuracy:     {stats['accuracy']:.2f}% (Excluding Flat)")
         response_lines.append("\n--- RECENT LOGS ---")
         
-        # Read last 10 lines of CSV
         if os.path.isfile(CSV_FILE):
             with open(CSV_FILE, 'r') as f:
                 lines = f.readlines()
-                # Header
                 response_lines.append(lines[0].strip()) 
-                # Last 10 lines
                 for line in lines[-10:]:
-                    if line != lines[0]: # Avoid repeating header if file is short
+                    if line != lines[0]:
                         response_lines.append(line.strip())
         else:
             response_lines.append("No data recorded yet.")
@@ -79,18 +74,24 @@ class CSVRequestHandler(BaseHTTPRequestHandler):
         total_pnl = 0.0
         wins = 0
         total_trades = 0
+        active_trades = 0
         
         if os.path.isfile(CSV_FILE):
             with open(CSV_FILE, mode='r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    total_pnl += float(row['pnl'])
+                    pnl = float(row['pnl'])
+                    total_pnl += pnl
                     total_trades += 1
-                    if float(row['is_win']) > 0:
-                        wins += 1
+                    
+                    # Ignore flat trades (pnl == 0) for accuracy calc
+                    if abs(pnl) > 1e-9:
+                        active_trades += 1
+                        if float(row['is_win']) > 0:
+                            wins += 1
         
-        accuracy = (wins / total_trades * 100) if total_trades > 0 else 0
-        return {"pnl": total_pnl, "accuracy": accuracy, "trades": total_trades}
+        accuracy = (wins / active_trades * 100) if active_trades > 0 else 0
+        return {"pnl": total_pnl, "accuracy": accuracy, "trades": total_trades, "active_trades": active_trades}
 
 def start_web_server():
     """Starts the web server in a background thread."""
@@ -114,6 +115,7 @@ def fetch_signals():
         text = resp.text
         signals = {}
         for ticker in TICKERS:
+            # Expecting ticker: 1 or ticker: -1 or ticker: 0
             match = re.search(rf"{ticker}:\s+(-?\d+)", text)
             signals[ticker] = int(match.group(1)) if match else 0
         return signals
@@ -151,7 +153,7 @@ def run_record_loop():
     server_thread = threading.Thread(target=start_web_server, daemon=True)
     server_thread.start()
     
-    print(f"--- 📉 Accuracy Recorder Started ---")
+    print(f"--- 📉 Directional Recorder Started ---")
     print("Waiting for the next 15-minute mark...")
 
     while True:
@@ -175,7 +177,11 @@ def run_record_loop():
             if ticker in previous_state:
                 prev = previous_state[ticker]
                 price_return = (curr_price - prev['price']) / prev['price']
+                
+                # Directional PnL: Signal (1/-1) * Return
                 pnl = prev['signal'] * price_return
+                
+                # Win = PnL > 0 (excludes flat 0)
                 is_win = 1 if pnl > 0 else 0
                 
                 record = {
@@ -189,7 +195,7 @@ def run_record_loop():
                     "is_win": is_win
                 }
                 update_csv(record)
-                print(f"   {ticker}: PnL {pnl:.6f}")
+                print(f"   {ticker}: Signal {prev['signal']} -> PnL {pnl:.6f}")
 
             previous_state[ticker] = {"price": curr_price, "signal": curr_signal}
 
@@ -198,4 +204,3 @@ if __name__ == "__main__":
         run_record_loop()
     except KeyboardInterrupt:
         print("\n🛑 Recorder stopped.")
-  
