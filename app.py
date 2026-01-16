@@ -97,36 +97,37 @@ def process_and_plot(df):
     # 2. Binning (Round down to 0.5 steps)
     df['binned_change'] = np.floor(df['pct_change'] * 2) / 2
 
-    # 3. Compute Statistics ON THE BINNED DATA
-    mu = df['binned_change'].mean()
-    sigma = df['binned_change'].std()
+    # 3. Compute Stats using RAW data (This fixes the curve alignment)
+    #    The visual fit requires the "True" mean, not the "Floored" mean.
+    mu_raw = df['pct_change'].mean()
+    sigma_raw = df['pct_change'].std()
 
-    # Prepare distribution for plotting
+    # Prepare distribution for plotting (using Binned data for bars)
     distribution = df['binned_change'].value_counts().sort_index()
     plot_data = distribution.loc[-10:10] 
 
-    # 4. Generate Normal Distribution Curve (using binned stats)
+    # 4. Generate Normal Distribution Curve (using Raw Params)
     x_range = np.linspace(-10, 10, 1000)
-    pdf = norm.pdf(x_range, mu, sigma)
+    pdf = norm.pdf(x_range, mu_raw, sigma_raw)
     
-    # Scale PDF: Total Count * Bin Width (0.5)
+    # Scale PDF to match histogram
     scaling_factor = len(df) * 0.5 
     y_curve = pdf * scaling_factor
 
     # 5. Plotting
     plt.figure(figsize=(12, 6))
     
-    # Histogram
+    # Histogram (Binned Data)
     plt.bar(plot_data.index, plot_data.values, width=0.4, align='edge', 
-            color='skyblue', edgecolor='black', label='Binned Data')
+            color='skyblue', edgecolor='black', label='Binned Data (0.5 steps)')
     
-    # Normal Distribution Line
-    plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (Binned Params)')
+    # Normal Distribution Line (Raw Data fit)
+    plt.plot(x_range, y_curve, 'r-', linewidth=2, label='Normal Dist (True Fit)')
     
     # Stats Text Box
     textstr = '\n'.join((
-        r'$\mu_{binned}=%.4f$' % (mu, ),
-        r'$\sigma_{binned}=%.4f$' % (sigma, )))
+        r'$\mu_{raw}=%.4f$' % (mu_raw, ),
+        r'$\sigma_{raw}=%.4f$' % (sigma_raw, )))
     props = dict(boxstyle='round', facecolor='white', alpha=0.8)
     plt.gca().text(0.95, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
             verticalalignment='top', horizontalalignment='right', bbox=props)
