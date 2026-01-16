@@ -15,17 +15,13 @@ IMAGE_PATH = os.path.join(DATA_DIR, "plot.png")
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
 START_DATE = "2020-01-01"
-# Current date logic to handle "2026" requirement safely
-END_DATE = "2026-01-01" 
+END_DATE = "2026-01-01"
 PORT = 8000
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def fetch_binance_data(symbol, interval, start_str, end_str):
-    """
-    Fetches historical kline data from Binance with pagination.
-    """
     api_url = "https://api.binance.com/api/v3/klines"
     start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
     end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
@@ -52,19 +48,13 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
                 break
                 
             data.extend(klines)
-            
-            # Update start time to the close time of the last candle + 1ms
             last_close_time = klines[-1][6]
             current_start = last_close_time + 1
-            
-            # Rate limit handling (polite pause)
             time.sleep(0.1)
             
-            # Progress indicator
             current_date = datetime.datetime.fromtimestamp(current_start / 1000)
             print(f"Fetched up to {current_date}", end='\r')
             
-            # Break if we reached beyond current time (Binance won't give future data)
             if current_start > int(time.time() * 1000):
                 break
                 
@@ -74,14 +64,12 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
             
     print("\nData fetch complete.")
     
-    # Binance Columns: Open Time, Open, High, Low, Close, Volume, ...
     df = pd.DataFrame(data, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'trades', 
         'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
     
-    # Convert types
     numeric_cols = ['open', 'high', 'low', 'close', 'volume']
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, axis=1)
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
@@ -89,9 +77,6 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
     return df[['open_time', 'open', 'high', 'low', 'close', 'volume']]
 
 def get_data():
-    """
-    Loads data from disk if available, otherwise fetches it.
-    """
     if os.path.exists(FILE_PATH):
         print(f"Loading data from {FILE_PATH}...")
         df = pd.read_csv(FILE_PATH)
@@ -104,33 +89,44 @@ def get_data():
         return df
 
 def process_and_plot(df):
-    """
-    Computes derivative (price change), bins it, and saves the plot.
-    """
-    # 3. Compute the Derivative (Percentage Change: (Close - PrevClose) / PrevClose)
-    # Note: We use Close vs Prev Close for standard candle-to-candle return
+    # 1. Compute Derivative
     df['pct_change'] = df['close'].pct_change() * 100
     df = df.dropna()
 
-    # 4. Round to lowest 0.5 step (Floor to 0.5)
-    # Logic: 0.4 -> 0.0, 0.9 -> 0.5, -0.4 -> -0.5, -0.9 -> -1.0
-    # Formula: floor(x * 2) / 2
+    # 2. Compute Statistics (Mean and Std Dev)
+    mu = df['pct_change'].mean()
+    sigma = df['pct_change'].std()
+
+    # 3. Binning: Floor to 0.5 step
     df['binned_change'] = np.floor(df['pct_change'] * 2) / 2
-
-    # Group by the bins to get frequency
     distribution = df['binned_change'].value_counts().sort_index()
-
-    # Filter extreme outliers for better plotting (optional, keeps plot readable)
-    # Keeping mostly within -10% to +10% usually covers 99.9% of hourly moves
+    
+    # Filter for plotting clarity (-10% to +10%)
     plot_data = distribution.loc[-10:10] 
 
-    # Plotting
+    # 4. Plotting
     plt.figure(figsize=(12, 6))
+    
+    # Histogram
     plt.bar(plot_data.index, plot_data.values, width=0.4, align='edge', color='skyblue', edgecolor='black')
     
+    # Vertical line for Mean
+    plt.axvline(mu, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {mu:.2f}%')
+    
+    # Add Text Box with stats
+    textstr = '\n'.join((
+        r'$\mu=%.4f$' % (mu, ),
+        r'$\sigma=%.4f$' % (sigma, )))
+    
+    # Place text box in top right
+    props = dict(boxstyle='round', facecolor='white', alpha=0.8)
+    plt.gca().text(0.95, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
+            verticalalignment='top', horizontalalignment='right', bbox=props)
+
     plt.title(f'{SYMBOL} Hourly Price Change Distribution ({START_DATE} to {END_DATE})')
     plt.xlabel('Price Change % (Rounded down to 0.5 steps)')
-    plt.ylabel('Frequency (Count)')
+    plt.ylabel('Frequency')
+    plt.legend()
     plt.grid(axis='y', alpha=0.5)
     plt.xticks(np.arange(-10, 10.5, 1))
     
@@ -149,9 +145,8 @@ class ImageHandler(http.server.SimpleHTTPRequestHandler):
                 <head><title>ETH Data Analysis</title></head>
                 <body style="font-family: sans-serif; text-align: center; padding: 20px;">
                     <h1>ETH/USDT Hourly Price Change Distribution</h1>
-                    <p>Data from {START_DATE} to {END_DATE}</p>
                     <img src="/plot.png" alt="Price Distribution Plot" style="max-width: 100%; border: 1px solid #ddd;">
-                    <p><small>Generated at {datetime.datetime.now()}</small></p>
+                    <p><i>Plot generated at {datetime.datetime.now()}</i></p>
                 </body>
             </html>
             """
@@ -177,11 +172,6 @@ def run_server():
             print("\nServer stopped.")
 
 if __name__ == "__main__":
-    # 1 & 2. Fetch and Load
     df = get_data()
-    
-    # 3 & 4. Compute and Plot
     process_and_plot(df)
-    
-    # 2. Simple Web Server
     run_server()
