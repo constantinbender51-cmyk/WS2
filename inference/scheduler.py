@@ -30,9 +30,11 @@ class SignalRequestHandler(BaseHTTPRequestHandler):
         with lock:
             self._prune_expired_signals()
             for ticker in TICKERS:
-                # Calculate sum of active signals
+                # Calculate sum of active signals (Net Exposure)
                 total_score = sum(s['value'] for s in active_signals[ticker])
-                # Format: "BTC: 2  (Active: 1, 1, 0)"
+                
+                # Format: "BTC: 2  (Components: 1, 1, 0)"
+                # This shows the net direction (positive=Long, negative=Short)
                 details = ", ".join([str(s['value']) for s in active_signals[ticker]])
                 response_lines.append(f"{ticker}: {total_score}\t[Components: {details if details else 'None'}]")
         
@@ -64,15 +66,20 @@ def get_seconds_until_next_interval(interval_minutes=15):
     return seconds_remaining
 
 def parse_inference_output(output_str):
-    """Parses stdout from inference.py to find the signal."""
-    # Look for the specific print statements in your inference.py
-    if "SIGNAL: BUY" in output_str:
-        return 1
-    elif "SIGNAL: SELL" in output_str:
-        return -1
-    elif "SIGNAL: X" in output_str:
-        return 0
-    return 0 # Default if unknown or incomplete
+    """
+    Parses stdout from inference.py to find the directional signal.
+    Expected format in output_str: ">> SIGNAL {TICKER}: {VALUE} ({LABEL})"
+    Example: ">> SIGNAL BTC: -1 (SHORT)"
+    """
+    # Regex finds: ">> SIGNAL", followed by Ticker, followed by integer capture group
+    match = re.search(r">> SIGNAL \w+: (-?\d+)", output_str)
+    if match:
+        try:
+            val = int(match.group(1))
+            return val
+        except ValueError:
+            return 0
+    return 0
 
 def run_batch_inference():
     print(f"\n{'='*40}")
@@ -91,7 +98,7 @@ def run_batch_inference():
                 check=True
             )
             
-            # Print output to console for debugging (optional)
+            # Debug: Print a snippet of stdout if needed
             # print(result.stdout)
 
             # Parse signal
@@ -109,8 +116,10 @@ def run_batch_inference():
                 # Prune old immediately to keep list clean
                 now = datetime.now()
                 active_signals[ticker] = [s for s in active_signals[ticker] if s['expiry'] > now]
+                
+                current_sum = sum(s['value'] for s in active_signals[ticker])
 
-            print(f"-> Signal: {signal_val} (Active Sum: {sum(s['value'] for s in active_signals[ticker])})")
+            print(f"-> Signal: {signal_val} (Net Exposure: {current_sum})")
 
         except subprocess.CalledProcessError as e:
             print(f"\n❌ Error running {ticker}: {e}")
