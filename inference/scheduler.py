@@ -66,11 +66,11 @@ def get_seconds_until_next_interval(interval_minutes=15):
 def parse_inference_output(output_str):
     """Parses stdout from inference.py to find the signal."""
     # Look for the specific print statements in your inference.py
-    if "SIGNAL: EXPANSION" in output_str:
+    if "SIGNAL: BUY" in output_str:
         return 1
-    elif "SIGNAL: CONTRACTION" in output_str:
+    elif "SIGNAL: SELL" in output_str:
         return -1
-    elif "SIGNAL: NEUTRAL" in output_str:
+    elif "SIGNAL: X" in output_str:
         return 0
     return 0 # Default if unknown or incomplete
 
