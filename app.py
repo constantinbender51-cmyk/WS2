@@ -21,7 +21,7 @@ END_TRAIN = "2025-01-01 00:00:00"
 END_TEST = "2026-01-01 00:00:00"
 
 # Grid Search Parameters
-K_VALUES = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0]
+K_VALUES = [0.05, 0.1, 0.2, 0.4, 0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0]
 SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
 
 # Qualification Thresholds
