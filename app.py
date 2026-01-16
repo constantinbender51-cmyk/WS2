@@ -6,13 +6,27 @@ from datetime import datetime
 from tqdm import tqdm
 
 # --- Configuration ---
+# Data Storage
 DATA_DIR = "/app/data/"
+TRAIN_FILENAME = "eth_train_2020_2025.csv"
+TEST_FILENAME = "eth_test_2025_2026.csv"
+
+# Exchange / Symbol Settings
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1h'
+
+# Date Ranges
 START_TRAIN = "2020-01-01 00:00:00"
 END_TRAIN = "2025-01-01 00:00:00"
 END_TEST = "2026-01-01 00:00:00"
-MIN_CORRECT = 50  # Threshold for valid strategies
+
+# Grid Search Parameters
+K_VALUES = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0]
+SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
+
+# Qualification Thresholds
+MIN_CORRECT_PREDICTIONS = 50  # Disqualify if correct count is below this
+
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
@@ -72,6 +86,7 @@ def prepare_datasets(df_train, df_test, k):
     train_returns = df_train['close'].pct_change().fillna(0)
     test_returns = df_test['close'].pct_change().fillna(0)
     
+    # Calculate bucket size using training data only to avoid look-ahead bias
     avg_abs_return = train_returns.abs().mean()
     bucket_size = avg_abs_return * k
     
@@ -79,6 +94,7 @@ def prepare_datasets(df_train, df_test, k):
         bucket_size = 1e-9 
 
     def get_buckets(returns):
+        # 0-bucketsize -> bucket 1
         return np.floor(returns.abs() / bucket_size).astype(int) + 1
 
     train_buckets = get_buckets(train_returns)
@@ -123,17 +139,19 @@ def evaluate_prediction(train_buckets, test_buckets, seqlen):
     
     test_seq = test_buckets.tolist()
     
+    # Start iterating where we have enough history for the prefix
     for i in range(seqlen - 1, len(test_seq)):
         current_idx = i - 1 
         current_bucket = test_seq[current_idx]
         
+        # Extract prefix to predict the bucket at index i
         prefix = tuple(test_seq[i - (seqlen - 1) : i])
         
         predicted_bucket = predict_most_frequent(prefix, freq_map)
         actual_next_bucket = test_seq[i]
         
         if predicted_bucket is not None:
-            # Only evaluate if Prediction > Current
+            # Only evaluating if Prediction > Current
             if predicted_bucket > current_bucket:
                 if actual_next_bucket > current_bucket:
                     correct += 1
@@ -151,53 +169,43 @@ def evaluate_prediction(train_buckets, test_buckets, seqlen):
     return accuracy, correct
 
 def run_grid_search():
-    df_train = fetch_binance_data(SYMBOL, TIMEFRAME, START_TRAIN, END_TRAIN, "eth_train_2020_2025.csv")
-    df_test = fetch_binance_data(SYMBOL, TIMEFRAME, END_TRAIN, END_TEST, "eth_test_2025_2026.csv")
-    
-    k_values = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0]
-    seqlen_values = [3, 4, 5, 6, 7, 8]
+    df_train = fetch_binance_data(SYMBOL, TIMEFRAME, START_TRAIN, END_TRAIN, TRAIN_FILENAME)
+    df_test = fetch_binance_data(SYMBOL, TIMEFRAME, END_TRAIN, END_TEST, TEST_FILENAME)
     
     print("\nStarting Grid Search...")
-    print(f"Skipping strategies with < {MIN_CORRECT} correct predictions.\n")
-    print(f"{'K':<10} {'SeqLen':<10} {'Accuracy':<10} {'Correct':<10} {'Status':<10}")
-    print("-" * 55)
+    print(f"{'K':<10} {'SeqLen':<10} {'Accuracy':<10} {'Correct':<10}")
+    print("-" * 45)
 
     best_acc = -1
     best_params = None
     best_correct_count = 0
 
-    for k in k_values:
+    for k in K_VALUES:
         train_buckets, test_buckets = prepare_datasets(df_train, df_test, k)
         
-        for seqlen in seqlen_values:
+        for seqlen in SEQLEN_VALUES:
             acc, correct_count = evaluate_prediction(train_buckets, test_buckets, seqlen)
             
-            # --- Logic Filter ---
-            if correct_count < MIN_CORRECT:
-                status = "SKIPPED"
-                # We print it to show it was calculated, but marked as skipped
-                print(f"{k:<10} {seqlen:<10} {acc:.4f}     {correct_count:<10} {status}")
-                continue
-            else:
-                status = "VALID"
-                print(f"{k:<10} {seqlen:<10} {acc:.4f}     {correct_count:<10} {status}")
+            # Print result
+            print(f"{k:<10} {seqlen:<10} {acc:.4f}     {correct_count:<10}")
+            
+            # Strictly disqualify configurations with fewer than MIN_CORRECT_PREDICTIONS
+            if correct_count >= MIN_CORRECT_PREDICTIONS:
+                if acc > best_acc:
+                    best_acc = acc
+                    best_correct_count = correct_count
+                    best_params = (k, seqlen)
 
-            # Only update best if VALID
-            if acc > best_acc:
-                best_acc = acc
-                best_correct_count = correct_count
-                best_params = (k, seqlen)
-
-    print("-" * 55)
+    print("-" * 45)
     
     if best_params:
-        print(f"Best Valid Configuration:")
+        print(f"Best Configuration (>= {MIN_CORRECT_PREDICTIONS} correct):")
         print(f"K: {best_params[0]}")
         print(f"SeqLen: {best_params[1]}")
         print(f"Accuracy: {best_acc:.4f}")
         print(f"Total Correct Predictions: {best_correct_count}")
     else:
-        print("No strategy met the minimum correct prediction threshold.")
+        print(f"No configuration met the threshold of {MIN_CORRECT_PREDICTIONS} correct predictions.")
 
 if __name__ == "__main__":
     run_grid_search()
