@@ -8,12 +8,12 @@ from tqdm import tqdm
 # --- Configuration ---
 # Data Storage
 DATA_DIR = "/app/data/"
-TRAIN_FILENAME = "eth_train_30m_2020_2025.csv"  # Updated filename
-TEST_FILENAME = "eth_test_30m_2025_2026.csv"    # Updated filename
+TRAIN_FILENAME = "eth_train_15m_2020_2025.csv"
+TEST_FILENAME = "eth_test_15m_2025_2026.csv"
 
 # Exchange / Symbol Settings
 SYMBOL = 'ETH/USDT'
-TIMEFRAME = '30m'  # Changed to 30m to allow offset resampling
+TIMEFRAME = '15m'  # Changed to 15m to allow 4 offsets
 
 # Date Ranges
 START_TRAIN = "2020-01-01 00:00:00"
@@ -25,7 +25,8 @@ K_VALUES = [0.05, 0.1, 0.2, 0.4, 0.5, 0.8]
 SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
 
 # Qualification Thresholds
-MIN_CORRECT_PREDICTIONS = 100  # Increased threshold since we have 2x data
+# Increased threshold significantly as we now have 4x the data points
+MIN_CORRECT_PREDICTIONS = 200  
 
 
 def ensure_dir(directory):
@@ -79,11 +80,13 @@ def fetch_binance_data(symbol, timeframe, start_str, end_str, filename):
     df.to_csv(filepath)
     return df
 
-def resample_dataset(df_30m, offset_minutes=0):
+def resample_dataset(df_15m, offset_minutes=0):
     """
-    Resamples 30m data into 1h candles with a specific offset.
-    offset=0  -> Candles start at 00:00, 01:00 (Standard)
-    offset=30 -> Candles start at 00:30, 01:30 (Offset)
+    Resamples 15m data into 1h candles with a specific offset.
+    offset=0  -> 00:00 - 01:00
+    offset=15 -> 00:15 - 01:15
+    offset=30 -> 00:30 - 01:30
+    offset=45 -> 00:45 - 01:45
     """
     agg_dict = {
         'open': 'first',
@@ -95,9 +98,9 @@ def resample_dataset(df_30m, offset_minutes=0):
     
     offset_str = f'{offset_minutes}min'
     
-    # Resample 30m -> 1h
-    # closed='left', label='left' ensures the candle at 00:30 aggregates 00:30 and 01:00 data points
-    df_resampled = df_30m.resample('1h', offset=offset_str, closed='left', label='left').agg(agg_dict)
+    # Resample 15m -> 1h
+    # closed='left', label='left' ensures standard candle aggregation
+    df_resampled = df_15m.resample('1h', offset=offset_str, closed='left', label='left').agg(agg_dict)
     
     # Drop any NaN rows (incomplete periods at the end)
     df_resampled.dropna(inplace=True)
@@ -106,12 +109,9 @@ def resample_dataset(df_30m, offset_minutes=0):
 
 def prepare_buckets(train_df_list, test_df_list, k):
     """
-    Calculates buckets based on training volatility of BOTH offsets combined.
-    train_df_list: [train_df_00, train_df_30]
-    test_df_list:  [test_df_00, test_df_30]
+    Calculates buckets based on training volatility of ALL 4 offsets combined.
     """
-    
-    # 1. Calculate Returns for all training data (both offsets) to find a global bucket size
+    # 1. Calculate Returns for all training data to find a global bucket size
     all_train_returns = []
     for df in train_df_list:
         all_train_returns.append(df['close'].pct_change().fillna(0))
@@ -163,14 +163,14 @@ def predict_most_frequent(prefix, freq_map):
 
 def evaluate_prediction(test_buckets_list, freq_map, seqlen):
     """
-    Runs evaluation on multiple test streams (00 and 30) using the shared freq_map.
+    Runs evaluation on multiple test streams (00, 15, 30, 45) using the shared freq_map.
     Returns aggregated stats.
     """
     total_correct = 0
     total_incorrect = 0
     total_ignored = 0
     
-    # Iterate over both test datasets (Dataset A and Dataset B)
+    # Iterate over all 4 test datasets
     for test_buckets in test_buckets_list:
         test_seq = test_buckets.tolist()
         
@@ -203,25 +203,18 @@ def evaluate_prediction(test_buckets_list, freq_map, seqlen):
     return accuracy, total_correct
 
 def run_grid_search():
-    # 1. Fetch Raw 30m Data
+    # 1. Fetch Raw 15m Data
     df_train_raw = fetch_binance_data(SYMBOL, TIMEFRAME, START_TRAIN, END_TRAIN, TRAIN_FILENAME)
     df_test_raw = fetch_binance_data(SYMBOL, TIMEFRAME, END_TRAIN, END_TEST, TEST_FILENAME)
     
-    # 2. Resample into two universes: offset 00 and offset 30
-    print("\nResampling data to 1h offset streams...")
+    # 2. Resample into four universes: 00, 15, 30, 45
+    print("\nResampling data to 4x 1h offset streams (00, 15, 30, 45)...")
     
-    # Train Sets
-    train_df_00 = resample_dataset(df_train_raw, offset_minutes=0)
-    train_df_30 = resample_dataset(df_train_raw, offset_minutes=30)
-    
-    # Test Sets
-    test_df_00 = resample_dataset(df_test_raw, offset_minutes=0)
-    test_df_30 = resample_dataset(df_test_raw, offset_minutes=30)
+    offsets = [0, 15, 30, 45]
+    train_dfs = [resample_dataset(df_train_raw, offset) for offset in offsets]
+    test_dfs = [resample_dataset(df_test_raw, offset) for offset in offsets]
 
-    train_dfs = [train_df_00, train_df_30]
-    test_dfs = [test_df_00, test_df_30]
-
-    print("\nStarting Dual-Stream Grid Search...")
+    print("\nStarting Quad-Stream Grid Search...")
     print(f"{'K':<10} {'SeqLen':<10} {'Accuracy':<10} {'Correct':<10}")
     print("-" * 45)
 
@@ -234,10 +227,10 @@ def run_grid_search():
         train_buckets_list, test_buckets_list = prepare_buckets(train_dfs, test_dfs, k)
         
         for seqlen in SEQLEN_VALUES:
-            # Train Shared Frequency Map (Data Augmentation)
+            # Train Shared Frequency Map (Data Augmentation x4)
             freq_map = build_frequency_map(train_buckets_list, seqlen)
             
-            # Evaluate on both test streams combined
+            # Evaluate on all test streams combined
             acc, correct_count = evaluate_prediction(test_buckets_list, freq_map, seqlen)
             
             # Print result
@@ -252,7 +245,7 @@ def run_grid_search():
     print("-" * 45)
     
     if best_params:
-        print(f"Best Configuration (Combined Streams):")
+        print(f"Best Configuration (Combined 4 Streams):")
         print(f"K: {best_params[0]}")
         print(f"SeqLen: {best_params[1]}")
         print(f"Accuracy: {best_acc:.4f}")
