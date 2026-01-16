@@ -32,13 +32,29 @@ def load_model():
 
 def fetch_recent_data(symbol):
     exchange = ccxt.binance()
-    # Fetch 5 days of 15m data
+    # Fetch data
     since = exchange.milliseconds() - (5 * 24 * 60 * 60 * 1000)
     candles = exchange.fetch_ohlcv(symbol, '15m', since=since, limit=1000)
+    
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
+
+    # --- SAFETY CHECK: DROP STUB CANDLE ---
+    # Calculate the timestamp of the currently OPEN candle
+    now = datetime.utcnow() # Use UTC to match Binance timestamps
+    current_minute = now.minute
+    # Round down to the nearest 15m block (00, 15, 30, 45)
+    minute_floor = (current_minute // 15) * 15
+    current_open_candle_time = now.replace(minute=minute_floor, second=0, microsecond=0)
+
+    # If the last candle in our data matches the current OPEN time, drop it.
+    if not df.empty and df.index[-1] >= current_open_candle_time:
+        # print(f"Dropping incomplete stub candle: {df.index[-1]}")
+        df = df.iloc[:-1]
+
     return df
+
 
 def get_current_offset_data(df_15m, target_seqlen):
     last_time = df_15m.index[-1]
