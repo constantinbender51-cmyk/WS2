@@ -7,7 +7,6 @@ import pickle
 import requests
 from datetime import datetime, timedelta
 
-
 # --- Usage ---
 # Run: python inference.py BTC
 # Run: python inference.py SOL
@@ -43,20 +42,15 @@ def fetch_recent_data(symbol):
     df.set_index('timestamp', inplace=True)
 
     # --- SAFETY CHECK: DROP STUB CANDLE ---
-    # Calculate the timestamp of the currently OPEN candle
-    now = datetime.utcnow() # Use UTC to match Binance timestamps
+    now = datetime.utcnow()
     current_minute = now.minute
-    # Round down to the nearest 15m block (00, 15, 30, 45)
     minute_floor = (current_minute // 15) * 15
     current_open_candle_time = now.replace(minute=minute_floor, second=0, microsecond=0)
 
-    # If the last candle in our data matches the current OPEN time, drop it.
     if not df.empty and df.index[-1] >= current_open_candle_time:
-        # print(f"Dropping incomplete stub candle: {df.index[-1]}")
         df = df.iloc[:-1]
 
     return df
-
 
 def get_current_offset_data(df_15m, target_seqlen):
     last_time = df_15m.index[-1]
@@ -84,14 +78,14 @@ def main():
         print("Not enough history.")
         return
 
-    # 3. Tokenize
+    # 3. Tokenize (DIRECTIONAL LOGIC)
     returns = df_hourly['close'].pct_change().fillna(0)
-    buckets = (np.floor(returns.abs() / cfg['bucket_size']).astype(int) + 1).tolist()
+    # Signed integers: int(return / size)
+    buckets = (returns / cfg['bucket_size']).astype(int).tolist()
     
     # 4. Predict
     prefix_len = cfg['seqlen'] - 1
     current_prefix = tuple(buckets[-prefix_len:])
-    last_bucket = current_prefix[-1]
     
     if current_prefix in weights:
         candidates = weights[current_prefix]
@@ -99,15 +93,16 @@ def main():
         confidence = candidates[prediction] / sum(candidates.values())
         
         print(f"\nSequence: {current_prefix}")
-        print(f"Current Bucket: {last_bucket}")
-        print(f"PREDICTION: {prediction} (Conf: {confidence:.1%})")
+        print(f"Predicted Bucket: {prediction} (Conf: {confidence:.1%})")
         
+        # Output Signals for user parsing
         if prediction > 0:
-            print(">> SIGNAL: BUY")
+            print(f">> SIGNAL {TICKER}: 1 (LONG)")
         elif prediction < 0:
-            print(">> SIGNAL: SELL")
+            print(f">> SIGNAL {TICKER}: -1 (SHORT)")
         else:
-            print(">> SIGNAL: X")
+            print(f">> SIGNAL {TICKER}: 0 (NEUTRAL)")
+            
     else:
         print(f"\nSequence {current_prefix} not seen in training. No prediction.")
 
