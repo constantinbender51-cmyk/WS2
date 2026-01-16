@@ -1,318 +1,261 @@
-
-import numpy as np
-import pandas as pd
-import ccxt
-from datetime import datetime, timedelta
-from collections import defaultdict, Counter
-from itertools import product
-import warnings
 import os
-warnings.filterwarnings('ignore')
+import ccxt
+import pandas as pd
+import numpy as np
+import pickle
+import requests
+import base64
+import json
+from datetime import datetime
+from tqdm import tqdm
+from dotenv import load_dotenv
 
-def fetch_binance_data(symbol='ETH/USDT', timeframe='30m', start_date='2020-01-01', end_date='2026-01-01', cache_dir='/app/data/'):
-    """Fetch OHLC data from Binance with caching"""
-    
-    # Create cache directory if it doesn't exist
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # Create filename based on parameters
-    filename = f"{symbol.replace('/', '_')}_{timeframe}_{start_date}_{end_date}.csv"
-    filepath = os.path.join(cache_dir, filename)
-    
-    # Check if cached data exists
+# --- Load Secrets ---
+load_dotenv()
+GITHUB_TOKEN = os.getenv("GITHUB_PAT")
+
+# --- Configuration ---
+GITHUB_OWNER = "constantinbender51-cmyk"
+GITHUB_REPO = "model-2"
+GITHUB_BRANCH = "main"
+
+# The "Big 3" Assets
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+TIMEFRAME = '15m'
+
+# Date Ranges
+START_TRAIN = "2020-01-01 00:00:00"
+END_TRAIN = "2025-01-01 00:00:00"
+END_TEST = "2026-01-01 00:00:00"
+
+# Grid Search Parameters
+# k now represents the multiplier for the threshold of a "directional move"
+K_VALUES = [0.1, 0.2, 0.5, 0.8, 1.0] 
+SEQLEN_VALUES = [3, 4, 5, 6, 7, 8]
+MIN_CORRECT_PREDICTIONS = 100 
+
+DATA_DIR = "/app/data/"
+
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def fetch_binance_data(symbol, timeframe, start_str, end_str):
+    ensure_dir(DATA_DIR)
+    safe_symbol = symbol.replace('/', '_')
+    filename = f"{safe_symbol}_{timeframe}_{start_str[:4]}_{end_str[:4]}.csv"
+    filepath = os.path.join(DATA_DIR, filename)
+
     if os.path.exists(filepath):
-        print(f"Loading cached data from {filepath}...")
-        df = pd.read_csv(filepath)
-        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)  # Remove timezone info
-        print(f"Loaded {len(df)} candles from cache")
+        print(f"Loading {filename} from disk...")
+        df = pd.read_csv(filepath, index_col=0, parse_dates=True)
         return df
+
+    print(f"Fetching {symbol} {timeframe} data ({start_str} to {end_str})...")
+    exchange = ccxt.binance()
+    start_ts = exchange.parse8601(start_str)
+    end_ts = exchange.parse8601(end_str)
     
-    # If not cached, fetch from Binance
-    print(f"Fetching {symbol} {timeframe} data from {start_date} to {end_date}...")
-    
-    exchange = ccxt.binance({
-        'enableRateLimit': True,
-    })
-    
-    start_ts = exchange.parse8601(f'{start_date}T00:00:00Z')
-    end_ts = exchange.parse8601(f'{end_date}T00:00:00Z')
-    
-    all_candles = []
+    ohlcv = []
     current_ts = start_ts
     
+    pbar = tqdm()
     while current_ts < end_ts:
         try:
-            candles = exchange.fetch_ohlcv(symbol, timeframe, current_ts, limit=1000)
-            if not candles:
-                break
-            
-            all_candles.extend(candles)
+            candles = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
+            if not candles: break
+            candles = [c for c in candles if c[0] < end_ts]
+            if not candles: break
             current_ts = candles[-1][0] + 1
-            
-            print(f"Fetched {len(all_candles)} candles...", end='\r')
-            
-            if candles[-1][0] >= end_ts:
-                break
-                
+            ohlcv.extend(candles)
+            pbar.update(len(candles))
         except Exception as e:
-            print(f"\nError fetching data: {e}")
+            print(f"Error fetching data: {e}")
             break
-    
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_localize(None)  # Remove timezone
-    
-    # Filter by end date
-    end_date_dt = pd.to_datetime(end_date)
-    df = df[df['timestamp'] < end_date_dt]
-    
-    print(f"\nFetched {len(df)} candles total")
-    
-    # Save to cache
-    print(f"Saving data to {filepath}...")
-    df.to_csv(filepath, index=False)
-    print("Data saved successfully")
-    
+    pbar.close()
+
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    df.to_csv(filepath)
     return df
 
-def create_datasets(df):
-    """Create original and base datasets"""
-    original = df.copy()
-    base = df.iloc[1:].reset_index(drop=True)  # Start at candle 2 (index 1)
-    
-    print(f"Original dataset: {len(original)} candles")
-    print(f"Base dataset: {len(base)} candles (starts at candle 2)")
-    
-    return original, base
+def resample_dataset(df_15m, offset_minutes=0):
+    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    offset_str = f'{offset_minutes}min'
+    df_resampled = df_15m.resample('1h', offset=offset_str, closed='left', label='left').agg(agg_dict)
+    df_resampled.dropna(inplace=True)
+    return df_resampled
 
-def resample_to_1h(df):
-    """Resample 30m data to 1h"""
-    df_copy = df.copy()
-    df_copy.set_index('timestamp', inplace=True)
+def prepare_buckets(train_df_list, test_df_list, k):
+    """
+    DIRECTIONAL LOGIC:
+    Buckets are now signed integers.
+    Bucket 0 = Flat (within +/- bucket_size)
+    Bucket +1 = Up 1 unit, Bucket -1 = Down 1 unit
+    """
+    all_train_returns = []
+    for df in train_df_list:
+        all_train_returns.append(df['close'].pct_change().fillna(0))
     
-    resampled = df_copy.resample('1H').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }).dropna()
+    combined_train_returns = pd.concat(all_train_returns)
+    # Average absolute move serves as the baseline unit
+    avg_abs_return = combined_train_returns.abs().mean()
     
-    resampled.reset_index(inplace=True)
-    print(f"Resampled to 1H: {len(resampled)} candles")
-    
-    return resampled
-
-def calculate_buckets(df, k):
-    """Calculate bucket assignments for each candle"""
-    returns = df['close'].pct_change().dropna()
-    avg_abs_return = returns.abs().mean()
     bucket_size = avg_abs_return * k
-    
-    print(f"Average |return|: {avg_abs_return:.6f}")
-    print(f"Bucket size (k={k}): {bucket_size:.6f}")
-    
-    # Calculate buckets for each candle
-    buckets = []
-    for ret in returns:
-        if ret >= 0:
-            bucket = int(ret / bucket_size) + 1
-        else:
-            bucket = -int(abs(ret) / bucket_size) - 1
-        buckets.append(bucket)
-    
-    return buckets, bucket_size
+    if bucket_size == 0: bucket_size = 1e-9 
 
-def create_sequences(buckets):
-    """Create bucket sequence and derivative sequence"""
-    bucket_seq = buckets
-    derivative_seq = [0]  # First element is 0
-    
-    for i in range(1, len(bucket_seq)):
-        derivative_seq.append(bucket_seq[i] - bucket_seq[i-1])
-    
-    return bucket_seq, derivative_seq
+    def get_buckets(df):
+        returns = df['close'].pct_change().fillna(0)
+        # Signed quantization: int(return / size)
+        # e.g. return 0.5, size 0.2 -> 2 (Up)
+        # e.g. return -0.5, size 0.2 -> -2 (Down)
+        return (returns / bucket_size).astype(int)
 
-def get_subsequence_frequencies(sequence, seq_len):
-    """Get frequency counts for all subsequences of given length"""
-    freq = Counter()
+    train_buckets_list = [get_buckets(df) for df in train_df_list]
+    test_buckets_list = [get_buckets(df) for df in test_df_list]
     
-    for i in range(len(sequence) - seq_len + 1):
-        subseq = tuple(sequence[i:i+seq_len])
-        freq[subseq] += 1
-    
-    return freq
+    return train_buckets_list, test_buckets_list, bucket_size
 
-def predict_completion(incomplete_subseq, freq_dict, sequence_type='bucket'):
-    """Predict the next element based on most frequent completion"""
-    incomplete_tuple = tuple(incomplete_subseq)
-    
-    # Find all subsequences that start with the incomplete subsequence
-    matching = {}
-    for subseq, count in freq_dict.items():
-        if len(subseq) > len(incomplete_tuple) and subseq[:len(incomplete_tuple)] == incomplete_tuple:
-            next_val = subseq[len(incomplete_tuple)]
-            matching[next_val] = matching.get(next_val, 0) + count
-    
-    if not matching:
-        return None
-    
-    # Return the most probable next value
-    return max(matching.items(), key=lambda x: x[1])[0]
+def build_frequency_map(sequences_list, seqlen):
+    freq_map = {}
+    for sequence in sequences_list:
+        seq_array = sequence.tolist()
+        for i in range(len(seq_array) - seqlen + 1):
+            window = tuple(seq_array[i : i + seqlen])
+            prefix = window[:-1]
+            target = window[-1]
+            if prefix not in freq_map: freq_map[prefix] = {}
+            if target not in freq_map[prefix]: freq_map[prefix][target] = 0
+            freq_map[prefix][target] += 1
+    return freq_map
 
-def evaluate_predictions(train_bucket_seq, train_deriv_seq, val_bucket_seq, val_deriv_seq, k, seq_len):
-    """Evaluate prediction accuracy on validation set"""
-    
-    # Build frequency dictionaries from training data
-    bucket_freq = get_subsequence_frequencies(train_bucket_seq, seq_len + 1)
-    deriv_freq = get_subsequence_frequencies(train_deriv_seq, seq_len + 1)
-    
-    correct_bucket = 0
-    correct_deriv = 0
-    total_predictions = 0
-    
-    # Test on all incomplete subsequences in validation set
-    for i in range(len(val_bucket_seq) - seq_len):
-        incomplete_bucket = val_bucket_seq[i:i+seq_len]
-        incomplete_deriv = val_deriv_seq[i:i+seq_len]
-        
-        actual_bucket_next = val_bucket_seq[i+seq_len]
-        actual_deriv_next = val_deriv_seq[i+seq_len]
-        
-        # Predict using bucket sequence
-        pred_bucket = predict_completion(incomplete_bucket, bucket_freq, 'bucket')
-        
-        # Predict using derivative sequence
-        pred_deriv = predict_completion(incomplete_deriv, deriv_freq, 'derivative')
-        
-        if pred_bucket is not None:
-            total_predictions += 1
-            if pred_bucket == actual_bucket_next:
-                correct_bucket += 1
-        
-        if pred_deriv is not None:
-            if pred_deriv == actual_deriv_next:
-                correct_deriv += 1
-    
-    if total_predictions == 0:
-        return 0.0, 0.0, 0
-    
-    accuracy_bucket = correct_bucket / total_predictions
-    accuracy_deriv = correct_deriv / total_predictions
-    
-    return accuracy_bucket, accuracy_deriv, total_predictions
+def predict_most_frequent(prefix, freq_map):
+    if prefix not in freq_map: return None
+    candidates = freq_map[prefix]
+    return max(candidates, key=candidates.get)
 
-def grid_search(train_original, train_base, val_original, val_base, k_values, seq_len_values):
-    """Perform grid search over k and seq_len parameters"""
-    print("\n" + "="*80)
-    print("STARTING GRID SEARCH")
-    print("="*80)
+def evaluate_prediction(test_buckets_list, freq_map, seqlen):
+    total_correct = 0
+    total_incorrect = 0
     
-    results = []
-    
-    for dataset_type in ['original', 'base']:
-        print(f"\n--- Testing {dataset_type.upper()} dataset ---")
-        
-        train_df = train_original if dataset_type == 'original' else train_base
-        val_df = val_original if dataset_type == 'original' else val_base
-        
-        # Resample to 1h
-        train_1h = resample_to_1h(train_df)
-        val_1h = resample_to_1h(val_df)
-        
-        for k in k_values:
-            print(f"\nTesting k={k}")
+    for test_buckets in test_buckets_list:
+        test_seq = test_buckets.tolist()
+        for i in range(seqlen - 1, len(test_seq)):
+            # Predict the current step based on history
+            prefix = tuple(test_seq[i - (seqlen - 1) : i])
+            predicted_bucket = predict_most_frequent(prefix, freq_map)
+            actual_next_bucket = test_seq[i]
             
-            # Calculate buckets for training and validation
-            train_buckets, bucket_size = calculate_buckets(train_1h, k)
-            val_buckets, _ = calculate_buckets(val_1h, k)
-            
-            # Create sequences
-            train_bucket_seq, train_deriv_seq = create_sequences(train_buckets)
-            val_bucket_seq, val_deriv_seq = create_sequences(val_buckets)
-            
-            for seq_len in seq_len_values:
-                if seq_len >= len(train_bucket_seq):
+            # LOGIC: DIRECTIONAL ACCURACY
+            if predicted_bucket is not None:
+                # Ignore Flat actuals (0)
+                if actual_next_bucket == 0:
                     continue
                 
-                # Evaluate predictions
-                acc_bucket, acc_deriv, total_preds = evaluate_predictions(
-                    train_bucket_seq, train_deriv_seq,
-                    val_bucket_seq, val_deriv_seq,
-                    k, seq_len
-                )
+                # Check Direction Matches
+                pred_sign = np.sign(predicted_bucket)
+                actual_sign = np.sign(actual_next_bucket)
                 
-                # Combined accuracy (average of both)
-                combined_acc = (acc_bucket + acc_deriv) / 2
-                
-                results.append({
-                    'dataset': dataset_type,
-                    'k': k,
-                    'seq_len': seq_len,
-                    'bucket_accuracy': acc_bucket,
-                    'derivative_accuracy': acc_deriv,
-                    'combined_accuracy': combined_acc,
-                    'total_predictions': total_preds,
-                    'bucket_size': bucket_size
-                })
-                
-                print(f"  seq_len={seq_len}: Bucket Acc={acc_bucket:.4f}, Deriv Acc={acc_deriv:.4f}, "
-                      f"Combined={combined_acc:.4f}, Predictions={total_preds}")
-    
-    return results
+                # We also ignore if model predicts 0 (Neutral)
+                if pred_sign == 0:
+                    continue
 
-def main():
-    # 1. Fetch data (with caching)
-    df = fetch_binance_data(symbol='ETH/USDT', timeframe='30m', 
-                           start_date='2020-01-01', end_date='2026-01-17',
-                           cache_dir='/app/data/')
+                if pred_sign == actual_sign:
+                    total_correct += 1
+                else:
+                    total_incorrect += 1
+                    
+    total_valid = total_correct + total_incorrect
+    if total_valid == 0: return 0.0, 0
+    return total_correct / total_valid, total_correct
+
+def upload_to_github(file_path, repo_owner, repo_name, token, branch="main"):
+    if not token:
+        print("Error: GITHUB_PAT not found in .env")
+        return
+    file_name = os.path.basename(file_path)
+    print(f"Uploading {file_name}...")
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{file_name}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     
-    # Split into training (2020-2025) and validation (2025-2026)
-    # Convert to timezone-naive datetime for comparison
-    split_date = pd.to_datetime('2025-01-01')
+    with open(file_path, "rb") as f:
+        content = f.read()
+    content_b64 = base64.b64encode(content).decode("utf-8")
+
+    sha = None
+    r_check = requests.get(api_url, headers=headers, params={"ref": branch})
+    if r_check.status_code == 200:
+        sha = r_check.json().get("sha")
+
+    data = {
+        "message": f"Update model {file_name} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "content": content_b64,
+        "branch": branch
+    }
+    if sha: data["sha"] = sha
     
-    train_df = df[df['timestamp'] < split_date].copy()
-    val_df = df[df['timestamp'] >= split_date].copy()
+    requests.put(api_url, headers=headers, data=json.dumps(data))
+    print(f"✅ Uploaded {file_name}")
+
+def run_multi_asset_search():
+    print(f"Starting Multi-Asset Grid Search for: {SYMBOLS}")
     
-    print(f"\nTraining period: {train_df['timestamp'].min()} to {train_df['timestamp'].max()}")
-    print(f"Validation period: {val_df['timestamp'].min()} to {val_df['timestamp'].max()}")
-    print(f"Training samples: {len(train_df)}, Validation samples: {len(val_df)}")
-    
-    # 2. Create original and base datasets
-    train_original, train_base = create_datasets(train_df)
-    val_original, val_base = create_datasets(val_df)
-    
-    # 3. Grid search parameters
-    k_values = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]
-    seq_len_values = [3, 5, 7, 10, 15, 20]
-    
-    # 4. Perform grid search
-    results = grid_search(train_original, train_base, val_original, val_base, 
-                         k_values, seq_len_values)
-    
-    # 5. Find and print winning configuration
-    results_df = pd.DataFrame(results)
-    best_result = results_df.loc[results_df['combined_accuracy'].idxmax()]
-    
-    print("\n" + "="*80)
-    print("WINNING CONFIGURATION")
-    print("="*80)
-    print(f"Dataset: {best_result['dataset']}")
-    print(f"k: {best_result['k']}")
-    print(f"Sequence Length: {best_result['seq_len']}")
-    print(f"Bucket Size: {best_result['bucket_size']:.6f}")
-    print(f"Bucket Sequence Accuracy: {best_result['bucket_accuracy']:.4f}")
-    print(f"Derivative Sequence Accuracy: {best_result['derivative_accuracy']:.4f}")
-    print(f"Combined Accuracy: {best_result['combined_accuracy']:.4f}")
-    print(f"Total Predictions: {best_result['total_predictions']}")
-    print("="*80)
-    
-    # Print top 10 configurations
-    print("\nTop 10 Configurations:")
-    print(results_df.nlargest(10, 'combined_accuracy')[['dataset', 'k', 'seq_len', 
-                                                          'bucket_accuracy', 'derivative_accuracy',
-                                                          'combined_accuracy', 'total_predictions']])
-    
-    return results_df
+    for symbol in SYMBOLS:
+        print(f"\n{'='*60}")
+        print(f"PROCESSING ASSET: {symbol}")
+        print(f"{'='*60}")
+        
+        # Fetch Data
+        df_train_raw = fetch_binance_data(symbol, TIMEFRAME, START_TRAIN, END_TRAIN)
+        df_test_raw = fetch_binance_data(symbol, TIMEFRAME, END_TRAIN, END_TEST)
+        
+        # Resample
+        offsets = [0, 15, 30, 45]
+        train_dfs = [resample_dataset(df_train_raw, offset) for offset in offsets]
+        test_dfs = [resample_dataset(df_test_raw, offset) for offset in offsets]
+        
+        best_acc = -1
+        best_model_data = None
+        
+        # Grid Search
+        print(f"{'K':<10} {'SeqLen':<10} {'Accuracy':<10} {'Correct':<10}")
+        print("-" * 45)
+        
+        for k in K_VALUES:
+            train_buckets_list, test_buckets_list, bucket_size = prepare_buckets(train_dfs, test_dfs, k)
+            for seqlen in SEQLEN_VALUES:
+                freq_map = build_frequency_map(train_buckets_list, seqlen)
+                acc, correct_count = evaluate_prediction(test_buckets_list, freq_map, seqlen)
+                print(f"{k:<10} {seqlen:<10} {acc:.4f}     {correct_count:<10}")
+                
+                if correct_count >= MIN_CORRECT_PREDICTIONS and acc > best_acc:
+                    best_acc = acc
+                    best_model_data = {
+                        "weights": freq_map,
+                        "config": {
+                            "symbol": symbol,
+                            "k": k,
+                            "seqlen": seqlen,
+                            "bucket_size": bucket_size,
+                            "type": "directional"
+                        },
+                        "metrics": {"accuracy": acc, "correct": correct_count}
+                    }
+
+        # Save and Upload for THIS symbol
+        if best_model_data:
+            ticker = symbol.split('/')[0] # BTC, ETH, SOL
+            filename = f"model_{ticker}.pkl"
+            
+            print(f"\n🏆 Best {symbol} Model: Acc {best_acc:.4f} | K {best_model_data['config']['k']}")
+            
+            with open(filename, "wb") as f:
+                pickle.dump(best_model_data, f)
+            
+            upload_to_github(filename, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, GITHUB_BRANCH)
+        else:
+            print(f"❌ No valid model found for {symbol}")
 
 if __name__ == "__main__":
-    results = main()
+    run_multi_asset_search()
