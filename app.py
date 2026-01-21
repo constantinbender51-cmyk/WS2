@@ -1,191 +1,234 @@
-import os
 import time
-import datetime
-import http.server
-import socketserver
-import pandas as pd
+import json
+import csv
+import os
 import requests
-import matplotlib.pyplot as plt
-import numpy as np
-from scipy.stats import t  # Changed from norm to t (Student's t-distribution)
+from datetime import datetime, timezone, timedelta
 
-# Configuration
-DATA_DIR = "/app/data/"
-FILE_PATH = os.path.join(DATA_DIR, "eth_1h_2020_2026.csv")
-IMAGE_PATH = os.path.join(DATA_DIR, "plot.png")
-SYMBOL = "ETHUSDT"
-INTERVAL = "1h"
-START_DATE = "2020-01-01"
-END_DATE = "2026-01-01"
-PORT = 8000
-STEP_SIZE = 0.1
+# --- Configuration ---
+PREDICTION_URL = "https://workspace-production-9fae.up.railway.app/predictions"
+ACTIVE_TRADES_FILE = "active_trades.json"
+HISTORY_FILE = "trade_history.csv"
 
-# Ensure data directory exists
-os.makedirs(DATA_DIR, exist_ok=True)
+# Timeframe in minutes and their mapping to array indices
+TIMEFRAMES = {
+    0: {"label": "15m", "minutes": 15},
+    1: {"label": "30m", "minutes": 30},
+    2: {"label": "1h",  "minutes": 60},
+    3: {"label": "4h",  "minutes": 240},
+    4: {"label": "1d",  "minutes": 1440}
+}
 
-def fetch_binance_data(symbol, interval, start_str, end_str):
-    api_url = "https://api.binance.com/api/v3/klines"
-    start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
-    end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
-    
-    data = []
-    current_start = start_ts
-    
-    print(f"Fetching {symbol} data from {start_str} to {end_str}...")
-    
-    while current_start < end_ts:
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'startTime': current_start,
-            'limit': 1000
-        }
-        
+def load_active_trades():
+    if os.path.exists(ACTIVE_TRADES_FILE):
         try:
-            response = requests.get(api_url, params=params)
-            response.raise_for_status()
-            klines = response.json()
+            with open(ACTIVE_TRADES_FILE, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def save_active_trades(trades):
+    with open(ACTIVE_TRADES_FILE, 'w') as f:
+        json.dump(trades, f, indent=4)
+
+def append_to_history(trade):
+    file_exists = os.path.exists(HISTORY_FILE)
+    with open(HISTORY_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["Symbol", "Timeframe", "Direction", "OpenTime", "CloseTime", "OpenPrice", "ClosePrice", "PnL", "PnL_Percent"])
+        
+        # PnL Calculation: (New - Old) / Old
+        pnl_val = (trade['close_price'] - trade['open_price']) / trade['open_price']
+        
+        # Invert PnL if signal was Short (assuming -1 indicates short, 1 indicates long)
+        if trade['signal'] < 0:
+            pnl_val = pnl_val * -1
+
+        writer.writerow([
+            trade['symbol'],
+            trade['timeframe'],
+            trade['signal'],
+            datetime.fromtimestamp(trade['start_ts'], timezone.utc).isoformat(),
+            datetime.fromtimestamp(trade['end_ts'], timezone.utc).isoformat(),
+            trade['open_price'],
+            trade['close_price'],
+            round(pnl_val, 8),
+            f"{round(pnl_val * 100, 4)}%"
+        ])
+    print(f"[HISTORY] Saved {trade['symbol']} {trade['timeframe']} | PnL: {round(pnl_val*100, 4)}%")
+
+def get_binance_ohlc(symbol, interval, start_time_ms):
+    """
+    Fetches specific candle data from Binance.
+    """
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": start_time_ms,
+        "limit": 1
+    }
+    try:
+        r = requests.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        if data:
+            # Binance response: [Open Time, Open, High, Low, Close, Volume, Close Time, ...]
+            return float(data[0][1]), float(data[0][4]) # Return Open, Close
+    except Exception as e:
+        print(f"[ERROR] Binance fetch failed for {symbol}: {e}")
+    return None, None
+
+def get_candle_times(current_time_dt, timeframe_minutes):
+    """
+    Calculates the start and end timestamp of the 'current' candle based on the timeframe.
+    """
+    # Align to 00:00
+    total_minutes = current_time_dt.hour * 60 + current_time_dt.minute
+    remainder = total_minutes % timeframe_minutes
+    
+    # Start of the current candle
+    start_dt = current_time_dt - timedelta(minutes=remainder, seconds=current_time_dt.second, microseconds=current_time_dt.microsecond)
+    
+    # End of the current candle
+    end_dt = start_dt + timedelta(minutes=timeframe_minutes)
+    
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+def process_expiries():
+    """
+    Checks active trades to see if their candle has closed.
+    """
+    active_trades = load_active_trades()
+    remaining_trades = []
+    current_ms = int(time.time() * 1000)
+    
+    # Allow a small buffer (e.g. 10 seconds) to ensure Binance has the data
+    buffer_ms = 10000 
+
+    for trade in active_trades:
+        if current_ms > (trade['end_ts'] + buffer_ms):
+            # Trade has expired, fetch result
+            print(f"[EXPIRY] Processing expired trade: {trade['symbol']} {trade['timeframe']}")
             
-            if not klines:
-                break
-                
-            data.extend(klines)
-            last_close_time = klines[-1][6]
-            current_start = last_close_time + 1
-            time.sleep(0.1)
+            open_price, close_price = get_binance_ohlc(
+                trade['symbol'], 
+                trade['binance_interval'], 
+                trade['start_ts']
+            )
             
-            current_date = datetime.datetime.fromtimestamp(current_start / 1000)
-            print(f"Fetched up to {current_date}", end='\r')
+            if open_price is not None and close_price is not None:
+                trade['open_price'] = open_price
+                trade['close_price'] = close_price
+                append_to_history(trade)
+            else:
+                print(f"[WARN] Could not fetch data for {trade['symbol']}, keeping in active list.")
+                remaining_trades.append(trade)
+        else:
+            remaining_trades.append(trade)
             
-            if current_start > int(time.time() * 1000):
-                break
-                
-        except Exception as e:
-            print(f"\nError fetching data: {e}")
+    save_active_trades(remaining_trades)
+
+def fetch_signals():
+    print(f"[FETCH] Retrieveing signals at {datetime.now().strftime('%H:%M:%S')}")
+    try:
+        r = requests.get(PREDICTION_URL)
+        r.raise_for_status()
+        data = r.json()
+        
+        active_trades = load_active_trades()
+        current_dt = datetime.now(timezone.utc)
+        
+        new_trades_count = 0
+
+        for symbol, info in data.items():
+            comp = info.get('comp', [])
+            
+            for idx, signal in enumerate(comp):
+                if signal != 0: # Active Signal
+                    tf_info = TIMEFRAMES[idx]
+                    start_ms, end_ms = get_candle_times(current_dt, tf_info['minutes'])
+                    
+                    # Unique ID for the trade to prevent duplicates
+                    trade_id = f"{symbol}_{tf_info['label']}_{start_ms}"
+                    
+                    # Check if already active
+                    if any(t['id'] == trade_id for t in active_trades):
+                        continue
+                        
+                    print(f"[SIGNAL] Found {symbol} {tf_info['label']} (Val: {signal})")
+                    
+                    # Store trade metadata (Prices fetched at expiry)
+                    new_trade = {
+                        "id": trade_id,
+                        "symbol": symbol,
+                        "signal": signal,
+                        "timeframe": tf_info['label'],
+                        "binance_interval": tf_info['label'], # Binance uses same format (15m, 1h)
+                        "start_ts": start_ms,
+                        "end_ts": end_ms
+                    }
+                    active_trades.append(new_trade)
+                    new_trades_count += 1
+        
+        save_active_trades(active_trades)
+        print(f"[UPDATE] Added {new_trades_count} new trades.")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch predictions: {e}")
+
+def get_seconds_until_next_run():
+    """
+    Calculates seconds until the next XX:06, XX:21, XX:36, XX:51.
+    """
+    now = datetime.now()
+    minutes = now.minute
+    
+    # Target minute markers
+    targets = [6, 21, 36, 51]
+    
+    # Find next target
+    next_target = None
+    for t in targets:
+        if minutes < t:
+            next_target = t
             break
             
-    print("\nData fetch complete.")
-    
-    df = pd.DataFrame(data, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'trades', 
-        'taker_buy_base', 'taker_buy_quote', 'ignore'
-    ])
-    
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, axis=1)
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-    
-    return df[['open_time', 'open', 'high', 'low', 'close', 'volume']]
-
-def get_data():
-    if os.path.exists(FILE_PATH):
-        print(f"Loading data from {FILE_PATH}...")
-        df = pd.read_csv(FILE_PATH)
-        df['open_time'] = pd.to_datetime(df['open_time'])
-        return df
+    if next_target is None:
+        # Wrap around to next hour's first target (06)
+        wait_minutes = (60 - minutes) + targets[0]
     else:
-        df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE, END_DATE)
-        print(f"Saving data to {FILE_PATH}...")
-        df.to_csv(FILE_PATH, index=False)
-        return df
-
-def process_and_plot(df):
-    # 1. Compute Derivative
-    df['pct_change'] = df['close'].pct_change() * 100
-    df = df.dropna()
-
-    # 2. Binning (Symmetric Truncation to 0.1 steps)
-    inv_step = int(1 / STEP_SIZE) 
-    df['binned_change'] = np.trunc(df['pct_change'] * inv_step) / inv_step
-
-    # 3. Fit Student's t-distribution
-    # We fit on the RAW data to get the true shape parameters (df, loc, scale)
-    # df (degrees of freedom) controls the "fatness" of the tails. 
-    # Lower df = fatter tails/sharper peak.
-    param = t.fit(df['pct_change'])
-    df_fit, loc_fit, scale_fit = param
-
-    # Prepare distribution for plotting
-    distribution = df['binned_change'].value_counts().sort_index()
-    plot_data = distribution.loc[-5:5] 
-
-    # 4. Generate t-distribution Curve
-    x_range = np.linspace(-5, 5, 1000)
-    pdf = t.pdf(x_range, df_fit, loc_fit, scale_fit)
+        wait_minutes = next_target - minutes
+        
+    target_time = now + timedelta(minutes=wait_minutes)
+    target_time = target_time.replace(second=0, microsecond=0)
     
-    # Scale PDF
-    scaling_factor = len(df) * STEP_SIZE 
-    y_curve = pdf * scaling_factor
+    seconds_wait = (target_time - now).total_seconds()
+    return seconds_wait
 
-    # 5. Plotting
-    plt.figure(figsize=(12, 6))
+def main():
+    print("--- Crypto Signal Bot Started ---")
+    print("Syncing to 6 minutes after every 15m interval (XX:06, XX:21, XX:36, XX:51)...")
     
-    # Histogram
-    plt.bar(plot_data.index, plot_data.values, width=STEP_SIZE*0.8, align='center', 
-            color='skyblue', edgecolor='black', linewidth=0.5, label='Actual Data')
-    
-    # t-distribution Line
-    plt.plot(x_range, y_curve, 'r-', linewidth=2, label=f"Student's t-dist (df={df_fit:.2f})")
-    
-    # Stats Text Box
-    textstr = '\n'.join((
-        r'$\mu \approx %.4f$' % (loc_fit, ),
-        r'$\sigma \approx %.4f$' % (scale_fit, ),
-        r'$d.o.f.=%.2f$' % (df_fit, )))
-    props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-    plt.gca().text(0.95, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
-            verticalalignment='top', horizontalalignment='right', bbox=props)
-
-    plt.title(f'{SYMBOL} Hourly Returns vs Student\'s t-Distribution ({START_DATE} to {END_DATE})')
-    plt.xlabel(f'Price Change % (Rounded to lowest absolute {STEP_SIZE} step)')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.grid(axis='y', alpha=0.3)
-    plt.xticks(np.arange(-5, 5.5, 0.5))
-    
-    print(f"Saving plot to {IMAGE_PATH}...")
-    plt.savefig(IMAGE_PATH)
-    plt.close()
-
-class ImageHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            html = f"""
-            <html>
-                <head><title>ETH Data Analysis</title></head>
-                <body style="font-family: sans-serif; text-align: center; padding: 20px;">
-                    <h1>ETH/USDT Hourly Price Change Distribution</h1>
-                    <img src="/plot.png" alt="Price Distribution Plot" style="max-width: 100%; border: 1px solid #ddd;">
-                    <p><i>Plot generated at {datetime.datetime.now()}</i></p>
-                </body>
-            </html>
-            """
-            self.wfile.write(html.encode('utf-8'))
-        elif self.path == '/plot.png':
-            if os.path.exists(IMAGE_PATH):
-                self.send_response(200)
-                self.send_header("Content-type", "image/png")
-                self.end_headers()
-                with open(IMAGE_PATH, 'rb') as f:
-                    self.wfile.write(f.read())
-            else:
-                self.send_error(404, "Plot not found")
-        else:
-            self.send_error(404, "File not found")
-
-def run_server():
-    with socketserver.TCPServer(("", PORT), ImageHandler) as httpd:
-        print(f"Serving at http://localhost:{PORT}")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nServer stopped.")
+    while True:
+        # 1. Process any pending expiries first (check regardless of schedule)
+        process_expiries()
+        
+        # 2. Wait for schedule
+        sleep_sec = get_seconds_until_next_run()
+        print(f"[WAIT] Sleeping for {int(sleep_sec)} seconds...")
+        time.sleep(sleep_sec)
+        
+        # 3. Double check synchronization (ensure we didn't wake up slightly early)
+        time.sleep(1) 
+        
+        # 4. Run Cycle
+        fetch_signals()
+        
+        # Small sleep to prevent double execution within the same second
+        time.sleep(5)
 
 if __name__ == "__main__":
-    df = get_data()
-    process_and_plot(df)
-    run_server()
+    main()
