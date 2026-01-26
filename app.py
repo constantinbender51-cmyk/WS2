@@ -226,7 +226,7 @@ def build_models_worker():
             df['section'] = df['close'].apply(lambda x: get_bin(x, min_price, bin_size))
             
             # 2. Split Data 70/30
-            split_idx = int(len(df) * 0.70)
+            split_idx = int(len(df) * 0.950)
             train_df = df.iloc[:split_idx].copy()
             test_df = df.iloc[split_idx:].copy()
 
