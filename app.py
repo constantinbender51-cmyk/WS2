@@ -170,15 +170,17 @@ def get_bin(price, min_p, bin_size):
 
 def calculate_backtest(df, sequences, min_p, bin_size):
     """
-    Run backtest on a specific dataframe slice using provided sequences
+    Run backtest on a specific dataframe slice using provided sequences.
+    NOW INCLUDES FLAT OUTCOMES (DRAWS) IN STATS AND PNL.
     """
     results = []
     total_pnl = 0.0
     correct_dir = 0
+    flat_outcomes = 0
     total_preds = 0
     
     if df.empty or 'section' not in df.columns:
-        return results, total_pnl, 0
+        return results, total_pnl, 0, 0
     
     test_closes = df['close'].values
     test_sections = df['section'].values
@@ -195,24 +197,36 @@ def calculate_backtest(df, sequences, min_p, bin_size):
         if input_seq in sequences:
             pred_next_sec = int(sequences[input_seq].most_common(1)[0][0])
             
-            # --- IGNORE FLAT OUTCOMES & PREDICTIONS ---
+            # We still SKIP if the MODEL predicts FLAT (we wouldn't take the trade)
             if pred_next_sec == current_sec: continue 
-            if actual_next_sec == current_sec: continue 
+
+            # NOTE: We DO NOT skip if 'actual_next_sec == current_sec' anymore.
+            # We count these as valid trades that resulted in a "Draw/Flat" outcome.
 
             total_preds += 1
             direction = "UP" if pred_next_sec > current_sec else "DOWN"
             
             trade_pnl_pct = 0.0
-            is_correct = False
             
+            # Calculate PnL regardless of whether it hit the next section
             if direction == "UP":
                 trade_pnl_pct = (actual_price - current_price) / current_price * 100
-                if actual_next_sec > current_sec: is_correct = True
             else:
                 trade_pnl_pct = (current_price - actual_price) / current_price * 100
-                if actual_next_sec < current_sec: is_correct = True
             
-            if is_correct: correct_dir += 1
+            # Determine Win/Loss/Draw
+            if actual_next_sec == current_sec:
+                # Outcome was FLAT (Draw)
+                flat_outcomes += 1
+                # PnL is still added (likely small pos or neg)
+            else:
+                # Outcome was NOT flat
+                is_correct = False
+                if direction == "UP" and actual_next_sec > current_sec: is_correct = True
+                elif direction == "DOWN" and actual_next_sec < current_sec: is_correct = True
+                
+                if is_correct: correct_dir += 1
+            
             total_pnl += trade_pnl_pct
             
             # Capture inputs used for this prediction
@@ -227,7 +241,9 @@ def calculate_backtest(df, sequences, min_p, bin_size):
             })
             
     acc = (correct_dir / total_preds * 100) if total_preds else 0
-    return results, total_pnl, acc
+    flat_pct = (flat_outcomes / total_preds * 100) if total_preds else 0
+    
+    return results, total_pnl, acc, flat_pct
 
 def build_models_worker():
     global models, system_status, portfolio_stats, total_backtest_trades, recent_7_day_stats
@@ -285,7 +301,7 @@ def build_models_worker():
             
             # Run Backtest immediately on Test Data (30%)
             print(f"[{symbol}] Running full backtest...")
-            res, pnl, acc = calculate_backtest(test_df, sequences, min_price, bin_size)
+            res, pnl, acc, flat_pct = calculate_backtest(test_df, sequences, min_price, bin_size)
             
             last_bt_trade = res[-1] if len(res) > 0 else None
             
@@ -294,6 +310,7 @@ def build_models_worker():
                 "symbol": symbol,
                 "backtest_pnl": pnl,
                 "backtest_acc": acc,
+                "flat_pct": flat_pct,
                 "trades": len(res),
                 "last_bt_trade": last_bt_trade
             })
@@ -306,12 +323,13 @@ def build_models_worker():
                 df_7d['section'] = df_7d['close'].apply(lambda x: get_bin(x, min_price, bin_size))
                 
                 # Run backtest on this specific slice
-                res_7d, pnl_7d, acc_7d = calculate_backtest(df_7d, sequences, min_price, bin_size)
+                res_7d, pnl_7d, acc_7d, flat_pct_7d = calculate_backtest(df_7d, sequences, min_price, bin_size)
                 
                 temp_7_day_stats.append({
                     "symbol": symbol,
                     "pnl": pnl_7d,
                     "acc": acc_7d,
+                    "flat_pct": flat_pct_7d,
                     "count": len(res_7d),
                     "last_trade_input": res_7d[-1]['inputs'] if len(res_7d) > 0 else []
                 })
@@ -453,7 +471,8 @@ def live_prediction_loop():
             current_section = input_sections[-1]
             
             if input_sections in m['sequences']:
-                predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+                predicted_section = int(m['sequences'][input_sections].most_common(1)[0][0])
+                current_section = int(current_section)
                 
                 direction = "FLAT"
                 if predicted_section > current_section:
@@ -512,7 +531,8 @@ def predict_manual():
         current_section = input_sections[-1]
         
         if input_sections in m['sequences']:
-            predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+            predicted_section = int(m['sequences'][input_sections].most_common(1)[0][0])
+            current_section = int(current_section)
             
             direction = "FLAT"
             if predicted_section > current_section:
@@ -565,6 +585,7 @@ def dashboard():
             "last_price": models[symbol].get("last_price", 0),
             "backtest_pnl": round(stat['backtest_pnl'], 2),
             "backtest_acc": round(stat['backtest_acc'], 2),
+            "flat_pct": round(stat['flat_pct'], 2),
             "trades": stat['trades'],
             "active_pred": active_dir,
             "active_entry": active['entry_price'] if active else "",
@@ -674,6 +695,7 @@ def dashboard():
                         <th>Active Entry</th>
                         <th>Active Inputs (Last 7)</th>
                         <th>Backtest Acc %</th>
+                        <th>Flat Outcome %</th>
                         <th>Backtest PnL %</th>
                         <th>BT Trades</th>
                     </tr>
@@ -691,6 +713,7 @@ def dashboard():
                             {{ row.active_inputs | join(', ') }}
                         </td>
                         <td>{{ row.backtest_acc }}%</td>
+                        <td>{{ row.flat_pct }}%</td>
                         <td class="{{ 'up' if row.backtest_pnl > 0 else 'down' }}">{{ row.backtest_pnl }}%</td>
                         <td>{{ row.trades }}</td>
                     </tr>
@@ -739,6 +762,7 @@ def dashboard():
                         <th>Symbol</th>
                         <th>7-Day PnL %</th>
                         <th>7-Day Accuracy %</th>
+                        <th>Flat Outcome %</th>
                         <th>Trades (7d)</th>
                         <th>Last Input Seq (7d)</th>
                     </tr>
@@ -751,6 +775,7 @@ def dashboard():
                             {{ "%.2f"|format(row.pnl) }}%
                         </td>
                         <td>{{ "%.1f"|format(row.acc) }}%</td>
+                        <td>{{ "%.1f"|format(row.flat_pct) }}%</td>
                         <td>{{ row.count }}</td>
                         <td class="small-text" style="max-width: 400px; word-wrap: break-word;">
                              {{ row.last_trade_input | join(', ') }}
