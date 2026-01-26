@@ -398,34 +398,38 @@ def live_prediction_loop():
                 prev = current_predictions[symbol]
                 entry_price = prev['entry_price']
                 direction = prev['direction']
+                entry_section = prev['current_section'] # Retrieved from storage
                 
-                # Retrieve bounds from the prediction if available (or calc approx)
+                # Retrieve bounds
                 pred_min = prev.get('predicted_min', 0)
                 pred_max = prev.get('predicted_max', 0)
                 
+                # Calculate raw PnL for display
                 pnl_percent = 0.0
                 if direction == "UP":
                     pnl_percent = ((current_close - entry_price) / entry_price) * 100
                 elif direction == "DOWN":
                     pnl_percent = ((entry_price - current_close) / entry_price) * 100
                 
-                # --- WIN/LOSS/DRAW LOGIC UPDATE ---
-                # A loss smaller than the "section size" is considered a DRAW (noise).
-                # Calculate the percentage size of 1 bin
-                bin_size = m['bin_size']
-                step_pct = (bin_size / entry_price) * 100
+                # --- NEW WIN/LOSS LOGIC BASED ON SECTIONS ---
+                exit_section = get_bin(current_close, m['min_price'], m['bin_size'])
                 
                 result_status = "DRAW"
                 
-                if pnl_percent > 0:
-                    result_status = "WIN"
-                elif pnl_percent < 0:
-                    # If loss is significant (greater than 1 bin size), it's a loss
-                    if abs(pnl_percent) > step_pct:
-                        result_status = "LOSS"
-                    else:
-                        # Loss is within the noise floor of the section logic
-                        result_status = "DRAW"
+                if exit_section == entry_section:
+                    # Price stayed in the same bin -> DRAW (noise filter)
+                    result_status = "DRAW"
+                else:
+                    if direction == "UP":
+                        if exit_section > entry_section:
+                            result_status = "WIN"
+                        else:
+                            result_status = "LOSS"
+                    elif direction == "DOWN":
+                        if exit_section < entry_section:
+                            result_status = "WIN"
+                        else:
+                            result_status = "LOSS"
                     
                 outcome = {
                     "symbol": symbol,
