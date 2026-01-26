@@ -165,7 +165,6 @@ def calculate_backtest(df, sequences, min_p, bin_size):
         current_sec = input_seq[-1]
         
         if input_seq in sequences:
-            # Cast to int to ensure JSON serialization compatibility later
             pred_next_sec = int(sequences[input_seq].most_common(1)[0][0])
             
             # --- IGNORE FLAT OUTCOMES & PREDICTIONS ---
@@ -358,13 +357,13 @@ def live_prediction_loop():
                 elif direction == "DOWN":
                     pnl_percent = ((entry_price - current_close) / entry_price) * 100
                 
-                # Determine Outcome
-                outcome_label = "NEITHER"
+                # Determine Result Status
+                result_status = "DRAW"
                 if pnl_percent > 0:
-                    outcome_label = "WIN"
+                    result_status = "WIN"
                 elif pnl_percent < 0:
-                    outcome_label = "LOSS"
-
+                    result_status = "LOSS"
+                    
                 outcome = {
                     "symbol": symbol,
                     "timestamp": last_closed_candle['timestamp'],
@@ -372,8 +371,8 @@ def live_prediction_loop():
                     "exit_price": current_close,
                     "direction": direction,
                     "pnl_percent": round(pnl_percent, 4),
-                    "inputs": prev['inputs']['prices'], # Log just the prices list
-                    "outcome": outcome_label
+                    "result": result_status,
+                    "inputs": prev['inputs']
                 }
                 live_outcomes.append(outcome)
                 del current_predictions[symbol]
@@ -385,8 +384,7 @@ def live_prediction_loop():
             current_section = input_sections[-1]
             
             if input_sections in m['sequences']:
-                # FIX: Force int conversion here to prevent JSON serialization error
-                predicted_section = int(m['sequences'][input_sections].most_common(1)[0][0])
+                predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
                 
                 direction = "FLAT"
                 if predicted_section > current_section:
@@ -418,6 +416,7 @@ live_thread = threading.Thread(target=live_prediction_loop, daemon=True)
 live_thread.start()
 
 # --- Routes ---
+# --- Routes ---
 
 @app.route('/api/status')
 def api_status():
@@ -430,60 +429,50 @@ def api_signals():
 
 @app.route('/api/manual_predict', methods=['POST'])
 def manual_predict():
+    data = request.json
+    symbol = data.get('symbol')
+    prices = data.get('prices') # Expecting list of 7 floats
+
+    if not symbol or not prices or len(prices) != 7:
+        return jsonify({"error": "Invalid input. Require symbol and exactly 7 prices."}), 400
+
+    if symbol not in models or not models[symbol]['ready']:
+        return jsonify({"error": f"Model for {symbol} not ready."}), 400
+
+    m = models[symbol]
+    
     try:
-        data = request.json
-        symbol = data.get('symbol')
-        prices_str = data.get('prices')
-        
-        if not symbol or symbol not in models or not models[symbol]["ready"]:
-            return jsonify({"error": "Model not ready or invalid symbol"}), 400
-        
-        if not prices_str:
-            return jsonify({"error": "No prices provided"}), 400
+        # Convert prices to bins
+        sections = tuple([get_bin(float(p), m['min_price'], m['bin_size']) for p in prices])
+    except ValueError:
+        return jsonify({"error": "Prices must be numbers."}), 400
 
-        try:
-            # Parse CSV string to list of floats
-            prices = [float(x.strip()) for x in prices_str.split(',')]
-        except ValueError:
-            return jsonify({"error": "Invalid price format. Use comma separated numbers."}), 400
+    response = {
+        "symbol": symbol,
+        "input_prices": prices,
+        "input_sections": list(sections),
+        "prediction": "UNKNOWN",
+        "direction": "UNKNOWN"
+    }
 
-        if len(prices) != 7:
-            return jsonify({"error": f"Expected 7 prices, got {len(prices)}"}), 400
-            
-        m = models[symbol]
+    if sections in m['sequences']:
+        pred_section = m['sequences'][sections].most_common(1)[0][0]
+        curr_section = sections[-1]
         
-        # Convert prices to sections
-        input_sections = tuple([get_bin(p, m['min_price'], m['bin_size']) for p in prices])
-        current_section = input_sections[-1]
-        
-        result = {
-            "symbol": symbol,
-            "inputs": prices,
-            "input_sections": list(input_sections),
-            "found": False,
-            "prediction": "UNKNOWN"
-        }
-        
-        if input_sections in m['sequences']:
-            # FIX: Force int conversion here to prevent JSON serialization error
-            predicted_section = int(m['sequences'][input_sections].most_common(1)[0][0])
+        direction = "FLAT"
+        if pred_section > curr_section:
+            direction = "UP"
+        elif pred_section < curr_section:
+            direction = "DOWN"
             
-            result["found"] = True
-            result["predicted_section"] = predicted_section
-            
-            if predicted_section > current_section:
-                result["prediction"] = "UP"
-            elif predicted_section < current_section:
-                result["prediction"] = "DOWN"
-            else:
-                result["prediction"] = "FLAT"
-        else:
-            result["prediction"] = "NO MATCH"
-            
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        response["prediction"] = "FOUND"
+        response["direction"] = direction
+        response["predicted_section"] = int(pred_section)
+    else:
+        response["prediction"] = "NOT_FOUND"
+        response["message"] = "This exact sequence of 7 price sections has never been seen in the training data."
+
+    return jsonify(response)
 
 @app.route('/')
 def dashboard():
@@ -516,7 +505,6 @@ def dashboard():
     <html>
     <head>
         <title>Multi-Asset Sequence Predictor</title>
-        <meta http-equiv="refresh" content="60">
         <style>
             body { font-family: 'Segoe UI', monospace; padding: 20px; background: #f4f4f9; color: #333; }
             h2, h3 { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-top: 30px;}
@@ -526,9 +514,6 @@ def dashboard():
             th { background-color: #f8f9fa; font-weight: 600; }
             .up { color: #27ae60; font-weight: bold; }
             .down { color: #c0392b; font-weight: bold; }
-            .win { color: #ffffff; background-color: #27ae60; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-            .loss { color: #ffffff; background-color: #c0392b; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-            .neither { color: #333; background-color: #ddd; padding: 2px 6px; border-radius: 4px; }
             .symbol { font-weight: bold; color: #2c3e50; }
             .small-text { font-size: 10px; color: #666; font-family: monospace; display: block; margin-top: 4px; }
             
@@ -536,22 +521,29 @@ def dashboard():
             .stat-box { flex: 1; }
             .stat-label { font-size: 11px; text-transform: uppercase; color: #555; }
             .stat-val { font-size: 16px; font-weight: bold; }
-
-            .manual-box { background: #e3f2fd; padding: 15px; border-radius: 5px; margin-top: 40px; border: 1px solid #bbdefb; }
-            .manual-controls { display: flex; gap: 10px; align-items: center; }
-            input[type="text"] { flex: 2; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
-            select { flex: 0.5; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
-            button { padding: 8px 16px; background: #1976d2; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;}
-            button:hover { background: #1565c0; }
-            #manual-result { margin-top: 10px; font-weight: bold; font-size: 14px; }
+            
+            /* Manual Predictor Styles */
+            .manual-box { background: #fff3e0; padding: 20px; border: 1px solid #ffe0b2; border-radius: 5px; margin-top: 30px; }
+            .input-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+            .input-row input { padding: 8px; border: 1px solid #ddd; border-radius: 4px; flex: 1; min-width: 80px; }
+            .input-row select { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+            .btn { padding: 10px 20px; background: #333; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+            .btn:hover { background: #555; }
+            #manual-result { margin-top: 15px; font-weight: bold; padding: 10px; background: white; border: 1px solid #eee; display: none; }
         </style>
         <script>
-            async function runManualPrediction() {
+            async def runManual() {
                 const symbol = document.getElementById('manual-symbol').value;
-                const prices = document.getElementById('manual-prices').value;
-                const resultDiv = document.getElementById('manual-result');
+                const prices = [];
+                for(let i=1; i<=7; i++) {
+                    const val = document.getElementById('p'+i).value;
+                    if(!val) { alert("Please enter all 7 prices"); return; }
+                    prices.push(parseFloat(val));
+                }
                 
-                resultDiv.innerHTML = "Calculating...";
+                const resDiv = document.getElementById('manual-result');
+                resDiv.style.display = 'block';
+                resDiv.innerHTML = "Calculating...";
                 
                 try {
                     const response = await fetch('/api/manual_predict', {
@@ -559,21 +551,24 @@ def dashboard():
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ symbol: symbol, prices: prices })
                     });
-                    
                     const data = await response.json();
                     
-                    if (data.error) {
-                        resultDiv.innerHTML = `<span style="color:red">Error: ${data.error}</span>`;
+                    if(data.error) {
+                        resDiv.innerHTML = `<span style="color:red">Error: ${data.error}</span>`;
                     } else {
-                        let color = "black";
-                        if (data.prediction === "UP") color = "#27ae60";
-                        if (data.prediction === "DOWN") color = "#c0392b";
+                        let color = 'black';
+                        if(data.direction === 'UP') color = 'green';
+                        if(data.direction === 'DOWN') color = 'red';
                         
-                        resultDiv.innerHTML = `Prediction: <span style="color:${color}; font-size:18px;">${data.prediction}</span> ` +
-                                              (data.found ? `(Matched Sequence)` : `(No Sequence Match)`);
+                        resDiv.innerHTML = `
+                            Symbol: ${data.symbol} <br/>
+                            Prediction: <span style="color:${color}; font-size: 1.2em;">${data.direction}</span> <br/>
+                            <span class="small-text">Input Sections: ${data.input_sections} -> Predicted: ${data.predicted_section}</span>
+                            ${data.message ? `<br/><small>${data.message}</small>` : ''}
+                        `;
                     }
-                } catch (e) {
-                    resultDiv.innerHTML = `<span style="color:red">Network Error</span>`;
+                } catch(e) {
+                    resDiv.innerHTML = "Network Error";
                 }
             }
         </script>
@@ -627,46 +622,6 @@ def dashboard():
                 </tbody>
             </table>
 
-            <h3>Live Trade Log (All Assets)</h3>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Time (UTC)</th>
-                        <th>Symbol</th>
-                        <th>Direction</th>
-                        <th>Entry</th>
-                        <th>Exit</th>
-                        <th>Input Prices (Last 7)</th>
-                        <th>PnL %</th>
-                        <th>Outcome</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for row in outcomes|reverse %}
-                    <tr>
-                        <td>{{ row.timestamp | datetime }}</td>
-                        <td class="symbol">{{ row.symbol }}</td>
-                        <td class="{{ 'up' if row.direction == 'UP' else 'down' }}">{{ row.direction }}</td>
-                        <td>{{ row.entry_price }}</td>
-                        <td>{{ row.exit_price }}</td>
-                        <td class="small-text" style="max-width: 300px; word-wrap: break-word;">
-                            {{ row.inputs | join(', ') }}
-                        </td>
-                        <td class="{{ 'up' if row.pnl_percent > 0 else 'down' }}">
-                            {{ row.pnl_percent }}%
-                        </td>
-                        <td>
-                            <span class="{{ 'win' if row.outcome == 'WIN' else 'loss' if row.outcome == 'LOSS' else 'neither' }}">
-                                {{ row.outcome }}
-                            </span>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr><td colspan="8">No live trades recorded yet.</td></tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-
             <h3>Last Backtest Signals (Diagnostics)</h3>
             <table>
                 <thead>
@@ -701,21 +656,109 @@ def dashboard():
                 </tbody>
             </table>
 
-            <h3>Manual Prediction Tool</h3>
+            <h3>Live Trade Log (All Assets)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time (UTC)</th>
+                        <th>Symbol</th>
+                        <th>Direction</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>PnL %</th>
+                        <th>Result</th>
+                        <th>Input Prices</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in outcomes|reverse %}
+                    <tr>
+                        <td>{{ row.timestamp | datetime }}</td>
+                        <td class="symbol">{{ row.symbol }}</td>
+                        <td class="{{ 'up' if row.direction == 'UP' else 'down' }}">{{ row.direction }}</td>
+                        <td>{{ row.entry_price }}</td>
+                        <td>{{ row.exit_price }}</td>
+                        <td class="{{ 'up' if row.pnl_percent > 0 else 'down' }}">
+                            {{ row.pnl_percent }}%
+                        </td>
+                        <td class="{{ 'up' if row.result == 'WIN' else 'down' if row.result == 'LOSS' else '' }}">
+                            {{ row.result }}
+                        </td>
+                        <td class="small-text" style="max-width: 400px; word-wrap: break-word;">
+                             {{ row.inputs.prices | join(', ') }}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="8">No live trades recorded yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            
             <div class="manual-box">
-                <p style="margin-top:0; font-size:12px; color:#555;">Enter 7 consecutive close prices (comma separated) to check for a pattern match.</p>
-                <div class="manual-controls">
+                <h3>Manual Sequence Test</h3>
+                <p>Enter 7 consecutive prices (oldest to newest) to test the model's prediction.</p>
+                <div class="input-row">
                     <select id="manual-symbol">
                         {% for row in summary %}
                         <option value="{{ row.symbol }}">{{ row.symbol }}</option>
                         {% endfor %}
                     </select>
-                    <input type="text" id="manual-prices" placeholder="e.g. 50000.1, 50020.5, 49990.0, ... (7 prices)">
-                    <button onclick="runManualPrediction()">Predict</button>
+                    <input type="number" step="any" id="p1" placeholder="Price 1">
+                    <input type="number" step="any" id="p2" placeholder="Price 2">
+                    <input type="number" step="any" id="p3" placeholder="Price 3">
+                    <input type="number" step="any" id="p4" placeholder="Price 4">
+                    <input type="number" step="any" id="p5" placeholder="Price 5">
+                    <input type="number" step="any" id="p6" placeholder="Price 6">
+                    <input type="number" step="any" id="p7" placeholder="Price 7 (Latest)">
+                    <button class="btn" onclick="runManual()">Predict</button>
                 </div>
                 <div id="manual-result"></div>
             </div>
+            
         </div>
+        <script>
+            // Fix for the async function definition in HTML string
+            async function runManual() {
+                const symbol = document.getElementById('manual-symbol').value;
+                const prices = [];
+                for(let i=1; i<=7; i++) {
+                    const val = document.getElementById('p'+i).value;
+                    if(!val) { alert("Please enter all 7 prices"); return; }
+                    prices.push(parseFloat(val));
+                }
+                
+                const resDiv = document.getElementById('manual-result');
+                resDiv.style.display = 'block';
+                resDiv.innerHTML = "Calculating...";
+                
+                try {
+                    const response = await fetch('/api/manual_predict', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ symbol: symbol, prices: prices })
+                    });
+                    const data = await response.json();
+                    
+                    if(data.error) {
+                        resDiv.innerHTML = `<span style="color:red">Error: ${data.error}</span>`;
+                    } else {
+                        let color = 'black';
+                        if(data.direction === 'UP') color = 'green';
+                        if(data.direction === 'DOWN') color = 'red';
+                        
+                        resDiv.innerHTML = `
+                            Symbol: ${data.symbol} <br/>
+                            Prediction: <span style="color:${color}; font-size: 1.2em;">${data.direction}</span> <br/>
+                            <span class="small-text">Input Sections: ${data.input_sections} -> Predicted: ${data.predicted_section || '?'}</span>
+                            ${data.message ? `<br/><small>${data.message}</small>` : ''}
+                        `;
+                    }
+                } catch(e) {
+                    resDiv.innerHTML = "Network Error";
+                    console.error(e);
+                }
+            }
+        </script>
     </body>
     </html>
     """
