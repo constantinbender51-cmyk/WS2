@@ -165,6 +165,7 @@ def calculate_backtest(df, sequences, min_p, bin_size):
         current_sec = input_seq[-1]
         
         if input_seq in sequences:
+            # Cast to int to ensure JSON serialization compatibility later
             pred_next_sec = int(sequences[input_seq].most_common(1)[0][0])
             
             # --- IGNORE FLAT OUTCOMES & PREDICTIONS ---
@@ -384,7 +385,8 @@ def live_prediction_loop():
             current_section = input_sections[-1]
             
             if input_sections in m['sequences']:
-                predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+                # FIX: Force int conversion here to prevent JSON serialization error
+                predicted_section = int(m['sequences'][input_sections].most_common(1)[0][0])
                 
                 direction = "FLAT"
                 if predicted_section > current_section:
@@ -463,7 +465,9 @@ def manual_predict():
         }
         
         if input_sections in m['sequences']:
-            predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+            # FIX: Force int conversion here to prevent JSON serialization error
+            predicted_section = int(m['sequences'][input_sections].most_common(1)[0][0])
+            
             result["found"] = True
             result["predicted_section"] = predicted_section
             
@@ -533,7 +537,7 @@ def dashboard():
             .stat-label { font-size: 11px; text-transform: uppercase; color: #555; }
             .stat-val { font-size: 16px; font-weight: bold; }
 
-            .manual-box { background: #e3f2fd; padding: 15px; border-radius: 5px; margin-bottom: 20px; border: 1px solid #bbdefb; }
+            .manual-box { background: #e3f2fd; padding: 15px; border-radius: 5px; margin-top: 40px; border: 1px solid #bbdefb; }
             .manual-controls { display: flex; gap: 10px; align-items: center; }
             input[type="text"] { flex: 2; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
             select { flex: 0.5; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
@@ -591,21 +595,6 @@ def dashboard():
                     <div class="stat-label">Total Backtest Trades</div>
                     <div class="stat-val">{{ total_bt_trades }}</div>
                 </div>
-            </div>
-
-            <h3>Manual Prediction Tool</h3>
-            <div class="manual-box">
-                <p style="margin-top:0; font-size:12px; color:#555;">Enter 7 consecutive close prices (comma separated) to check for a pattern match.</p>
-                <div class="manual-controls">
-                    <select id="manual-symbol">
-                        {% for row in summary %}
-                        <option value="{{ row.symbol }}">{{ row.symbol }}</option>
-                        {% endfor %}
-                    </select>
-                    <input type="text" id="manual-prices" placeholder="e.g. 50000.1, 50020.5, 49990.0, ... (7 prices)">
-                    <button onclick="runManualPrediction()">Predict</button>
-                </div>
-                <div id="manual-result"></div>
             </div>
 
             <h3>Asset Overview & Performance</h3>
@@ -711,6 +700,21 @@ def dashboard():
                     {% endfor %}
                 </tbody>
             </table>
+
+            <h3>Manual Prediction Tool</h3>
+            <div class="manual-box">
+                <p style="margin-top:0; font-size:12px; color:#555;">Enter 7 consecutive close prices (comma separated) to check for a pattern match.</p>
+                <div class="manual-controls">
+                    <select id="manual-symbol">
+                        {% for row in summary %}
+                        <option value="{{ row.symbol }}">{{ row.symbol }}</option>
+                        {% endfor %}
+                    </select>
+                    <input type="text" id="manual-prices" placeholder="e.g. 50000.1, 50020.5, 49990.0, ... (7 prices)">
+                    <button onclick="runManualPrediction()">Predict</button>
+                </div>
+                <div id="manual-result"></div>
+            </div>
         </div>
     </body>
     </html>
