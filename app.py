@@ -7,7 +7,7 @@ import threading
 import datetime
 import os
 from collections import defaultdict, Counter
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -54,7 +54,8 @@ live_outcomes = []
 current_predictions = {} 
 
 # Stores pre-calculated backtest results for dashboard display
-portfolio_stats = [] 
+portfolio_stats = []
+recent_7_day_stats = [] # Stores 7-day specific backtest results
 total_backtest_trades = 0
 
 system_status = {
@@ -138,6 +139,30 @@ def fetch_data(symbol):
         cached_dfs[symbol] = df 
     return df
 
+def fetch_7_day_data(symbol):
+    """
+    Fetches the last ~7 days of data (approx 700 candles) separately
+    from the main historical fetch.
+    """
+    print(f"[{symbol}] Fetching separate 7-day dataset...")
+    try:
+        # 7 days * 24h * 4 (15m) = 672 candles. We request 750 to be safe.
+        params = {'symbol': symbol, 'interval': '15m', 'limit': 750}
+        r = requests.get(BINANCE_URL, params=params)
+        r.raise_for_status()
+        data = r.json()
+        
+        parsed = []
+        for c in data:
+            parsed.append({
+                "timestamp": c[0],
+                "close": float(c[4])
+            })
+        return pd.DataFrame(parsed)
+    except Exception as e:
+        print(f"[{symbol}] 7-Day Fetch Error: {e}")
+        return pd.DataFrame()
+
 def get_bin(price, min_p, bin_size):
     if bin_size == 0: return 0
     b = int((price - min_p) / bin_size)
@@ -151,6 +176,9 @@ def calculate_backtest(df, sequences, min_p, bin_size):
     total_pnl = 0.0
     correct_dir = 0
     total_preds = 0
+    
+    if df.empty or 'section' not in df.columns:
+        return results, total_pnl, 0
     
     test_closes = df['close'].values
     test_sections = df['section'].values
@@ -202,11 +230,13 @@ def calculate_backtest(df, sequences, min_p, bin_size):
     return results, total_pnl, acc
 
 def build_models_worker():
-    global models, system_status, portfolio_stats, total_backtest_trades
+    global models, system_status, portfolio_stats, total_backtest_trades, recent_7_day_stats
     try:
         temp_stats = []
         temp_total_trades = 0
+        temp_7_day_stats = []
         
+        # 1. Build Base Models and Run Full Backtest
         for symbol in ASSETS:
             df = fetch_data(symbol)
             if df.empty:
@@ -215,28 +245,26 @@ def build_models_worker():
 
             print(f"[{symbol}] Building model...")
             
-            # 1. Apply Hardcoded Clamps
+            # Apply Hardcoded Clamps
             raw_min = df['close'].min()
             raw_max = df['close'].max()
             
             config = ASSET_CONFIG.get(symbol, {"min": raw_min, "max": raw_max})
-            min_price = max(raw_min, config["min"]) # Ensure we cover data if config is too tight, or use config
             min_price = config["min"]
             max_price = config["max"]
             
-            # Check for data outliers outside config, or just clamp them in get_bin
             price_range = max_price - min_price
             bin_size = price_range / SECTIONS
 
             # Apply binning to whole dataset
             df['section'] = df['close'].apply(lambda x: get_bin(x, min_price, bin_size))
             
-            # 2. Split Data 70/30
-            split_idx = int(len(df) * 0.850)
+            # Split Data 70/30
+            split_idx = int(len(df) * 0.950)
             train_df = df.iloc[:split_idx].copy()
             test_df = df.iloc[split_idx:].copy()
 
-            # 3. Build Model Sequences ONLY on Training Data
+            # Build Model Sequences ONLY on Training Data
             train_sections = train_df['section'].values
             sequences = defaultdict(Counter)
             for i in range(len(train_sections) - SEQUENCE_LEN + 1):
@@ -255,8 +283,8 @@ def build_models_worker():
             }
             print(f"[{symbol}] Model ready. Range: {min_price:.4f}-{max_price:.4f}.")
             
-            # 4. Run Backtest immediately on Test Data (30%)
-            print(f"[{symbol}] Running backtest on {len(test_df)} candles...")
+            # Run Backtest immediately on Test Data (30%)
+            print(f"[{symbol}] Running full backtest...")
             res, pnl, acc = calculate_backtest(test_df, sequences, min_price, bin_size)
             
             last_bt_trade = res[-1] if len(res) > 0 else None
@@ -269,10 +297,30 @@ def build_models_worker():
                 "trades": len(res),
                 "last_bt_trade": last_bt_trade
             })
+            
+            # 2. SEPARATE 7-DAY BACKTEST
+            # Fetch fresh separate data for the last 7 days
+            df_7d = fetch_7_day_data(symbol)
+            if not df_7d.empty:
+                # Apply same binning logic using the model params
+                df_7d['section'] = df_7d['close'].apply(lambda x: get_bin(x, min_price, bin_size))
+                
+                # Run backtest on this specific slice
+                res_7d, pnl_7d, acc_7d = calculate_backtest(df_7d, sequences, min_price, bin_size)
+                
+                temp_7_day_stats.append({
+                    "symbol": symbol,
+                    "pnl": pnl_7d,
+                    "acc": acc_7d,
+                    "count": len(res_7d),
+                    "last_trade_input": res_7d[-1]['inputs'] if len(res_7d) > 0 else []
+                })
+            time.sleep(0.5) # Slight delay to respect API limits
 
         # Update global cache
         portfolio_stats = temp_stats
         total_backtest_trades = temp_total_trades
+        recent_7_day_stats = temp_7_day_stats
             
     except Exception as e:
         print(f"Fatal error during initialization: {e}")
@@ -427,53 +475,6 @@ def api_signals():
     """Returns the currently active live predictions."""
     return jsonify(current_predictions.copy())
 
-@app.route('/api/manual_predict', methods=['POST'])
-def manual_predict():
-    data = request.json
-    symbol = data.get('symbol')
-    prices = data.get('prices') # Expecting list of 7 floats
-
-    if not symbol or not prices or len(prices) != 7:
-        return jsonify({"error": "Invalid input. Require symbol and exactly 7 prices."}), 400
-
-    if symbol not in models or not models[symbol]['ready']:
-        return jsonify({"error": f"Model for {symbol} not ready."}), 400
-
-    m = models[symbol]
-    
-    try:
-        # Convert prices to bins
-        sections = tuple([get_bin(float(p), m['min_price'], m['bin_size']) for p in prices])
-    except ValueError:
-        return jsonify({"error": "Prices must be numbers."}), 400
-
-    response = {
-        "symbol": symbol,
-        "input_prices": prices,
-        "input_sections": list(sections),
-        "prediction": "UNKNOWN",
-        "direction": "UNKNOWN"
-    }
-
-    if sections in m['sequences']:
-        pred_section = m['sequences'][sections].most_common(1)[0][0]
-        curr_section = sections[-1]
-        
-        direction = "FLAT"
-        if pred_section > curr_section:
-            direction = "UP"
-        elif pred_section < curr_section:
-            direction = "DOWN"
-            
-        response["prediction"] = "FOUND"
-        response["direction"] = direction
-        response["predicted_section"] = int(pred_section)
-    else:
-        response["prediction"] = "NOT_FOUND"
-        response["message"] = "This exact sequence of 7 price sections has never been seen in the training data."
-
-    return jsonify(response)
-
 @app.route('/')
 def dashboard():
     if system_status["loading"]:
@@ -521,57 +522,7 @@ def dashboard():
             .stat-box { flex: 1; }
             .stat-label { font-size: 11px; text-transform: uppercase; color: #555; }
             .stat-val { font-size: 16px; font-weight: bold; }
-            
-            /* Manual Predictor Styles */
-            .manual-box { background: #fff3e0; padding: 20px; border: 1px solid #ffe0b2; border-radius: 5px; margin-top: 30px; }
-            .input-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
-            .input-row input { padding: 8px; border: 1px solid #ddd; border-radius: 4px; flex: 1; min-width: 80px; }
-            .input-row select { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-            .btn { padding: 10px 20px; background: #333; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
-            .btn:hover { background: #555; }
-            #manual-result { margin-top: 15px; font-weight: bold; padding: 10px; background: white; border: 1px solid #eee; display: none; }
         </style>
-        <script>
-            async def runManual() {
-                const symbol = document.getElementById('manual-symbol').value;
-                const prices = [];
-                for(let i=1; i<=7; i++) {
-                    const val = document.getElementById('p'+i).value;
-                    if(!val) { alert("Please enter all 7 prices"); return; }
-                    prices.push(parseFloat(val));
-                }
-                
-                const resDiv = document.getElementById('manual-result');
-                resDiv.style.display = 'block';
-                resDiv.innerHTML = "Calculating...";
-                
-                try {
-                    const response = await fetch('/api/manual_predict', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ symbol: symbol, prices: prices })
-                    });
-                    const data = await response.json();
-                    
-                    if(data.error) {
-                        resDiv.innerHTML = `<span style="color:red">Error: ${data.error}</span>`;
-                    } else {
-                        let color = 'black';
-                        if(data.direction === 'UP') color = 'green';
-                        if(data.direction === 'DOWN') color = 'red';
-                        
-                        resDiv.innerHTML = `
-                            Symbol: ${data.symbol} <br/>
-                            Prediction: <span style="color:${color}; font-size: 1.2em;">${data.direction}</span> <br/>
-                            <span class="small-text">Input Sections: ${data.input_sections} -> Predicted: ${data.predicted_section}</span>
-                            ${data.message ? `<br/><small>${data.message}</small>` : ''}
-                        `;
-                    }
-                } catch(e) {
-                    resDiv.innerHTML = "Network Error";
-                }
-            }
-        </script>
     </head>
     <body>
         <div class="container">
@@ -655,6 +606,34 @@ def dashboard():
                     {% endfor %}
                 </tbody>
             </table>
+            
+            <h3>Last 7 Days Performance (Separate Fetch)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>7-Day PnL %</th>
+                        <th>7-Day Accuracy %</th>
+                        <th>Trades (7d)</th>
+                        <th>Last Input Seq (7d)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in recent_stats %}
+                    <tr>
+                        <td class="symbol">{{ row.symbol }}</td>
+                        <td class="{{ 'up' if row.pnl > 0 else 'down' }}">
+                            {{ "%.2f"|format(row.pnl) }}%
+                        </td>
+                        <td>{{ "%.1f"|format(row.acc) }}%</td>
+                        <td>{{ row.count }}</td>
+                        <td class="small-text" style="max-width: 400px; word-wrap: break-word;">
+                             {{ row.last_trade_input | join(', ') }}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
 
             <h3>Live Trade Log (All Assets)</h3>
             <table>
@@ -693,72 +672,7 @@ def dashboard():
                     {% endfor %}
                 </tbody>
             </table>
-            
-            <div class="manual-box">
-                <h3>Manual Sequence Test</h3>
-                <p>Enter 7 consecutive prices (oldest to newest) to test the model's prediction.</p>
-                <div class="input-row">
-                    <select id="manual-symbol">
-                        {% for row in summary %}
-                        <option value="{{ row.symbol }}">{{ row.symbol }}</option>
-                        {% endfor %}
-                    </select>
-                    <input type="number" step="any" id="p1" placeholder="Price 1">
-                    <input type="number" step="any" id="p2" placeholder="Price 2">
-                    <input type="number" step="any" id="p3" placeholder="Price 3">
-                    <input type="number" step="any" id="p4" placeholder="Price 4">
-                    <input type="number" step="any" id="p5" placeholder="Price 5">
-                    <input type="number" step="any" id="p6" placeholder="Price 6">
-                    <input type="number" step="any" id="p7" placeholder="Price 7 (Latest)">
-                    <button class="btn" onclick="runManual()">Predict</button>
-                </div>
-                <div id="manual-result"></div>
-            </div>
-            
         </div>
-        <script>
-            // Fix for the async function definition in HTML string
-            async function runManual() {
-                const symbol = document.getElementById('manual-symbol').value;
-                const prices = [];
-                for(let i=1; i<=7; i++) {
-                    const val = document.getElementById('p'+i).value;
-                    if(!val) { alert("Please enter all 7 prices"); return; }
-                    prices.push(parseFloat(val));
-                }
-                
-                const resDiv = document.getElementById('manual-result');
-                resDiv.style.display = 'block';
-                resDiv.innerHTML = "Calculating...";
-                
-                try {
-                    const response = await fetch('/api/manual_predict', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ symbol: symbol, prices: prices })
-                    });
-                    const data = await response.json();
-                    
-                    if(data.error) {
-                        resDiv.innerHTML = `<span style="color:red">Error: ${data.error}</span>`;
-                    } else {
-                        let color = 'black';
-                        if(data.direction === 'UP') color = 'green';
-                        if(data.direction === 'DOWN') color = 'red';
-                        
-                        resDiv.innerHTML = `
-                            Symbol: ${data.symbol} <br/>
-                            Prediction: <span style="color:${color}; font-size: 1.2em;">${data.direction}</span> <br/>
-                            <span class="small-text">Input Sections: ${data.input_sections} -> Predicted: ${data.predicted_section || '?'}</span>
-                            ${data.message ? `<br/><small>${data.message}</small>` : ''}
-                        `;
-                    }
-                } catch(e) {
-                    resDiv.innerHTML = "Network Error";
-                    console.error(e);
-                }
-            }
-        </script>
     </body>
     </html>
     """
@@ -768,6 +682,7 @@ def dashboard():
     return render_template_string(html, 
                                   status=system_status,
                                   summary=display_summary,
+                                  recent_stats=recent_7_day_stats,
                                   total_bt_trades=total_backtest_trades,
                                   outcomes=live_outcomes,
                                   now_utc=now_utc)
