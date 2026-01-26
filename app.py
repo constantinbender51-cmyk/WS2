@@ -7,7 +7,7 @@ import threading
 import datetime
 import os
 from collections import defaultdict, Counter
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -491,7 +491,49 @@ live_thread = threading.Thread(target=live_prediction_loop, daemon=True)
 live_thread.start()
 
 # --- Routes ---
-# --- Routes ---
+
+@app.route('/predict_manual', methods=['POST'])
+def predict_manual():
+    try:
+        data = request.json
+        input_str = data.get('prices', '')
+        symbol = data.get('symbol', 'BTCUSDT')
+        
+        if symbol not in models:
+            return jsonify({"error": "Model not ready for this asset"}), 400
+            
+        prices = [float(p.strip()) for p in input_str.split(',') if p.strip()]
+        
+        if len(prices) != 7:
+            return jsonify({"error": f"Expected 7 prices, got {len(prices)}"}), 400
+            
+        m = models[symbol]
+        input_sections = tuple([get_bin(p, m['min_price'], m['bin_size']) for p in prices])
+        current_section = input_sections[-1]
+        
+        if input_sections in m['sequences']:
+            predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+            
+            direction = "FLAT"
+            if predicted_section > current_section:
+                direction = "UP"
+            elif predicted_section < current_section:
+                direction = "DOWN"
+                
+            pred_min_price = m['min_price'] + (predicted_section * m['bin_size'])
+            pred_max_price = pred_min_price + m['bin_size']
+            
+            return jsonify({
+                "direction": direction,
+                "predicted_section": predicted_section,
+                "current_section": current_section,
+                "target_range": f"{pred_min_price:.2f} - {pred_max_price:.2f}"
+            })
+        else:
+            return jsonify({"direction": "UNKNOWN (Sequence not found in history)", "target_range": "-"})
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/status')
 def api_status():
@@ -553,7 +595,41 @@ def dashboard():
             .stat-box { flex: 1; }
             .stat-label { font-size: 11px; text-transform: uppercase; color: #555; }
             .stat-val { font-size: 16px; font-weight: bold; }
+            
+            .manual-box { background: #fff; padding: 20px; border: 1px solid #ddd; margin-bottom: 20px; border-radius: 5px; }
+            .manual-box input, .manual-box select { padding: 8px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; width: 300px; }
+            .manual-box button { padding: 8px 15px; background: #2980b9; color: white; border: none; cursor: pointer; border-radius: 4px; }
+            .manual-box button:hover { background: #1f618d; }
+            #manual-result { margin-top: 10px; font-weight: bold; font-size: 14px; }
         </style>
+        <script>
+            async function runPrediction() {
+                const prices = document.getElementById('manual-input').value;
+                const symbol = document.getElementById('manual-asset').value;
+                const resultDiv = document.getElementById('manual-result');
+                
+                resultDiv.innerHTML = "Calculating...";
+                
+                try {
+                    const response = await fetch('/predict_manual', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ prices: prices, symbol: symbol })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        resultDiv.innerHTML = `<span style="color:red">Error: ${data.error}</span>`;
+                    } else {
+                        let color = data.direction === 'UP' ? 'green' : (data.direction === 'DOWN' ? 'red' : 'black');
+                        resultDiv.innerHTML = `Prediction: <span style="color:${color}; font-size:16px;">${data.direction}</span> | Target Range: ${data.target_range}`;
+                    }
+                } catch (e) {
+                    resultDiv.innerHTML = `<span style="color:red">Request failed: ${e}</span>`;
+                }
+            }
+        </script>
     </head>
     <body>
         <div class="container">
@@ -572,6 +648,20 @@ def dashboard():
                     <div class="stat-label">Total Backtest Trades</div>
                     <div class="stat-val">{{ total_bt_trades }}</div>
                 </div>
+            </div>
+            
+            <h3>Manual Sequence Predictor</h3>
+            <div class="manual-box">
+                <label>Select Asset Model: </label>
+                <select id="manual-asset">
+                    {% for s in summary %}
+                    <option value="{{ s.symbol }}">{{ s.symbol }}</option>
+                    {% endfor %}
+                </select>
+                <br><br>
+                <input type="text" id="manual-input" placeholder="Enter 7 prices separated by comma (e.g. 96000, 96100...)">
+                <button onclick="runPrediction()">Predict</button>
+                <div id="manual-result"></div>
             </div>
 
             <h3>Asset Overview & Performance</h3>
