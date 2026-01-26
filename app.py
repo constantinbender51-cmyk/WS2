@@ -1,462 +1,513 @@
-import time
-import json
-import csv
-import os
-import base64
-import io
 import requests
-from datetime import datetime, timezone, timedelta
+import pandas as pd
+import numpy as np
+import io
+import time
+import threading
+import datetime
+import os
+from collections import defaultdict, Counter
+from flask import Flask, render_template_string, jsonify
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import base64
 
 # --- Configuration ---
-# Existing Bot Config
-PREDICTION_URL = "https://workspace-production-9fae.up.railway.app/predictions"
-ACTIVE_TRADES_FILE = "active_trades.json"  # Local fallback
-HISTORY_FILE = "trade_history.csv"         # Local fallback
+DATA_DIR = "/app/data"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+PORT = 8080
+SECTIONS = 100
+SEQUENCE_LEN = 8  # 7 input + 1 target
 
-# New ETH Bot Config
-ETH_URL = "https://web-production-73e1d.up.railway.app/"
-ETH_STATE_FILE = "eth_state.json"          # Local fallback
-ETH_HISTORY_FILE = "eth_history.csv"       # Local fallback
+# List of assets based on your request
+ASSETS = [
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", 
+    "ADAUSDT", "BCHUSDT", "LINKUSDT", "XLMUSDT", "SUIUSDT", 
+    "AVAXUSDT", "LTCUSDT", "HBARUSDT", "SHIBUSDT", "TONUSDT"
+]
 
-# GitHub Configuration
-GITHUB_REPO = "constantinbender51-cmyk/Models"
-GITHUB_BRANCH = "main"
-GITHUB_TOKEN = os.environ.get("PAT")
+app = Flask(__name__)
 
-# Remote Paths (Where files live on GitHub)
-GITHUB_PATH_HISTORY_MAIN = "data/logs/trade_history.csv"
-GITHUB_PATH_HISTORY_ETH = "data/logs/eth_history.csv"
-GITHUB_PATH_STATE_MAIN = "data/states/active_trades.json"
-GITHUB_PATH_STATE_ETH = "data/states/eth_state.json"
+# --- Global State ---
+# All state is now dictionaries keyed by Symbol
+models = {} # Stores { "BTCUSDT": { sequences, min, max, bin_size, ready } }
+cached_dfs = {}
+live_outcomes = [] # Global list of all finished trades
+current_predictions = {} # { "BTCUSDT": prediction_obj, ... }
 
-# Timeframe mapping
-TIMEFRAMES = {
-    0: {"label": "15m", "minutes": 15},
-    1: {"label": "30m", "minutes": 30},
-    2: {"label": "1h",  "minutes": 60},
-    3: {"label": "4h",  "minutes": 240},
-    4: {"label": "1d",  "minutes": 1440}
+system_status = {
+    "loading": True,
+    "last_check_time": "Never",
+    "next_check_time": "Calculating...",
+    "errors": []
 }
 
-# --- GitHub Helpers ---
+# --- Data Management ---
 
-def get_github_file(remote_path):
-    """
-    Fetches file content and SHA from GitHub.
-    Returns: (content_string, sha_string) or (None, None) if not found.
-    """
-    if not GITHUB_TOKEN:
-        print("[ERROR] GitHub 'PAT' environment variable not found.")
-        return None, None
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{remote_path}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    try:
-        r = requests.get(url, headers=headers, params={"ref": GITHUB_BRANCH})
-        if r.status_code == 200:
-            data = r.json()
-            content = base64.b64decode(data['content']).decode('utf-8')
-            return content, data['sha']
-        elif r.status_code == 404:
-            return None, None
-        else:
-            print(f"[GITHUB] Fetch failed for {remote_path}: {r.status_code}")
-    except Exception as e:
-        print(f"[GITHUB] Exception fetching {remote_path}: {e}")
-    return None, None
-
-def update_github_file(remote_path, content, message, sha=None):
-    """
-    Creates or updates a file on GitHub.
-    """
-    if not GITHUB_TOKEN:
-        return
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{remote_path}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+def download_binance_history(symbol):
+    print(f"[{symbol}] Downloading historical data (2020-2026)...")
     
-    encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+    start_ts = int(datetime.datetime(2020, 1, 1).timestamp() * 1000)
+    end_ts = int(datetime.datetime(2026, 1, 1).timestamp() * 1000)
     
-    payload = {
-        "message": message,
-        "content": encoded_content,
-        "branch": GITHUB_BRANCH
-    }
-    if sha:
-        payload["sha"] = sha
-
-    try:
-        r = requests.put(url, headers=headers, json=payload)
-        if r.status_code in [200, 201]:
-            print(f"[GITHUB] Successfully saved to {remote_path}")
-        else:
-            print(f"[GITHUB] Save failed {remote_path}: {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"[GITHUB] Exception saving {remote_path}: {e}")
-
-def append_to_github_csv(remote_path, row_data, header):
-    """
-    Downloads existing CSV, appends row, and re-uploads.
-    Prevents history overwrite.
-    """
-    print(f"[LOGGING] Updating history at {remote_path}...")
-    existing_content, sha = get_github_file(remote_path)
+    all_candles = []
+    current_ts = start_ts
     
-    output = io.StringIO()
-    writer = csv.writer(output)
-    
-    # If file is new, add headers
-    if not existing_content:
-        writer.writerow(header)
-        existing_content = ""
-    
-    writer.writerow(row_data)
-    new_csv_chunk = output.getvalue()
-    
-    # Ensure clean newline handling
-    final_content = existing_content
-    if final_content and not final_content.endswith('\n'):
-        final_content += '\n'
-    final_content += new_csv_chunk
-    
-    update_github_file(
-        remote_path, 
-        final_content, 
-        f"Log trade {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
-        sha
-    )
-
-def save_json_state_to_github(remote_path, state_data):
-    """Saves state JSON to GitHub to persist across restarts."""
-    _, sha = get_github_file(remote_path)
-    json_str = json.dumps(state_data, indent=4)
-    update_github_file(
-        remote_path, 
-        json_str, 
-        f"Update state {datetime.now().strftime('%H:%M')}", 
-        sha
-    )
-
-def load_json_state_from_github(remote_path, default_val):
-    """Loads state JSON from GitHub."""
-    content, _ = get_github_file(remote_path)
-    if content:
+    while current_ts < end_ts:
         try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            print(f"[WARN] Corrupt JSON in {remote_path}, using default.")
-    return default_val
-
-# --- Market Data Helpers ---
-
-def get_binance_price(symbol, timestamp_ms=None):
-    """
-    Fetches price from Binance. 
-    """
-    url = "https://api.binance.com/api/v3/klines"
-    if timestamp_ms is None:
-        try:
-            r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
+            params = {
+                'symbol': symbol,
+                'interval': '15m',
+                'limit': 1000,
+                'startTime': current_ts,
+                'endTime': end_ts
+            }
+            r = requests.get(BINANCE_URL, params=params)
             r.raise_for_status()
-            return float(r.json()["price"])
-        except:
-            return None
-
-    # Historical
-    params = {
-        "symbol": symbol,
-        "interval": "1m",
-        "startTime": timestamp_ms,
-        "limit": 1
-    }
-    try:
-        r = requests.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        if data:
-            return float(data[0][1]) # Open price of that minute
-    except Exception as e:
-        print(f"[ERROR] Binance fetch failed for {symbol}: {e}")
-    return None
-
-# --- Main Bot Functions ---
-
-def load_active_trades():
-    # Try GitHub first for persistence
-    print("[INIT] Loading Main Bot state...")
-    return load_json_state_from_github(GITHUB_PATH_STATE_MAIN, [])
-
-def save_active_trades(trades):
-    # Save to GitHub for persistence
-    save_json_state_to_github(GITHUB_PATH_STATE_MAIN, trades)
-
-def process_expiries():
-    active_trades = load_active_trades()
-    if not active_trades: 
-        return
-
-    remaining_trades = []
-    current_ms = int(time.time() * 1000)
-    buffer_ms = 10000 
-    changed = False
-
-    for trade in active_trades:
-        if current_ms > (trade['end_ts'] + buffer_ms):
-            print(f"[EXPIRY] Processing {trade['symbol']} {trade['timeframe']}")
+            data = r.json()
             
-            # Fetch prices
-            open_price = get_binance_price(trade['symbol'], trade['start_ts'])
-            close_price = get_binance_price(trade['symbol'], current_ms)
+            if not data:
+                break
+                
+            all_candles.extend(data)
+            last_close_time = data[-1][6]
+            current_ts = last_close_time + 1
             
-            if open_price is not None and close_price is not None:
-                # Calculate PnL
-                trade['open_price'] = open_price
-                trade['close_price'] = close_price
-                
-                pnl_val = (close_price - open_price) / open_price
-                if trade['signal'] < 0:
-                    pnl_val = pnl_val * -1
-                
-                # Log to GitHub
-                row_data = [
-                    trade['symbol'],
-                    trade['timeframe'],
-                    trade['signal'],
-                    datetime.fromtimestamp(trade['start_ts'] / 1000, timezone.utc).isoformat(),
-                    datetime.fromtimestamp(trade['end_ts'] / 1000, timezone.utc).isoformat(),
-                    trade['open_price'],
-                    trade['close_price'],
-                    round(pnl_val, 8),
-                    f"{round(pnl_val * 100, 4)}%"
-                ]
-                headers = ["Symbol", "Timeframe", "Direction", "OpenTime", "CloseTime", "OpenPrice", "ClosePrice", "PnL", "PnL_Percent"]
-                
-                append_to_github_csv(GITHUB_PATH_HISTORY_MAIN, row_data, headers)
-                print(f"[HISTORY] Saved {trade['symbol']} {trade['timeframe']} | PnL: {round(pnl_val*100, 4)}%")
-                
-                changed = True
-            else:
-                print(f"[WARN] No data for {trade['symbol']}, keeping active.")
-                remaining_trades.append(trade)
-        else:
-            remaining_trades.append(trade)
+            # Avoid rate limits
+            time.sleep(0.05) 
             
-    if changed:
-        save_active_trades(remaining_trades)
-
-def fetch_signals():
-    print(f"[FETCH] Main Signals at {datetime.now().strftime('%H:%M:%S')}")
-    try:
-        r = requests.get(PREDICTION_URL)
-        r.raise_for_status()
-        data = r.json()
-        
-        active_trades = load_active_trades()
-        current_dt = datetime.now(timezone.utc)
-        new_trades_count = 0
-
-        def get_candle_times(curr_dt, mins):
-            total = curr_dt.hour * 60 + curr_dt.minute
-            rem = total % mins
-            s_dt = curr_dt - timedelta(minutes=rem, seconds=curr_dt.second, microseconds=curr_dt.microsecond)
-            e_dt = s_dt + timedelta(minutes=mins)
-            return int(s_dt.timestamp() * 1000), int(e_dt.timestamp() * 1000)
-
-        for symbol, info in data.items():
-            comp = info.get('comp', [])
-            for idx, signal in enumerate(comp):
-                if signal != 0:
-                    tf_info = TIMEFRAMES[idx]
-                    start_ms, end_ms = get_candle_times(current_dt, tf_info['minutes'])
-                    trade_id = f"{symbol}_{tf_info['label']}_{start_ms}"
-                    
-                    if any(t['id'] == trade_id for t in active_trades):
-                        continue
-                        
-                    print(f"[SIGNAL] Found {symbol} {tf_info['label']} ({signal})")
-                    active_trades.append({
-                        "id": trade_id,
-                        "symbol": symbol,
-                        "signal": signal,
-                        "timeframe": tf_info['label'],
-                        "start_ts": start_ms,
-                        "end_ts": end_ms
-                    })
-                    new_trades_count += 1
-        
-        if new_trades_count > 0:
-            save_active_trades(active_trades)
-            print(f"[UPDATE] Added {new_trades_count} new main trades.")
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch predictions: {e}")
-
-# --- New ETH Bot Functions ---
-
-def load_eth_state():
-    print("[INIT] Loading ETH Bot state...")
-    default_state = {
-        "last_net_sum": None,
-        "wins": 0,
-        "losses": 0,
-        "active_trades": []
-    }
-    return load_json_state_from_github(GITHUB_PATH_STATE_ETH, default_state)
-
-def save_eth_state(state):
-    save_json_state_to_github(GITHUB_PATH_STATE_ETH, state)
-
-def run_eth_cycle():
-    print(f"[ETH] Running cycle at {datetime.now().strftime('%H:%M:%S')}")
-    state = load_eth_state()
-    active_trades = state.get("active_trades", [])
+        except Exception as e:
+            print(f"[{symbol}] Error downloading chunk: {e}")
+            time.sleep(2)
+            
+    print(f"[{symbol}] Download complete. Total candles: {len(all_candles)}")
     
-    # 1. Process Expiries
-    now = datetime.now(timezone.utc)
-    remaining_trades = []
-    state_changed = False
-    
-    for trade in active_trades:
-        trade_start_dt = datetime.fromisoformat(trade['start_time'])
-        if trade_start_dt.tzinfo is None:
-            trade_start_dt = trade_start_dt.replace(tzinfo=timezone.utc)
-            
-        expiry_dt = trade_start_dt + timedelta(hours=24)
+    parsed_data = []
+    for c in all_candles:
+        parsed_data.append({
+            "timestamp": c[0],
+            "close": float(c[4])
+        })
         
-        if now >= expiry_dt:
-            print(f"[ETH] Closing trade from {trade['start_time']}")
-            close_price = get_binance_price("ETHUSDT", int(expiry_dt.timestamp() * 1000))
-            
-            if close_price and trade['open_price']:
-                pnl = (close_price - trade['open_price']) / trade['open_price']
-                if trade['direction'] == -1:
-                    pnl = -pnl
-                
-                is_noise = abs(pnl) < 0.01
-                res = "NOISE"
-                if not is_noise:
-                    if pnl > 0:
-                        state['wins'] += 1
-                        res = "WIN"
-                    else:
-                        state['losses'] += 1
-                        res = "LOSS"
+    df = pd.DataFrame(parsed_data)
+    return df
 
-                # Log to GitHub
-                row_data = [
-                    "ETHUSDT", 
-                    trade['direction'], 
-                    trade['start_time'], 
-                    expiry_dt.isoformat(),
-                    trade['open_price'], 
-                    close_price, 
-                    round(pnl, 5), 
-                    res
-                ]
-                headers = ["Symbol", "Direction", "OpenTime", "CloseTime", "OpenPrice", "ClosePrice", "PnL", "Result"]
-                
-                append_to_github_csv(GITHUB_PATH_HISTORY_ETH, row_data, headers)
-                print(f"[ETH] Result: {res} | PnL: {round(pnl*100, 2)}%")
-                state_changed = True
-            else:
-                print("[ETH] Failed to fetch close price, retrying later.")
-                remaining_trades.append(trade)
-        else:
-            remaining_trades.append(trade)
-    
-    if len(active_trades) != len(remaining_trades):
-        state['active_trades'] = remaining_trades
-        state_changed = True
+def fetch_data(symbol):
+    global cached_dfs
+    if symbol in cached_dfs: return cached_dfs[symbol]
 
-    # 2. Fetch New Signal
-    try:
-        r = requests.get(ETH_URL)
-        r.raise_for_status()
-        data = r.json()
+    if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
+    
+    file_path = os.path.join(DATA_DIR, f"{symbol.lower()}_15m.csv")
         
-        current_net_sum = data.get("netSum")
-        last_update_str = data.get("lastUpdate")
-        
+    if os.path.exists(file_path):
+        print(f"[{symbol}] Loading data from file...")
         try:
-            update_dt = datetime.strptime(last_update_str, "%Y-%m-%d %H:%M:%S.%f")
-        except ValueError:
-            update_dt = datetime.strptime(last_update_str, "%Y-%m-%d %H:%M:%S")
-        update_dt = update_dt.replace(tzinfo=timezone.utc)
+            df = pd.read_csv(file_path)
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            cached_dfs[symbol] = df 
+            return df
+        except Exception as e:
+            print(f"[{symbol}] Error reading file: {e}. Redownloading...")
+    
+    df = download_binance_history(symbol)
+    if not df.empty:
+        print(f"[{symbol}] Saving data to file...")
+        df.to_csv(file_path, index=False)
+        cached_dfs[symbol] = df 
+    return df
 
-        prev_net_sum = state.get("last_net_sum")
-        
-        if prev_net_sum is not None and prev_net_sum != current_net_sum:
-            diff = current_net_sum - prev_net_sum
-            direction = 0
-            if diff > 0: direction = 1
-            elif diff < 0: direction = -1
+def get_bin(price, min_p, bin_size):
+    if bin_size == 0: return 0
+    b = int((price - min_p) / bin_size)
+    # Clamp bin to 0-(SECTIONS-1) to handle new highs/lows outside historic range
+    return max(0, min(b, SECTIONS - 1))
+
+def build_models_worker():
+    global models, system_status
+    try:
+        for symbol in ASSETS:
+            df = fetch_data(symbol)
+            if df.empty:
+                print(f"[{symbol}] No data found. Skipping.")
+                continue
+
+            print(f"[{symbol}] Building model...")
+            min_price = df['close'].min()
+            max_price = df['close'].max()
             
-            if direction != 0:
-                open_price = get_binance_price("ETHUSDT", int(update_dt.timestamp() * 1000))
+            # Dynamic price range logic (Removed hardcoded clamps for BTC)
+            price_range = max_price - min_price
+            if price_range == 0: price_range = min_price * 0.01 # Fallback
+            bin_size = price_range / SECTIONS
+
+            df['section'] = df['close'].apply(lambda x: get_bin(x, min_price, bin_size))
+            sections = df['section'].values
+            
+            sequences = defaultdict(Counter)
+            for i in range(len(sections) - SEQUENCE_LEN + 1):
+                seq = tuple(sections[i : i + SEQUENCE_LEN])
+                input_seq = seq[:-1]
+                target = seq[-1]
+                sequences[input_seq][target] += 1
                 
-                if open_price:
-                    new_trade = {
-                        "direction": direction,
-                        "open_price": open_price,
-                        "start_time": update_dt.isoformat(),
-                        "net_sum_diff": diff
-                    }
-                    state['active_trades'].append(new_trade)
-                    if len(state['active_trades']) > 1440:
-                        state['active_trades'].pop(0)
-                        
-                    print(f"[ETH] New Trade: Dir {direction} @ {open_price}")
-                    state_changed = True
-        
-        if state['last_net_sum'] != current_net_sum:
-            state['last_net_sum'] = current_net_sum
-            state_changed = True
+            models[symbol] = {
+                "sequences": sequences,
+                "min_price": min_price,
+                "max_price": max_price,
+                "bin_size": bin_size,
+                "ready": True,
+                "last_price": df['close'].iloc[-1]
+            }
+            print(f"[{symbol}] Model ready. Range: {min_price:.4f}-{max_price:.4f}.")
             
     except Exception as e:
-        print(f"[ETH] Error fetching/processing: {e}")
+        print(f"Fatal error during initialization: {e}")
+        system_status["errors"].append(str(e))
+    finally:
+        system_status["loading"] = False
 
-    # 3. Print Accuracy & Save if changed
-    total = state['wins'] + state['losses']
-    acc = (state['wins'] / total) if total > 0 else 0.0
-    print(f"[ETH] Accuracy: {round(acc*100, 2)}% ({state['wins']}/{total})")
+def fetch_live_candles(symbol, limit=20):
+    try:
+        params = {'symbol': symbol, 'interval': '15m', 'limit': limit}
+        r = requests.get(BINANCE_URL, params=params)
+        r.raise_for_status()
+        data = r.json()
+        closes = []
+        for candle in data:
+            closes.append({
+                "timestamp": candle[0],
+                "close": float(candle[4])
+            })
+        return closes
+    except Exception as e:
+        print(f"[{symbol}] Fetch Error: {e}")
+        return []
+
+# --- Live Bot Loop ---
+
+def live_prediction_loop():
+    global current_predictions, live_outcomes, system_status
     
-    if state_changed:
-        save_eth_state(state)
+    while system_status["loading"]:
+        time.sleep(5)
 
-# --- Scheduler / Main ---
-
-def main():
-    print("--- Crypto Signal Bot (Dual Mode - GitHub Persisted) ---")
-    
-    # Timing state
-    last_eth_run_minute = -1
-    last_main_run_minute = -1
+    print("Multi-Asset Live prediction bot started.")
     
     while True:
-        now = datetime.now()
+        now = datetime.datetime.utcnow()
         
-        # --- Task 1: ETH Bot (Every minute at :30s) ---
-        if now.second == 30 and now.minute != last_eth_run_minute:
-            run_eth_cycle()
-            last_eth_run_minute = now.minute
+        # Calculate time to next 15m candle close
+        next_quarter = (now.minute // 15 + 1) * 15
+        next_hour = now.hour
+        if next_quarter >= 60:
+            next_quarter = 0
+            next_hour = (next_hour + 1) % 24
             
-        # --- Task 2: Main Bot (Minutes 6, 21, 36, 51 at :00s approx) ---
-        if now.minute in [6, 21, 36, 51] and now.minute != last_main_run_minute:
-            process_expiries()
-            fetch_signals()
-            last_main_run_minute = now.minute
-            
-        # --- Main Expiries Frequent Check (Every 5 mins) ---
-        if now.second == 10 and now.minute % 5 == 0: 
-             process_expiries()
+        target_time = now.replace(hour=next_hour, minute=next_quarter, second=5, microsecond=0)
+        seconds_to_wait = (target_time - now).total_seconds()
+        
+        if seconds_to_wait < 0: seconds_to_wait += 900
 
-        time.sleep(1)
+        system_status["last_check_time"] = now.strftime('%H:%M:%S UTC')
+        system_status["next_check_time"] = target_time.strftime('%H:%M:%S UTC')
+        
+        print(f"Waiting {seconds_to_wait:.1f}s until {system_status['next_check_time']}...")
+        time.sleep(seconds_to_wait)
+        
+        # --- EXECUTE FOR ALL ASSETS ---
+        print(f"Executing Live Logic for {len(ASSETS)} assets...")
+        
+        for symbol in ASSETS:
+            if symbol not in models or not models[symbol]["ready"]:
+                continue
+
+            # Fetch Data
+            candles = fetch_live_candles(symbol, limit=10)
+            if len(candles) < 8: continue
+            
+            last_closed_candle = candles[-2]
+            current_close = last_closed_candle['close']
+            models[symbol]["last_price"] = current_close # Update dashboard tracker
+            
+            m = models[symbol]
+
+            # 1. Resolve Previous Prediction for this Symbol
+            if symbol in current_predictions:
+                prev = current_predictions[symbol]
+                entry_price = prev['entry_price']
+                direction = prev['direction']
+                
+                pnl_percent = 0.0
+                if direction == "UP":
+                    pnl_percent = ((current_close - entry_price) / entry_price) * 100
+                elif direction == "DOWN":
+                    pnl_percent = ((entry_price - current_close) / entry_price) * 100
+                    
+                outcome = {
+                    "symbol": symbol,
+                    "timestamp": last_closed_candle['timestamp'],
+                    "entry_price": entry_price,
+                    "exit_price": current_close,
+                    "direction": direction,
+                    "pnl_percent": round(pnl_percent, 4),
+                    "inputs": prev['inputs']
+                }
+                live_outcomes.append(outcome)
+                del current_predictions[symbol]
+
+            # 2. Make New Prediction
+            input_objs = candles[-8:-1] 
+            input_prices = [c['close'] for c in input_objs]
+            input_sections = tuple([get_bin(p, m['min_price'], m['bin_size']) for p in input_prices])
+            current_section = input_sections[-1]
+            
+            if input_sections in m['sequences']:
+                predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+                
+                direction = "FLAT"
+                if predicted_section > current_section:
+                    direction = "UP"
+                elif predicted_section < current_section:
+                    direction = "DOWN"
+                
+                if direction != "FLAT":
+                    current_predictions[symbol] = {
+                        "symbol": symbol,
+                        "timestamp": datetime.datetime.utcnow().timestamp() * 1000,
+                        "entry_price": input_prices[-1],
+                        "current_section": current_section,
+                        "predicted_section": predicted_section,
+                        "direction": direction,
+                        "inputs": {
+                            "prices": input_prices,
+                            "sections": list(input_sections)
+                        }
+                    }
+            
+            # Small delay to be polite to Binance API
+            time.sleep(0.1)
+
+# --- Threads ---
+init_thread = threading.Thread(target=build_models_worker, daemon=True)
+init_thread.start()
+
+live_thread = threading.Thread(target=live_prediction_loop, daemon=True)
+live_thread.start()
+
+# --- Backtesting Logic ---
+
+def run_backtest(symbol):
+    if symbol not in models: return [], 0, 0
+    
+    df = fetch_data(symbol)
+    if df.empty: return [], 0, 0
+
+    m = models[symbol]
+    sequences = m["sequences"]
+    
+    df_calc = df.copy() 
+    df_calc['section'] = df_calc['close'].apply(lambda x: get_bin(x, m["min_price"], m["bin_size"]))
+    
+    split_idx = int(len(df_calc) * 0.85) # Reduced backtest size for speed
+    test_df = df_calc.iloc[split_idx:].copy()
+    
+    results = []
+    total_pnl = 0.0
+    correct_dir = 0
+    total_preds = 0
+    
+    test_closes = test_df['close'].values
+    test_sections = test_df['section'].values
+    test_timestamps = test_df['timestamp'].values
+    
+    for i in range(len(test_sections) - SEQUENCE_LEN + 1):
+        input_seq = tuple(int(x) for x in test_sections[i : i + SEQUENCE_LEN - 1])
+        actual_next_sec = int(test_sections[i + SEQUENCE_LEN - 1])
+        actual_price = test_closes[i + SEQUENCE_LEN - 1]
+        
+        current_price = test_closes[i + SEQUENCE_LEN - 2]
+        current_sec = input_seq[-1]
+        
+        if input_seq in sequences:
+            pred_next_sec = int(sequences[input_seq].most_common(1)[0][0])
+            if pred_next_sec == current_sec: continue 
+
+            total_preds += 1
+            direction = "UP" if pred_next_sec > current_sec else "DOWN"
+            
+            trade_pnl_pct = 0.0
+            is_correct = False
+            
+            if direction == "UP":
+                trade_pnl_pct = (actual_price - current_price) / current_price * 100
+                if actual_next_sec > current_sec: is_correct = True
+            else:
+                trade_pnl_pct = (current_price - actual_price) / current_price * 100
+                if actual_next_sec < current_sec: is_correct = True
+            
+            if is_correct: correct_dir += 1
+            total_pnl += trade_pnl_pct
+            
+            results.append({
+                "timestamp": test_timestamps[i + SEQUENCE_LEN - 1],
+                "pnl": trade_pnl_pct
+            })
+            
+    acc = (correct_dir / total_preds * 100) if total_preds else 0
+    return results, total_pnl, acc
+
+# --- Routes ---
+
+@app.route('/api/status')
+def api_status():
+    return jsonify(system_status)
+
+@app.route('/')
+def dashboard():
+    if system_status["loading"]:
+        return "<h1>System Initializing...</h1><p>Downloading and processing data for 15 assets. Please refresh in 30 seconds.</p>"
+
+    # 1. Gather Portfolio Stats
+    portfolio_summary = []
+    total_backtest_trades = 0
+    
+    for symbol in ASSETS:
+        res, pnl, acc = run_backtest(symbol)
+        total_backtest_trades += len(res)
+        
+        # Active Prediction
+        active = current_predictions.get(symbol, None)
+        active_dir = active['direction'] if active else "-"
+        
+        portfolio_summary.append({
+            "symbol": symbol,
+            "last_price": models[symbol].get("last_price", 0),
+            "backtest_pnl": round(pnl, 2),
+            "backtest_acc": round(acc, 2),
+            "trades": len(res),
+            "active_pred": active_dir,
+            "active_entry": active['entry_price'] if active else ""
+        })
+
+    now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Multi-Asset Sequence Predictor</title>
+        <meta http-equiv="refresh" content="30">
+        <style>
+            body { font-family: 'Segoe UI', monospace; padding: 20px; background: #f4f4f9; color: #333; }
+            h2, h3 { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-top: 30px;}
+            .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            table { border-collapse: collapse; width: 100%; font-size: 13px; margin-bottom: 20px; }
+            th, td { border: 1px solid #eee; padding: 8px; text-align: left; }
+            th { background-color: #f8f9fa; font-weight: 600; }
+            .up { color: #27ae60; font-weight: bold; }
+            .down { color: #c0392b; font-weight: bold; }
+            .symbol { font-weight: bold; color: #2c3e50; }
+            
+            .header-stats { display: flex; gap: 20px; margin-bottom: 20px; background: #e8f5e9; padding: 15px; border-radius: 5px;}
+            .stat-box { flex: 1; }
+            .stat-label { font-size: 11px; text-transform: uppercase; color: #555; }
+            .stat-val { font-size: 16px; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Crypto Sequence Predictor (15 Assets)</h1>
+            
+            <div class="header-stats">
+                <div class="stat-box">
+                    <div class="stat-label">Server Time (UTC)</div>
+                    <div class="stat-val">{{ now_utc }}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Next Prediction Cycle</div>
+                    <div class="stat-val">{{ status.next_check_time }}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Total Backtest Trades</div>
+                    <div class="stat-val">{{ total_bt_trades }}</div>
+                </div>
+            </div>
+
+            <h3>Asset Overview & Performance</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Asset</th>
+                        <th>Current Price</th>
+                        <th>Active Signal</th>
+                        <th>Entry Price</th>
+                        <th>Backtest Acc %</th>
+                        <th>Backtest PnL %</th>
+                        <th>Total BT Trades</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in summary %}
+                    <tr>
+                        <td class="symbol">{{ row.symbol }}</td>
+                        <td>{{ row.last_price }}</td>
+                        <td class="{{ 'up' if row.active_pred == 'UP' else 'down' if row.active_pred == 'DOWN' else '' }}">
+                            {{ row.active_pred }}
+                        </td>
+                        <td>{{ row.active_entry }}</td>
+                        <td>{{ row.backtest_acc }}%</td>
+                        <td class="{{ 'up' if row.backtest_pnl > 0 else 'down' }}">{{ row.backtest_pnl }}%</td>
+                        <td>{{ row.trades }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            <h3>Live Trade Log (All Assets)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time (UTC)</th>
+                        <th>Symbol</th>
+                        <th>Direction</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>PnL %</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in outcomes|reverse %}
+                    <tr>
+                        <td>{{ row.timestamp | datetime }}</td>
+                        <td class="symbol">{{ row.symbol }}</td>
+                        <td class="{{ 'up' if row.direction == 'UP' else 'down' }}">{{ row.direction }}</td>
+                        <td>{{ row.entry_price }}</td>
+                        <td>{{ row.exit_price }}</td>
+                        <td class="{{ 'up' if row.pnl_percent > 0 else 'down' }}">
+                            {{ row.pnl_percent }}%
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="6">No live trades recorded yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    
+    app.jinja_env.filters['datetime'] = lambda x: datetime.datetime.fromtimestamp(x/1000).strftime('%Y-%m-%d %H:%M:%S') if isinstance(x, (int, float)) else x
+
+    return render_template_string(html, 
+                                  status=system_status,
+                                  summary=portfolio_summary,
+                                  total_bt_trades=total_backtest_trades,
+                                  outcomes=live_outcomes,
+                                  now_utc=now_utc)
 
 if __name__ == "__main__":
-    main()
+    print(f"Starting Multi-Asset Server on port {PORT}...")
+    app.run(host='0.0.0.0', port=PORT)
