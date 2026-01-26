@@ -48,14 +48,21 @@ ASSET_CONFIG = {
 app = Flask(__name__)
 
 # --- Global State ---
-models = {} # Stores { "BTCUSDT": { sequences, min, max, bin_size, ready } }
+models = {} 
 cached_dfs = {}
 live_outcomes = [] 
 current_predictions = {} 
 
-# Stores pre-calculated backtest results for dashboard display
 portfolio_stats = [] 
 total_backtest_trades = 0
+
+# New Global Stats Container
+live_performance = {
+    "total_pnl": 0.0,
+    "correct_count": 0,
+    "total_count": 0,
+    "accuracy": 0.0
+}
 
 system_status = {
     "loading": True,
@@ -144,9 +151,6 @@ def get_bin(price, min_p, bin_size):
     return max(0, min(b, SECTIONS - 1))
 
 def calculate_backtest(df, sequences, min_p, bin_size):
-    """
-    Run backtest on a specific dataframe slice using provided sequences
-    """
     results = []
     total_pnl = 0.0
     correct_dir = 0
@@ -167,7 +171,6 @@ def calculate_backtest(df, sequences, min_p, bin_size):
         if input_seq in sequences:
             pred_next_sec = int(sequences[input_seq].most_common(1)[0][0])
             
-            # --- IGNORE FLAT OUTCOMES & PREDICTIONS ---
             if pred_next_sec == current_sec: continue 
             if actual_next_sec == current_sec: continue 
 
@@ -187,7 +190,6 @@ def calculate_backtest(df, sequences, min_p, bin_size):
             if is_correct: correct_dir += 1
             total_pnl += trade_pnl_pct
             
-            # Capture inputs used for this prediction
             input_prices = test_closes[i : i + SEQUENCE_LEN - 1]
 
             results.append({
@@ -215,28 +217,21 @@ def build_models_worker():
 
             print(f"[{symbol}] Building model...")
             
-            # 1. Apply Hardcoded Clamps
             raw_min = df['close'].min()
             raw_max = df['close'].max()
             
             config = ASSET_CONFIG.get(symbol, {"min": raw_min, "max": raw_max})
-            min_price = max(raw_min, config["min"]) # Ensure we cover data if config is too tight, or use config
             min_price = config["min"]
             max_price = config["max"]
             
-            # Check for data outliers outside config, or just clamp them in get_bin
-            price_range = max_price - min_price
-            bin_size = price_range / SECTIONS
+            bin_size = (max_price - min_price) / SECTIONS
 
-            # Apply binning to whole dataset
             df['section'] = df['close'].apply(lambda x: get_bin(x, min_price, bin_size))
             
-            # 2. Split Data 70/30
             split_idx = int(len(df) * 0.950)
             train_df = df.iloc[:split_idx].copy()
             test_df = df.iloc[split_idx:].copy()
 
-            # 3. Build Model Sequences ONLY on Training Data
             train_sections = train_df['section'].values
             sequences = defaultdict(Counter)
             for i in range(len(train_sections) - SEQUENCE_LEN + 1):
@@ -255,7 +250,6 @@ def build_models_worker():
             }
             print(f"[{symbol}] Model ready. Range: {min_price:.4f}-{max_price:.4f}.")
             
-            # 4. Run Backtest immediately on Test Data (30%)
             print(f"[{symbol}] Running backtest on {len(test_df)} candles...")
             res, pnl, acc = calculate_backtest(test_df, sequences, min_price, bin_size)
             
@@ -270,7 +264,6 @@ def build_models_worker():
                 "last_bt_trade": last_bt_trade
             })
 
-        # Update global cache
         portfolio_stats = temp_stats
         total_backtest_trades = temp_total_trades
             
@@ -300,7 +293,7 @@ def fetch_live_candles(symbol, limit=20):
 # --- Live Bot Loop ---
 
 def live_prediction_loop():
-    global current_predictions, live_outcomes, system_status
+    global current_predictions, live_outcomes, system_status, live_performance
     
     while system_status["loading"]:
         time.sleep(5)
@@ -310,7 +303,6 @@ def live_prediction_loop():
     while True:
         now = datetime.datetime.utcnow()
         
-        # Calculate time to next 15m candle close
         next_quarter = (now.minute // 15 + 1) * 15
         next_hour = now.hour
         if next_quarter >= 60:
@@ -328,24 +320,22 @@ def live_prediction_loop():
         print(f"Waiting {seconds_to_wait:.1f}s until {system_status['next_check_time']}...")
         time.sleep(seconds_to_wait)
         
-        # --- EXECUTE FOR ALL ASSETS ---
         print(f"Executing Live Logic for {len(ASSETS)} assets...")
         
         for symbol in ASSETS:
             if symbol not in models or not models[symbol]["ready"]:
                 continue
 
-            # Fetch Data
             candles = fetch_live_candles(symbol, limit=10)
             if len(candles) < 8: continue
             
             last_closed_candle = candles[-2]
             current_close = last_closed_candle['close']
-            models[symbol]["last_price"] = current_close # Update dashboard tracker
+            models[symbol]["last_price"] = current_close 
             
             m = models[symbol]
 
-            # 1. Resolve Previous Prediction for this Symbol
+            # 1. Resolve Previous Prediction
             if symbol in current_predictions:
                 prev = current_predictions[symbol]
                 entry_price = prev['entry_price']
@@ -356,7 +346,23 @@ def live_prediction_loop():
                     pnl_percent = ((current_close - entry_price) / entry_price) * 100
                 elif direction == "DOWN":
                     pnl_percent = ((entry_price - current_close) / entry_price) * 100
-                    
+                
+                # Determine Outcome Type
+                outcome_type = "INCONSEQUENTIAL"
+                if pnl_percent > 0:
+                    outcome_type = "CORRECT"
+                elif pnl_percent < 0:
+                    outcome_type = "INCORRECT"
+                
+                # Update Global Performance Stats
+                live_performance["total_pnl"] += pnl_percent
+                live_performance["total_count"] += 1
+                if outcome_type == "CORRECT":
+                    live_performance["correct_count"] += 1
+                
+                if live_performance["total_count"] > 0:
+                    live_performance["accuracy"] = (live_performance["correct_count"] / live_performance["total_count"]) * 100
+
                 outcome = {
                     "symbol": symbol,
                     "timestamp": last_closed_candle['timestamp'],
@@ -364,7 +370,8 @@ def live_prediction_loop():
                     "exit_price": current_close,
                     "direction": direction,
                     "pnl_percent": round(pnl_percent, 4),
-                    "inputs": prev['inputs']
+                    "inputs": prev['inputs']['prices'],  # Add Input Prices
+                    "outcome": outcome_type             # Add Outcome
                 }
                 live_outcomes.append(outcome)
                 del current_predictions[symbol]
@@ -376,7 +383,9 @@ def live_prediction_loop():
             current_section = input_sections[-1]
             
             if input_sections in m['sequences']:
-                predicted_section = m['sequences'][input_sections].most_common(1)[0][0]
+                # FIX: Explicit cast to python int for JSON serialization
+                raw_pred = m['sequences'][input_sections].most_common(1)[0][0]
+                predicted_section = int(raw_pred)
                 
                 direction = "FLAT"
                 if predicted_section > current_section:
@@ -389,7 +398,7 @@ def live_prediction_loop():
                         "symbol": symbol,
                         "timestamp": datetime.datetime.utcnow().timestamp() * 1000,
                         "entry_price": input_prices[-1],
-                        "current_section": current_section,
+                        "current_section": int(current_section),
                         "predicted_section": predicted_section,
                         "direction": direction,
                         "inputs": {
@@ -408,7 +417,6 @@ live_thread = threading.Thread(target=live_prediction_loop, daemon=True)
 live_thread.start()
 
 # --- Routes ---
-# --- Routes ---
 
 @app.route('/api/status')
 def api_status():
@@ -416,7 +424,6 @@ def api_status():
 
 @app.route('/api/signals')
 def api_signals():
-    """Returns the currently active live predictions."""
     return jsonify(current_predictions.copy())
 
 @app.route('/')
@@ -424,7 +431,6 @@ def dashboard():
     if system_status["loading"]:
         return "<h1>System Initializing...</h1><p>Downloading and processing data for 15 assets. Please refresh in 30 seconds.</p>"
 
-    # Merge cached portfolio stats with current active prediction info
     display_summary = []
     
     for stat in portfolio_stats:
@@ -442,6 +448,30 @@ def dashboard():
             "active_entry": active['entry_price'] if active else "",
             "last_bt_trade": stat.get('last_bt_trade')
         })
+
+    # Generate Performance Plot
+    plot_url = ""
+    if live_outcomes:
+        try:
+            # Create a cumulative PnL series
+            dates = [datetime.datetime.fromtimestamp(x['timestamp']/1000) for x in live_outcomes]
+            pnls = [x['pnl_percent'] for x in live_outcomes]
+            cum_pnl = np.cumsum(pnls)
+
+            plt.figure(figsize=(10, 4))
+            plt.plot(dates, cum_pnl, marker='o', linestyle='-', color='#2980b9')
+            plt.title('Live Cumulative PnL (%)')
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            img = io.BytesIO()
+            plt.savefig(img, format='png')
+            img.seek(0)
+            plot_url = base64.b64encode(img.getvalue()).decode()
+            plt.close()
+        except Exception as e:
+            print(f"Plot error: {e}")
 
     now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     
@@ -464,9 +494,14 @@ def dashboard():
             .small-text { font-size: 10px; color: #666; font-family: monospace; display: block; margin-top: 4px; }
             
             .header-stats { display: flex; gap: 20px; margin-bottom: 20px; background: #e8f5e9; padding: 15px; border-radius: 5px;}
+            .live-stats { display: flex; gap: 20px; margin-bottom: 20px; background: #e3f2fd; padding: 15px; border-radius: 5px;}
             .stat-box { flex: 1; }
             .stat-label { font-size: 11px; text-transform: uppercase; color: #555; }
             .stat-val { font-size: 16px; font-weight: bold; }
+            
+            .outcome-CORRECT { background-color: #d4edda; color: #155724; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            .outcome-INCORRECT { background-color: #f8d7da; color: #721c24; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            .outcome-INCONSEQUENTIAL { background-color: #e2e3e5; color: #383d41; padding: 2px 6px; border-radius: 4px; }
         </style>
     </head>
     <body>
@@ -487,6 +522,28 @@ def dashboard():
                     <div class="stat-val">{{ total_bt_trades }}</div>
                 </div>
             </div>
+
+            <h3>Live Performance</h3>
+            <div class="live-stats">
+                <div class="stat-box">
+                    <div class="stat-label">Live Total PnL</div>
+                    <div class="stat-val {{ 'up' if live_perf.total_pnl > 0 else 'down' }}">{{ "%.2f"|format(live_perf.total_pnl) }}%</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Live Accuracy</div>
+                    <div class="stat-val">{{ "%.2f"|format(live_perf.accuracy) }}%</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Total Live Trades</div>
+                    <div class="stat-val">{{ live_perf.total_count }}</div>
+                </div>
+            </div>
+            
+            {% if plot_url %}
+            <div style="margin-bottom: 30px; text-align: center;">
+                <img src="data:image/png;base64,{{ plot_url }}" style="max-width: 100%; border: 1px solid #eee;">
+            </div>
+            {% endif %}
 
             <h3>Asset Overview & Performance</h3>
             <table>
@@ -518,49 +575,17 @@ def dashboard():
                 </tbody>
             </table>
 
-            <h3>Last Backtest Signals (Diagnostics)</h3>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Time (UTC)</th>
-                        <th>Symbol</th>
-                        <th>Direction</th>
-                        <th>Entry Price</th>
-                        <th>PnL Outcome</th>
-                        <th>Input Sequence Prices (Last 7)</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for row in summary %}
-                        {% if row.last_bt_trade %}
-                        <tr>
-                            <td>{{ row.last_bt_trade.timestamp | datetime }}</td>
-                            <td class="symbol">{{ row.symbol }}</td>
-                            <td class="{{ 'up' if row.last_bt_trade.direction == 'UP' else 'down' }}">
-                                {{ row.last_bt_trade.direction }}
-                            </td>
-                            <td>{{ row.last_bt_trade.entry }}</td>
-                            <td class="{{ 'up' if row.last_bt_trade.pnl > 0 else 'down' }}">
-                                {{ "%.2f"|format(row.last_bt_trade.pnl) }}%
-                            </td>
-                            <td class="small-text" style="max-width: 400px; word-wrap: break-word;">
-                                {{ row.last_bt_trade.inputs | join(', ') }}
-                            </td>
-                        </tr>
-                        {% endif %}
-                    {% endfor %}
-                </tbody>
-            </table>
-
             <h3>Live Trade Log (All Assets)</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Time (UTC)</th>
                         <th>Symbol</th>
+                        <th>Input Prices</th>
                         <th>Direction</th>
                         <th>Entry</th>
                         <th>Exit</th>
+                        <th>Outcome</th>
                         <th>PnL %</th>
                     </tr>
                 </thead>
@@ -569,15 +594,17 @@ def dashboard():
                     <tr>
                         <td>{{ row.timestamp | datetime }}</td>
                         <td class="symbol">{{ row.symbol }}</td>
+                        <td class="small-text">{{ row.inputs | join(', ') }}</td>
                         <td class="{{ 'up' if row.direction == 'UP' else 'down' }}">{{ row.direction }}</td>
                         <td>{{ row.entry_price }}</td>
                         <td>{{ row.exit_price }}</td>
+                        <td><span class="outcome-{{ row.outcome }}">{{ row.outcome }}</span></td>
                         <td class="{{ 'up' if row.pnl_percent > 0 else 'down' }}">
                             {{ row.pnl_percent }}%
                         </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="6">No live trades recorded yet.</td></tr>
+                    <tr><td colspan="8">No live trades recorded yet.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
@@ -593,6 +620,8 @@ def dashboard():
                                   summary=display_summary,
                                   total_bt_trades=total_backtest_trades,
                                   outcomes=live_outcomes,
+                                  live_perf=live_performance,
+                                  plot_url=plot_url,
                                   now_utc=now_utc)
 
 if __name__ == "__main__":
