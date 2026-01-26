@@ -52,6 +52,7 @@ models = {} # Stores { "BTCUSDT": { sequences, min, max, bin_size, ready } }
 cached_dfs = {}
 live_outcomes = [] 
 current_predictions = {} 
+latest_inputs = {} # NEW: Stores the last 7 input prices for ALL assets
 
 # Stores pre-calculated backtest results for dashboard display
 portfolio_stats = []
@@ -366,7 +367,7 @@ def fetch_live_candles(symbol, limit=20):
 # --- Live Bot Loop ---
 
 def live_prediction_loop():
-    global current_predictions, live_outcomes, system_status
+    global current_predictions, live_outcomes, system_status, latest_inputs
     
     while system_status["loading"]:
         time.sleep(5)
@@ -410,6 +411,11 @@ def live_prediction_loop():
             last_closed_candle = candles[-2]
             current_close = last_closed_candle['close']
             models[symbol]["last_price"] = current_close # Update dashboard tracker
+            
+            # --- ALWAYS CAPTURE INPUTS ---
+            input_objs = candles[-8:-1] 
+            input_prices = [c['close'] for c in input_objs]
+            latest_inputs[symbol] = input_prices # Store regardless of prediction status
             
             # 1. Resolve Previous Prediction for this Symbol
             if symbol in current_predictions:
@@ -465,8 +471,6 @@ def live_prediction_loop():
                 del current_predictions[symbol]
 
             # 2. Make New Prediction
-            input_objs = candles[-8:-1] 
-            input_prices = [c['close'] for c in input_objs]
             input_sections = tuple([get_bin(p, m['min_price'], m['bin_size']) for p in input_prices])
             current_section = input_sections[-1]
             
@@ -577,8 +581,12 @@ def dashboard():
         active = current_predictions.get(symbol, None)
         active_dir = active['direction'] if active else "-"
         
-        # Get active inputs if available
-        active_inputs = active['inputs']['prices'] if active else []
+        # Get active inputs either from the prediction object or the general cache
+        active_inputs = []
+        if active:
+            active_inputs = active['inputs']['prices']
+        elif symbol in latest_inputs:
+            active_inputs = latest_inputs[symbol]
         
         display_summary.append({
             "symbol": symbol,
