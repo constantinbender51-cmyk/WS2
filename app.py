@@ -187,9 +187,15 @@ def calculate_backtest(df, sequences, min_p, bin_size):
             if is_correct: correct_dir += 1
             total_pnl += trade_pnl_pct
             
+            # Capture inputs used for this prediction
+            input_prices = test_closes[i : i + SEQUENCE_LEN - 1]
+
             results.append({
                 "timestamp": test_timestamps[i + SEQUENCE_LEN - 1],
-                "pnl": trade_pnl_pct
+                "pnl": trade_pnl_pct,
+                "direction": direction,
+                "entry": current_price,
+                "inputs": list(input_prices)
             })
             
     acc = (correct_dir / total_preds * 100) if total_preds else 0
@@ -253,12 +259,15 @@ def build_models_worker():
             print(f"[{symbol}] Running backtest on {len(test_df)} candles...")
             res, pnl, acc = calculate_backtest(test_df, sequences, min_price, bin_size)
             
+            last_bt_trade = res[-1] if len(res) > 0 else None
+            
             temp_total_trades += len(res)
             temp_stats.append({
                 "symbol": symbol,
                 "backtest_pnl": pnl,
                 "backtest_acc": acc,
-                "trades": len(res)
+                "trades": len(res),
+                "last_bt_trade": last_bt_trade
             })
 
         # Update global cache
@@ -424,7 +433,8 @@ def dashboard():
             "backtest_acc": round(stat['backtest_acc'], 2),
             "trades": stat['trades'],
             "active_pred": active_dir,
-            "active_entry": active['entry_price'] if active else ""
+            "active_entry": active['entry_price'] if active else "",
+            "last_bt_trade": stat.get('last_bt_trade')
         })
 
     now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -438,13 +448,14 @@ def dashboard():
         <style>
             body { font-family: 'Segoe UI', monospace; padding: 20px; background: #f4f4f9; color: #333; }
             h2, h3 { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-top: 30px;}
-            .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            .container { max-width: 1500px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
             table { border-collapse: collapse; width: 100%; font-size: 13px; margin-bottom: 20px; }
-            th, td { border: 1px solid #eee; padding: 8px; text-align: left; }
+            th, td { border: 1px solid #eee; padding: 8px; text-align: left; vertical-align: top; }
             th { background-color: #f8f9fa; font-weight: 600; }
             .up { color: #27ae60; font-weight: bold; }
             .down { color: #c0392b; font-weight: bold; }
             .symbol { font-weight: bold; color: #2c3e50; }
+            .small-text { font-size: 10px; color: #666; font-family: monospace; display: block; margin-top: 4px; }
             
             .header-stats { display: flex; gap: 20px; margin-bottom: 20px; background: #e8f5e9; padding: 15px; border-radius: 5px;}
             .stat-box { flex: 1; }
@@ -478,10 +489,11 @@ def dashboard():
                         <th>Asset</th>
                         <th>Current Price</th>
                         <th>Active Signal</th>
-                        <th>Entry Price</th>
+                        <th>Active Entry</th>
                         <th>Backtest Acc %</th>
                         <th>Backtest PnL %</th>
-                        <th>Total BT Trades</th>
+                        <th>BT Trades</th>
+                        <th style="width: 250px;">Last BT Trade (Inputs -> Entry -> PnL)</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -496,6 +508,24 @@ def dashboard():
                         <td>{{ row.backtest_acc }}%</td>
                         <td class="{{ 'up' if row.backtest_pnl > 0 else 'down' }}">{{ row.backtest_pnl }}%</td>
                         <td>{{ row.trades }}</td>
+                        <td>
+                            {% if row.last_bt_trade %}
+                                <div>
+                                    <span class="{{ 'up' if row.last_bt_trade.direction == 'UP' else 'down' }}">
+                                        {{ row.last_bt_trade.direction }}
+                                    </span>
+                                    @ {{ row.last_bt_trade.entry }}
+                                    <span class="{{ 'up' if row.last_bt_trade.pnl > 0 else 'down' }}" style="float: right;">
+                                        {{ "%.2f"|format(row.last_bt_trade.pnl) }}%
+                                    </span>
+                                </div>
+                                <div class="small-text">
+                                    Inputs: {{ row.last_bt_trade.inputs | join(', ') }}
+                                </div>
+                            {% else %}
+                                <span class="small-text">No trades in backtest period</span>
+                            {% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>
