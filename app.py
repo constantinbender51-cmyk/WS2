@@ -493,7 +493,6 @@ def dashboard():
                         <th>Backtest Acc %</th>
                         <th>Backtest PnL %</th>
                         <th>BT Trades</th>
-                        <th style="width: 250px;">Last BT Trade (Inputs -> Entry -> PnL)</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -508,25 +507,41 @@ def dashboard():
                         <td>{{ row.backtest_acc }}%</td>
                         <td class="{{ 'up' if row.backtest_pnl > 0 else 'down' }}">{{ row.backtest_pnl }}%</td>
                         <td>{{ row.trades }}</td>
-                        <td>
-                            {% if row.last_bt_trade %}
-                                <div>
-                                    <span class="{{ 'up' if row.last_bt_trade.direction == 'UP' else 'down' }}">
-                                        {{ row.last_bt_trade.direction }}
-                                    </span>
-                                    @ {{ row.last_bt_trade.entry }}
-                                    <span class="{{ 'up' if row.last_bt_trade.pnl > 0 else 'down' }}" style="float: right;">
-                                        {{ "%.2f"|format(row.last_bt_trade.pnl) }}%
-                                    </span>
-                                </div>
-                                <div class="small-text">
-                                    Inputs: {{ row.last_bt_trade.inputs | join(', ') }}
-                                </div>
-                            {% else %}
-                                <span class="small-text">No trades in backtest period</span>
-                            {% endif %}
-                        </td>
                     </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            <h3>Last Backtest Signals (Diagnostics)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time (UTC)</th>
+                        <th>Symbol</th>
+                        <th>Direction</th>
+                        <th>Entry Price</th>
+                        <th>PnL Outcome</th>
+                        <th>Input Sequence Prices (Last 7)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in summary %}
+                        {% if row.last_bt_trade %}
+                        <tr>
+                            <td>{{ row.last_bt_trade.timestamp | datetime }}</td>
+                            <td class="symbol">{{ row.symbol }}</td>
+                            <td class="{{ 'up' if row.last_bt_trade.direction == 'UP' else 'down' }}">
+                                {{ row.last_bt_trade.direction }}
+                            </td>
+                            <td>{{ row.last_bt_trade.entry }}</td>
+                            <td class="{{ 'up' if row.last_bt_trade.pnl > 0 else 'down' }}">
+                                {{ "%.2f"|format(row.last_bt_trade.pnl) }}%
+                            </td>
+                            <td class="small-text" style="max-width: 400px; word-wrap: break-word;">
+                                {{ row.last_bt_trade.inputs | join(', ') }}
+                            </td>
+                        </tr>
+                        {% endif %}
                     {% endfor %}
                 </tbody>
             </table>
