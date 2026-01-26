@@ -17,8 +17,10 @@ import base64
 DATA_DIR = "/app/data"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 PORT = 8080
-SECTIONS = 100
-SEQUENCE_LEN = 8  # 7 input + 1 target
+
+# Default fallbacks (will be overridden by Grid Search)
+DEFAULT_SECTIONS = 100
+DEFAULT_SEQUENCE_LEN = 8  
 
 ASSETS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", 
@@ -48,11 +50,11 @@ ASSET_CONFIG = {
 app = Flask(__name__)
 
 # --- Global State ---
-models = {} # Stores { "BTCUSDT": { sequences, min, max, bin_size, ready } }
+models = {} # Stores { "BTCUSDT": { sequences, min, max, bin_size, ready, seq_len, sections } }
 cached_dfs = {}
 live_outcomes = [] 
 current_predictions = {} 
-latest_inputs = {} # NEW: Stores the last 7 input prices for ALL assets
+latest_inputs = {} # NEW: Stores the last input prices for ALL assets
 
 # Stores pre-calculated backtest results for dashboard display
 portfolio_stats = []
@@ -164,12 +166,12 @@ def fetch_7_day_data(symbol):
         print(f"[{symbol}] 7-Day Fetch Error: {e}")
         return pd.DataFrame()
 
-def get_bin(price, min_p, bin_size):
+def get_bin(price, min_p, bin_size, n_sections):
     if bin_size == 0: return 0
     b = int((price - min_p) / bin_size)
-    return max(0, min(b, SECTIONS - 1))
+    return max(0, min(b, n_sections - 1))
 
-def calculate_backtest(df, sequences, min_p, bin_size):
+def calculate_backtest(df, sequences, min_p, bin_size, seq_len, n_sections):
     """
     Run backtest on a specific dataframe slice using provided sequences.
     NOW INCLUDES FLAT OUTCOMES (DRAWS) IN STATS AND PNL.
@@ -187,12 +189,14 @@ def calculate_backtest(df, sequences, min_p, bin_size):
     test_sections = df['section'].values
     test_timestamps = df['timestamp'].values
     
-    for i in range(len(test_sections) - SEQUENCE_LEN + 1):
-        input_seq = tuple(int(x) for x in test_sections[i : i + SEQUENCE_LEN - 1])
-        actual_next_sec = int(test_sections[i + SEQUENCE_LEN - 1])
-        actual_price = test_closes[i + SEQUENCE_LEN - 1]
+    # seq_len is the total window (e.g. 8). Inputs = seq_len - 1 (e.g. 7). Target = 1.
+    
+    for i in range(len(test_sections) - seq_len + 1):
+        input_seq = tuple(int(x) for x in test_sections[i : i + seq_len - 1])
+        actual_next_sec = int(test_sections[i + seq_len - 1])
+        actual_price = test_closes[i + seq_len - 1]
         
-        current_price = test_closes[i + SEQUENCE_LEN - 2]
+        current_price = test_closes[i + seq_len - 2]
         current_sec = input_seq[-1]
         
         if input_seq in sequences:
@@ -231,10 +235,10 @@ def calculate_backtest(df, sequences, min_p, bin_size):
             total_pnl += trade_pnl_pct
             
             # Capture inputs used for this prediction
-            input_prices = test_closes[i : i + SEQUENCE_LEN - 1]
+            input_prices = test_closes[i : i + seq_len - 1]
 
             results.append({
-                "timestamp": test_timestamps[i + SEQUENCE_LEN - 1],
+                "timestamp": test_timestamps[i + seq_len - 1],
                 "pnl": trade_pnl_pct,
                 "direction": direction,
                 "entry": current_price,
@@ -253,78 +257,124 @@ def build_models_worker():
         temp_total_trades = 0
         temp_7_day_stats = []
         
+        # Grid Search Parameters
+        grid_sections = range(50, 210, 10)  # 50, 60 ... 200
+        grid_seq_lens = range(4, 13)        # 4 to 12
+        
         # 1. Build Base Models and Run Full Backtest
         for symbol in ASSETS:
-            df = fetch_data(symbol)
-            if df.empty:
+            df_full = fetch_data(symbol)
+            if df_full.empty:
                 print(f"[{symbol}] No data found. Skipping.")
                 continue
 
-            print(f"[{symbol}] Building model...")
+            print(f"[{symbol}] Starting Grid Search (Sections: 50-200, SeqLen: 4-12)...")
             
-            # Apply Hardcoded Clamps
-            raw_min = df['close'].min()
-            raw_max = df['close'].max()
-            
+            raw_min = df_full['close'].min()
+            raw_max = df_full['close'].max()
             config = ASSET_CONFIG.get(symbol, {"min": raw_min, "max": raw_max})
             min_price = config["min"]
             max_price = config["max"]
-            
             price_range = max_price - min_price
-            bin_size = price_range / SECTIONS
-
-            # Apply binning to whole dataset
-            df['section'] = df['close'].apply(lambda x: get_bin(x, min_price, bin_size))
             
-            # Split Data 70/30
-            split_idx = int(len(df) * 0.950)
-            train_df = df.iloc[:split_idx].copy()
-            test_df = df.iloc[split_idx:].copy()
-
-            # Build Model Sequences ONLY on Training Data
-            train_sections = train_df['section'].values
-            sequences = defaultdict(Counter)
-            for i in range(len(train_sections) - SEQUENCE_LEN + 1):
-                seq = tuple(train_sections[i : i + SEQUENCE_LEN])
-                input_seq = seq[:-1]
-                target = seq[-1]
-                sequences[input_seq][target] += 1
+            # Split Data 70/30 (approx for Grid Search Training)
+            split_idx = int(len(df_full) * 0.950)
+            train_df_raw = df_full.iloc[:split_idx].copy()
+            test_df_raw = df_full.iloc[split_idx:].copy()
+            
+            best_sharpe = -9999
+            best_params = (DEFAULT_SECTIONS, DEFAULT_SEQUENCE_LEN)
+            best_sequences = None
+            best_res = []
+            best_metrics = (0, 0, 0) # pnl, acc, flat_pct
+            
+            # --- GRID SEARCH START ---
+            for n_sections in grid_sections:
+                bin_size = price_range / n_sections
                 
+                # Pre-calculate sections for this bin_size to avoid re-looping too much
+                # (Optimization: We act on numpy arrays or just re-apply)
+                # Re-applying per section count is necessary
+                current_train_df = train_df_raw.copy()
+                current_train_df['section'] = current_train_df['close'].apply(lambda x: get_bin(x, min_price, bin_size, n_sections))
+                
+                current_test_df = test_df_raw.copy()
+                current_test_df['section'] = current_test_df['close'].apply(lambda x: get_bin(x, min_price, bin_size, n_sections))
+
+                train_sections = current_train_df['section'].values
+                
+                for seq_len in grid_seq_lens:
+                    # Build Sequences
+                    sequences = defaultdict(Counter)
+                    for i in range(len(train_sections) - seq_len + 1):
+                        seq = tuple(train_sections[i : i + seq_len])
+                        input_seq = seq[:-1]
+                        target = seq[-1]
+                        sequences[input_seq][target] += 1
+                    
+                    # Run Backtest on Test Split
+                    res, pnl, acc, flat_pct = calculate_backtest(current_test_df, sequences, min_price, bin_size, seq_len, n_sections)
+                    
+                    # Calculate Sharpe
+                    if len(res) > 1:
+                        pnls = [r['pnl'] for r in res]
+                        mean_pnl = np.mean(pnls)
+                        std_pnl = np.std(pnls)
+                        if std_pnl > 0.000001:
+                            sharpe = mean_pnl / std_pnl
+                        else:
+                            sharpe = 0
+                    else:
+                        sharpe = 0
+                    
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_params = (n_sections, seq_len)
+                        best_sequences = sequences
+                        best_res = res
+                        best_metrics = (pnl, acc, flat_pct)
+            
+            # --- GRID SEARCH END ---
+            
+            final_sections, final_seq_len = best_params
+            final_bin_size = price_range / final_sections
+            
             models[symbol] = {
-                "sequences": sequences,
+                "sequences": best_sequences,
                 "min_price": min_price,
                 "max_price": max_price,
-                "bin_size": bin_size,
+                "bin_size": final_bin_size,
+                "sections": final_sections,
+                "seq_len": final_seq_len,
                 "ready": True,
-                "last_price": df['close'].iloc[-1]
+                "last_price": df_full['close'].iloc[-1]
             }
-            print(f"[{symbol}] Model ready. Range: {min_price:.4f}-{max_price:.4f}.")
             
-            # Run Backtest immediately on Test Data (30%)
-            print(f"[{symbol}] Running full backtest...")
-            res, pnl, acc, flat_pct = calculate_backtest(test_df, sequences, min_price, bin_size)
+            print(f"[{symbol}] Best Model: Sections={final_sections}, SeqLen={final_seq_len}, Sharpe={best_sharpe:.4f}")
             
-            last_bt_trade = res[-1] if len(res) > 0 else None
+            last_bt_trade = best_res[-1] if len(best_res) > 0 else None
             
-            temp_total_trades += len(res)
+            temp_total_trades += len(best_res)
             temp_stats.append({
                 "symbol": symbol,
-                "backtest_pnl": pnl,
-                "backtest_acc": acc,
-                "flat_pct": flat_pct,
-                "trades": len(res),
-                "last_bt_trade": last_bt_trade
+                "backtest_pnl": best_metrics[0],
+                "backtest_acc": best_metrics[1],
+                "flat_pct": best_metrics[2],
+                "trades": len(best_res),
+                "last_bt_trade": last_bt_trade,
+                "sharpe": best_sharpe,
+                "best_k": final_sections,
+                "best_len": final_seq_len
             })
             
-            # 2. SEPARATE 7-DAY BACKTEST
-            # Fetch fresh separate data for the last 7 days
+            # 2. SEPARATE 7-DAY BACKTEST (Using Optimized Params)
             df_7d = fetch_7_day_data(symbol)
             if not df_7d.empty:
                 # Apply same binning logic using the model params
-                df_7d['section'] = df_7d['close'].apply(lambda x: get_bin(x, min_price, bin_size))
+                df_7d['section'] = df_7d['close'].apply(lambda x: get_bin(x, min_price, final_bin_size, final_sections))
                 
                 # Run backtest on this specific slice
-                res_7d, pnl_7d, acc_7d, flat_pct_7d = calculate_backtest(df_7d, sequences, min_price, bin_size)
+                res_7d, pnl_7d, acc_7d, flat_pct_7d = calculate_backtest(df_7d, best_sequences, min_price, final_bin_size, final_seq_len, final_sections)
                 
                 temp_7_day_stats.append({
                     "symbol": symbol,
@@ -334,7 +384,7 @@ def build_models_worker():
                     "count": len(res_7d),
                     "last_trade_input": res_7d[-1]['inputs'] if len(res_7d) > 0 else []
                 })
-            time.sleep(0.5) # Slight delay to respect API limits
+            time.sleep(0.1) # Slight delay to respect API limits
 
         # Update global cache
         portfolio_stats = temp_stats
@@ -403,17 +453,21 @@ def live_prediction_loop():
                 continue
             
             m = models[symbol]
-
-            # Fetch Data
-            candles = fetch_live_candles(symbol, limit=10)
-            if len(candles) < 8: continue
+            model_seq_len = m.get('seq_len', DEFAULT_SEQUENCE_LEN)
+            model_sections = m.get('sections', DEFAULT_SECTIONS)
+            
+            # Fetch Data (Need enough for sequence)
+            candles = fetch_live_candles(symbol, limit=model_seq_len + 5)
+            if len(candles) < model_seq_len: continue
             
             last_closed_candle = candles[-2]
             current_close = last_closed_candle['close']
             models[symbol]["last_price"] = current_close # Update dashboard tracker
             
             # --- ALWAYS CAPTURE INPUTS ---
-            input_objs = candles[-8:-1] 
+            # Input window is seq_len - 1
+            input_window_len = model_seq_len - 1
+            input_objs = candles[-(input_window_len+1):-1] 
             input_prices = [c['close'] for c in input_objs]
             latest_inputs[symbol] = input_prices # Store regardless of prediction status
             
@@ -436,7 +490,7 @@ def live_prediction_loop():
                     pnl_percent = ((entry_price - current_close) / entry_price) * 100
                 
                 # --- NEW WIN/LOSS LOGIC BASED ON SECTIONS ---
-                exit_section = get_bin(current_close, m['min_price'], m['bin_size'])
+                exit_section = get_bin(current_close, m['min_price'], m['bin_size'], model_sections)
                 
                 result_status = "DRAW"
                 
@@ -471,7 +525,7 @@ def live_prediction_loop():
                 del current_predictions[symbol]
 
             # 2. Make New Prediction
-            input_sections = tuple([get_bin(p, m['min_price'], m['bin_size']) for p in input_prices])
+            input_sections = tuple([get_bin(p, m['min_price'], m['bin_size'], model_sections) for p in input_prices])
             current_section = input_sections[-1]
             
             if input_sections in m['sequences']:
@@ -527,11 +581,13 @@ def predict_manual():
             
         prices = [float(p.strip()) for p in input_str.split(',') if p.strip()]
         
-        if len(prices) != 7:
-            return jsonify({"error": f"Expected 7 prices, got {len(prices)}"}), 400
-            
         m = models[symbol]
-        input_sections = tuple([get_bin(p, m['min_price'], m['bin_size']) for p in prices])
+        req_len = m.get('seq_len', DEFAULT_SEQUENCE_LEN) - 1
+        
+        if len(prices) != req_len:
+            return jsonify({"error": f"Model for {symbol} requires {req_len} input prices, got {len(prices)}"}), 400
+            
+        input_sections = tuple([get_bin(p, m['min_price'], m['bin_size'], m['sections']) for p in prices])
         current_section = input_sections[-1]
         
         if input_sections in m['sequences']:
@@ -571,7 +627,7 @@ def api_signals():
 @app.route('/')
 def dashboard():
     if system_status["loading"]:
-        return "<h1>System Initializing...</h1><p>Downloading and processing data for 15 assets. Please refresh in 30 seconds.</p>"
+        return "<h1>System Initializing...</h1><p>Running Grid Search (Sections: 50-200, Len: 4-12) for 15 assets. Please refresh in a few minutes.</p>"
 
     # Merge cached portfolio stats with current active prediction info
     display_summary = []
@@ -598,7 +654,10 @@ def dashboard():
             "active_pred": active_dir,
             "active_entry": active['entry_price'] if active else "",
             "active_inputs": active_inputs,
-            "last_bt_trade": stat.get('last_bt_trade')
+            "last_bt_trade": stat.get('last_bt_trade'),
+            "sharpe": round(stat.get('sharpe', 0), 4),
+            "sections": stat.get('best_k', 0),
+            "seq_len": stat.get('best_len', 0)
         })
 
     now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -688,7 +747,7 @@ def dashboard():
                     {% endfor %}
                 </select>
                 <br><br>
-                <input type="text" id="manual-input" placeholder="Enter 7 prices separated by comma (e.g. 96000, 96100...)">
+                <input type="text" id="manual-input" placeholder="Enter N prices separated by comma (length depends on model)">
                 <button onclick="runPrediction()">Predict</button>
                 <div id="manual-result"></div>
             </div>
@@ -698,32 +757,30 @@ def dashboard():
                 <thead>
                     <tr>
                         <th>Asset</th>
+                        <th>Params (K, L)</th>
+                        <th>Sharpe</th>
                         <th>Current Price</th>
                         <th>Active Signal</th>
-                        <th>Active Entry</th>
-                        <th>Active Inputs (Last 7)</th>
+                        <th>Active Inputs</th>
                         <th>Backtest Acc %</th>
-                        <th>Flat Outcome %</th>
                         <th>Backtest PnL %</th>
-                        <th>BT Trades</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for row in summary %}
                     <tr>
                         <td class="symbol">{{ row.symbol }}</td>
+                        <td>{{ row.sections }}, {{ row.seq_len }}</td>
+                        <td>{{ row.sharpe }}</td>
                         <td>{{ row.last_price }}</td>
                         <td class="{{ 'up' if row.active_pred == 'UP' else 'down' if row.active_pred == 'DOWN' else '' }}">
                             {{ row.active_pred }}
                         </td>
-                        <td>{{ row.active_entry }}</td>
                         <td class="small-text" style="max-width: 250px; word-wrap: break-word;">
                             {{ row.active_inputs | join(', ') }}
                         </td>
                         <td>{{ row.backtest_acc }}%</td>
-                        <td>{{ row.flat_pct }}%</td>
                         <td class="{{ 'up' if row.backtest_pnl > 0 else 'down' }}">{{ row.backtest_pnl }}%</td>
-                        <td>{{ row.trades }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -738,7 +795,7 @@ def dashboard():
                         <th>Direction</th>
                         <th>Entry Price</th>
                         <th>PnL Outcome</th>
-                        <th>Input Sequence Prices (Last 7)</th>
+                        <th>Input Sequence Prices</th>
                     </tr>
                 </thead>
                 <tbody>
