@@ -408,10 +408,16 @@ live_thread = threading.Thread(target=live_prediction_loop, daemon=True)
 live_thread.start()
 
 # --- Routes ---
+# --- Routes ---
 
 @app.route('/api/status')
 def api_status():
     return jsonify(system_status)
+
+@app.route('/api/signals')
+def api_signals():
+    """Returns the currently active live predictions."""
+    return jsonify(current_predictions.copy())
 
 @app.route('/')
 def dashboard():
