@@ -382,6 +382,8 @@ def live_prediction_loop():
         for symbol in ASSETS:
             if symbol not in models or not models[symbol]["ready"]:
                 continue
+            
+            m = models[symbol]
 
             # Fetch Data
             candles = fetch_live_candles(symbol, limit=10)
@@ -391,13 +393,15 @@ def live_prediction_loop():
             current_close = last_closed_candle['close']
             models[symbol]["last_price"] = current_close # Update dashboard tracker
             
-            m = models[symbol]
-
             # 1. Resolve Previous Prediction for this Symbol
             if symbol in current_predictions:
                 prev = current_predictions[symbol]
                 entry_price = prev['entry_price']
                 direction = prev['direction']
+                
+                # Retrieve bounds from the prediction if available (or calc approx)
+                pred_min = prev.get('predicted_min', 0)
+                pred_max = prev.get('predicted_max', 0)
                 
                 pnl_percent = 0.0
                 if direction == "UP":
@@ -405,12 +409,23 @@ def live_prediction_loop():
                 elif direction == "DOWN":
                     pnl_percent = ((entry_price - current_close) / entry_price) * 100
                 
-                # Determine Result Status
+                # --- WIN/LOSS/DRAW LOGIC UPDATE ---
+                # A loss smaller than the "section size" is considered a DRAW (noise).
+                # Calculate the percentage size of 1 bin
+                bin_size = m['bin_size']
+                step_pct = (bin_size / entry_price) * 100
+                
                 result_status = "DRAW"
+                
                 if pnl_percent > 0:
                     result_status = "WIN"
                 elif pnl_percent < 0:
-                    result_status = "LOSS"
+                    # If loss is significant (greater than 1 bin size), it's a loss
+                    if abs(pnl_percent) > step_pct:
+                        result_status = "LOSS"
+                    else:
+                        # Loss is within the noise floor of the section logic
+                        result_status = "DRAW"
                     
                 outcome = {
                     "symbol": symbol,
@@ -420,7 +435,9 @@ def live_prediction_loop():
                     "direction": direction,
                     "pnl_percent": round(pnl_percent, 4),
                     "result": result_status,
-                    "inputs": prev['inputs']
+                    "inputs": prev['inputs'],
+                    "lower_bound": pred_min,
+                    "upper_bound": pred_max
                 }
                 live_outcomes.append(outcome)
                 del current_predictions[symbol]
@@ -441,12 +458,18 @@ def live_prediction_loop():
                     direction = "DOWN"
                 
                 if direction != "FLAT":
+                    # Calculate bounds for the target section
+                    pred_min_price = m['min_price'] + (predicted_section * m['bin_size'])
+                    pred_max_price = pred_min_price + m['bin_size']
+                    
                     current_predictions[symbol] = {
                         "symbol": symbol,
                         "timestamp": datetime.datetime.utcnow().timestamp() * 1000,
                         "entry_price": input_prices[-1],
                         "current_section": current_section,
                         "predicted_section": predicted_section,
+                        "predicted_min": pred_min_price,
+                        "predicted_max": pred_max_price,
                         "direction": direction,
                         "inputs": {
                             "prices": input_prices,
@@ -488,6 +511,9 @@ def dashboard():
         active = current_predictions.get(symbol, None)
         active_dir = active['direction'] if active else "-"
         
+        # Get active inputs if available
+        active_inputs = active['inputs']['prices'] if active else []
+        
         display_summary.append({
             "symbol": symbol,
             "last_price": models[symbol].get("last_price", 0),
@@ -496,6 +522,7 @@ def dashboard():
             "trades": stat['trades'],
             "active_pred": active_dir,
             "active_entry": active['entry_price'] if active else "",
+            "active_inputs": active_inputs,
             "last_bt_trade": stat.get('last_bt_trade')
         })
 
@@ -551,6 +578,7 @@ def dashboard():
                         <th>Current Price</th>
                         <th>Active Signal</th>
                         <th>Active Entry</th>
+                        <th>Active Inputs (Last 7)</th>
                         <th>Backtest Acc %</th>
                         <th>Backtest PnL %</th>
                         <th>BT Trades</th>
@@ -565,6 +593,9 @@ def dashboard():
                             {{ row.active_pred }}
                         </td>
                         <td>{{ row.active_entry }}</td>
+                        <td class="small-text" style="max-width: 250px; word-wrap: break-word;">
+                            {{ row.active_inputs | join(', ') }}
+                        </td>
                         <td>{{ row.backtest_acc }}%</td>
                         <td class="{{ 'up' if row.backtest_pnl > 0 else 'down' }}">{{ row.backtest_pnl }}%</td>
                         <td>{{ row.trades }}</td>
@@ -646,6 +677,7 @@ def dashboard():
                         <th>Exit</th>
                         <th>PnL %</th>
                         <th>Result</th>
+                        <th>Boundaries (Min-Max)</th>
                         <th>Input Prices</th>
                     </tr>
                 </thead>
@@ -663,12 +695,15 @@ def dashboard():
                         <td class="{{ 'up' if row.result == 'WIN' else 'down' if row.result == 'LOSS' else '' }}">
                             {{ row.result }}
                         </td>
+                        <td class="small-text">
+                            {{ "%.2f"|format(row.lower_bound) }} - {{ "%.2f"|format(row.upper_bound) }}
+                        </td>
                         <td class="small-text" style="max-width: 400px; word-wrap: break-word;">
                              {{ row.inputs.prices | join(', ') }}
                         </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="8">No live trades recorded yet.</td></tr>
+                    <tr><td colspan="9">No live trades recorded yet.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
