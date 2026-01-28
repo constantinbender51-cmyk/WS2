@@ -82,6 +82,9 @@ def get_data(csv_filename):
 
         print(f"[{csv_filename}] Raw 1m Data: {len(df)} rows")
 
+        # Keeping 1H resampling for GA Optimization speed
+        # The live bot will run on 1m, but we optimize on 1H to avoid 
+        # waiting hours for the script to start.
         df_1h = df.resample('1h').agg({
             'open': 'first',
             'high': 'max',
@@ -89,7 +92,7 @@ def get_data(csv_filename):
             'close': 'last'
         }).dropna()
 
-        print(f"[{csv_filename}] Resampled 1H Data: {len(df_1h)} rows")
+        print(f"[{csv_filename}] Resampled 1H Data (For GA): {len(df_1h)} rows")
         
         if len(df_1h) < 100:
             raise ValueError("Data insufficient after resampling.")
@@ -237,7 +240,6 @@ def setup_toolbox(min_price, max_price, df_train):
                      (toolbox.attr_stop, toolbox.attr_profit) + (toolbox.attr_line,)*N_LINES, n=1)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     
-    # Register eval function with partial application of df_train
     toolbox.register("evaluate", evaluate_genome, df_train=df_train)
     toolbox.register("mate", tools.cxTwoPoint) 
     toolbox.register("mutate", mutate_custom, indpb=0.1, min_p=min_price, max_p=max_price)
@@ -303,7 +305,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     hourly_html = hourly_df.to_html(classes='table table-bordered table-sm table-hover', index=False) if not hourly_df.empty else "No hourly data recorded."
 
     live_log_df = pd.DataFrame(live_logs)
-    live_log_html = live_log_df.to_html(classes='table table-bordered table-sm table-hover', index=False) if not live_log_df.empty else "Waiting for next hour trigger..."
+    live_log_html = live_log_df.to_html(classes='table table-bordered table-sm table-hover', index=False) if not live_log_df.empty else "Waiting for next minute trigger..."
     
     live_trades_df = pd.DataFrame(live_trades)
     live_trades_html = live_trades_df.to_html(classes='table table-striped table-sm', index=False) if not live_trades_df.empty else "No live trades yet."
@@ -323,7 +325,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     <head>
         <title>{symbol} Strategy Results</title>
         <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-        <meta http-equiv="refresh" content="60"> 
+        <meta http-equiv="refresh" content="30"> 
         <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }} th {{ position: sticky; top: 0; background: white; }}</style>
     </head>
     <body>
@@ -342,11 +344,11 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
             
             <hr>
             <div id="live-section" style="background-color: #f8f9fa; padding: 15px; border-left: 5px solid #28a745;">
-                <h2 class="text-success">{symbol} Live Forward Test (Binance)</h2>
-                <p><strong>Status:</strong> Running. Fetches candle at XX:00:05.</p>
+                <h2 class="text-success">{symbol} Live Forward Test (Binance 1m)</h2>
+                <p><strong>Status:</strong> Running. Fetches candle at XX:XX:05 (Every Minute).</p>
                 <div class="row">
                     <div class="col-md-6">
-                        <h4>Live Hourly State</h4>
+                        <h4>Live Minute State</h4>
                         <div style="max-height: 400px; overflow-y: scroll; border: 1px solid #ddd; background: white;">
                             {live_log_html}
                         </div>
@@ -375,13 +377,13 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     """
     return html_content
 
-# --- 6. Live Forward Test Logic ---
+# --- 6. Live Forward Test Logic (1 Minute Update) ---
 def fetch_binance_candle(symbol_pair):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {
             'symbol': symbol_pair,
-            'interval': '1h',
+            'interval': '1m', # CHANGED TO 1 MINUTE
             'limit': 2 
         }
         r = requests.get(url, params=params, timeout=10)
@@ -413,18 +415,19 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
     
     # Stagger start to avoid rate limits
     time.sleep(random.uniform(1, 10))
-    print(f"[{symbol}] Live Trading Daemon Started.")
+    print(f"[{symbol}] Live Trading Daemon Started (1m interval).")
     
     while True:
         now = datetime.now()
-        next_run = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+        # Sleep until next MINUTE + 5 seconds
+        next_run = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
         
         if next_run <= now:
-            next_run += timedelta(hours=1)
+            next_run += timedelta(minutes=1)
             
         sleep_sec = (next_run - now).total_seconds()
         # Add tiny random jitter to avoid exact sync
-        sleep_sec += random.uniform(0.1, 2.0)
+        sleep_sec += random.uniform(0.1, 1.0)
         
         time.sleep(sleep_sec)
         
