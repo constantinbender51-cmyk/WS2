@@ -3,5 +3,4 @@ numpy
 matplotlib
 deap
 requests
-http.server
 socketserver
