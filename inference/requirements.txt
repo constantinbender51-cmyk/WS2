@@ -4,3 +4,5 @@ ccxt
 numpy
 tqdm
 requests
+pickle
+datetime
