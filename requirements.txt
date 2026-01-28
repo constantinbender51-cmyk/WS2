@@ -1,15 +1,7 @@
-flask
-scipy
 pandas
-requests
-matplotlib
 numpy
+matplotlib
 deap
+requests
 http.server
 socketserver
-warnings
-threading
-time
-json
-urllib.parse
-datetime
