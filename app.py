@@ -48,71 +48,66 @@ def process_data(order_book):
     
     return bids, asks
 
-def build_depth_figure(bids, asks, title, focus=False):
-    """
-    Helper to generate Plotly figures for depth.
-    If focus=True, filters data to +/- 2% of mid price.
-    """
-    if bids.empty or asks.empty:
-        return go.Figure()
-
-    # Calculate Mid Price for filtering
-    mid_price = (bids['price'].iloc[0] + asks['price'].iloc[0]) / 2
-
-    if focus:
-        lower_bound = mid_price * 0.98
-        upper_bound = mid_price * 1.02
-        bids_plot = bids[bids['price'] >= lower_bound]
-        asks_plot = asks[asks['price'] <= upper_bound]
+def get_subset(df, mid_price, percent=0.02, is_bid=True):
+    """Filters data to within specific percentage of mid price."""
+    if is_bid:
+        limit = mid_price * (1 - percent)
+        return df[df['price'] >= limit]
     else:
-        bids_plot = bids
-        asks_plot = asks
+        limit = mid_price * (1 + percent)
+        return df[df['price'] <= limit]
 
+def build_figure(bids, asks, title, log_scale=False):
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
-        x=bids_plot['price'], y=bids_plot['cumulative'],
+        x=bids['price'], y=bids['cumulative'],
         fill='tozeroy', name='Bids', line=dict(color='green')
     ))
 
     fig.add_trace(go.Scatter(
-        x=asks_plot['price'], y=asks_plot['cumulative'],
+        x=asks['price'], y=asks['cumulative'],
         fill='tozeroy', name='Asks', line=dict(color='red')
     ))
 
-    fig.update_layout(
+    layout_args = dict(
         title=title,
         xaxis_title="Price (USD)",
         yaxis_title="Cumulative Volume",
         template="plotly_dark",
         hovermode="x unified",
         margin=dict(l=40, r=40, t=40, b=40),
-        height=400 # Fixed height for better stacking
+        height=400
     )
+    
+    if log_scale:
+        layout_args['yaxis_type'] = "log"
+        
+    fig.update_layout(**layout_args)
     return fig
 
 app.layout = html.Div([
-    html.H2(f"Kraken Futures: {SYMBOL} Analysis", style={'textAlign': 'center', 'fontFamily': 'sans-serif'}),
+    html.H2(f"Kraken Futures: {SYMBOL} Analysis", style={'textAlign': 'center', 'fontFamily': 'sans-serif', 'color': '#eee'}),
     
     # --- Metrics Section ---
     html.Div([
         html.Div([
-            html.H4("Ratio (1 - Bid/Ask)", style={'margin': '5px'}),
+            html.H4("Ratio (±2% Depth)", style={'margin': '5px', 'color': '#aaa'}),
             html.H3(id='current-ratio-display', style={'margin': '5px', 'color': '#0074D9'})
-        ], style={'width': '45%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #555', 'padding': '10px', 'borderRadius': '5px'}),
+        ], style={'width': '45%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #444', 'padding': '10px', 'borderRadius': '5px'}),
         
         html.Div([
-            html.H4("60m Avg Ratio", style={'margin': '5px'}),
+            html.H4("60m Avg Ratio", style={'margin': '5px', 'color': '#aaa'}),
             html.H3(id='avg-ratio-display', style={'margin': '5px', 'color': '#FF851B'})
-        ], style={'width': '45%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #555', 'padding': '10px', 'borderRadius': '5px', 'float': 'right'})
-    ], style={'width': '90%', 'margin': '0 auto 20px auto', 'color': 'white'}),
+        ], style={'width': '45%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #444', 'padding': '10px', 'borderRadius': '5px', 'float': 'right'})
+    ], style={'width': '90%', 'margin': '0 auto 20px auto'}),
 
     # --- Charts Section ---
     html.Div([
-        # Graph 1: Zoomed View
+        # Graph 1: Zoomed View (Linear)
         dcc.Graph(id='focused-depth-chart'),
-        html.Hr(style={'borderColor': '#333'}),
-        # Graph 2: Full View
+        html.Hr(style={'borderColor': '#333', 'margin': '20px 0'}),
+        # Graph 2: Full View (Log Scale)
         dcc.Graph(id='full-depth-chart')
     ], style={'width': '95%', 'margin': '0 auto'}),
 
@@ -134,39 +129,43 @@ def update_dashboard(n):
     ob = fetch_order_book()
     
     if not ob:
-        empty_fig = go.Figure()
-        return empty_fig, empty_fig, "N/A", "N/A"
+        empty = go.Figure()
+        return empty, empty, "N/A", "N/A"
 
     bids, asks = process_data(ob)
     
-    # 1. Calculate Metrics
-    total_bid_vol = bids['size'].sum()
-    total_ask_vol = asks['size'].sum()
-    
-    if total_ask_vol == 0:
-        ratio = 0 
-    else:
-        ratio = 1 - (total_bid_vol / total_ask_vol)
+    # 1. Determine Mid Price
+    mid_price = (bids['price'].iloc[0] + asks['price'].iloc[0]) / 2
 
-    ratio_history.append(ratio)
+    # 2. Filter for +/- 2% (Metrics & Focused Plot)
+    bids_2pct = get_subset(bids, mid_price, 0.02, is_bid=True)
+    asks_2pct = get_subset(asks, mid_price, 0.02, is_bid=False)
+
+    # 3. Calculate Ratio on 2% Subset
+    vol_bid_2pct = bids_2pct['size'].sum()
+    vol_ask_2pct = asks_2pct['size'].sum()
     
+    if vol_ask_2pct == 0:
+        ratio = 0
+    else:
+        ratio = 1 - (vol_bid_2pct / vol_ask_2pct)
+
+    # Update History
+    ratio_history.append(ratio)
     if len(ratio_history) > 0:
         avg_60m = statistics.mean(ratio_history)
         avg_text = f"{avg_60m:.4f}"
     else:
         avg_text = "Wait..."
 
-    ratio_text = f"{ratio:.4f}"
-
-    # 2. Build Figures
-    # Zoomed Chart (+/- 2%)
-    mid_price = (bids['price'].iloc[0] + asks['price'].iloc[0]) / 2
-    fig_focused = build_depth_figure(bids, asks, f"Focused Depth (Mid: {mid_price:.2f})", focus=True)
+    # 4. Build Plots
+    # Focused: Linear Scale, limited to 2% data
+    fig_focused = build_figure(bids_2pct, asks_2pct, f"Depth ±2% (Mid: {mid_price:.2f})", log_scale=False)
     
-    # Full Chart (Entire Book)
-    fig_full = build_depth_figure(bids, asks, "Full Order Book Depth", focus=False)
+    # Full: Log Scale, all data
+    fig_full = build_figure(bids, asks, "Full Order Book (Log Scale)", log_scale=True)
     
-    return fig_focused, fig_full, ratio_text, avg_text
+    return fig_focused, fig_full, f"{ratio:.4f}", avg_text
 
 if __name__ == '__main__':
     app.run(debug=False, port=PORT, host='0.0.0.0')
