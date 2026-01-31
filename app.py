@@ -45,4 +45,4 @@ def fetch_futures_orderbook(symbol: str):
         print(f"HTTP Request failed: {e}")
 
 if __name__ == "__main__":
-    fetch_futures_orderbook("PF_BTCUSD")
+    fetch_futures_orderbook("PF_XBTUSD")
