@@ -6,16 +6,160 @@ from dash.dependencies import Input, Output
 from collections import deque
 import statistics
 import numpy as np
+import datetime
 
 # --- Configuration ---
 SYMBOL = "PF_XBTUSD"
 URL = "https://futures.kraken.com/derivatives/api/v3/orderbook"
 PORT = 8080
 UPDATE_INTERVAL_MS = 5000  # 5 seconds
-MAX_HISTORY = 720  # 60 minutes at 5s intervals
+MAX_HISTORY = 720  # 60 minutes
+
+# --- Paper Trading Engine ---
+class PaperTrader:
+    def __init__(self, initial_balance=10000):
+        self.balance = initial_balance
+        self.position = 0.0  # Positive = Long, Negative = Short
+        self.avg_entry_price = 0.0
+        self.realized_pnl = 0.0
+        self.active_orders = []  # List of dicts: {'id', 'side', 'type', 'price', 'size'}
+        self.trade_log = deque(maxlen=50)
+        self.is_strategy_active = False
+        self.reference_price = 0.0 # Price at which strategy activated
+
+    def reset_strategy(self):
+        """Cancels orders and closes positions (Market Close)."""
+        self.active_orders = []
+        if self.position != 0:
+            # Close position at current reference (mock market close)
+            # In a real tick, we'd use current bid/ask, but here we force close
+            self._execute_trade(-self.position, self.reference_price, "Strategy Deactivated")
+        self.is_strategy_active = False
+
+    def activate_strategy(self, current_price):
+        """Places the grid orders based on the current price snapshot."""
+        if self.is_strategy_active:
+            return # Already active, don't reset grid
+            
+        self.is_strategy_active = True
+        self.reference_price = current_price
+        mid = current_price
+        order_size = 100 # Arbitrary contract size per order
+
+        # Generate Orders based on instructions
+        # 1. 10 Sells (+0.6% to +2%)
+        sells = np.linspace(mid * 1.006, mid * 1.02, 10)
+        for p in sells:
+            self.active_orders.append({'side': 'sell', 'type': 'limit', 'price': p, 'size': order_size})
+
+        # 2. 10 Buys (-0.6% to -2%)
+        buys = np.linspace(mid * 0.994, mid * 0.98, 10)
+        for p in buys:
+            self.active_orders.append({'side': 'buy', 'type': 'limit', 'price': p, 'size': order_size})
+            
+        # 3. Stop Orders (Triggers)
+        # Note: In this simple engine, Stops are treated as "Market if Touched" that reduce position
+        # Upside Stops (0 to 3.88%): Triggers BUY if we are SHORT
+        sl_up = np.linspace(mid, mid * 1.0388, 10)
+        for p in sl_up:
+            self.active_orders.append({'side': 'buy', 'type': 'stop', 'price': p, 'size': order_size})
+
+        # Downside Stops (0 to -3.88%): Triggers SELL if we are LONG
+        sl_down = np.linspace(mid, mid * 0.9612, 10)
+        for p in sl_down:
+            self.active_orders.append({'side': 'sell', 'type': 'stop', 'price': p, 'size': order_size})
+
+    def process_tick(self, bid, ask):
+        """Checks orders against current market price."""
+        if not self.is_strategy_active:
+            return
+
+        # Update reference price for PnL calc
+        current_mid = (bid + ask) / 2
+        self.reference_price = current_mid
+        
+        filled_indices = []
+
+        for i, order in enumerate(self.active_orders):
+            executed = False
+            
+            # Limit Buy: Fill if Ask <= Price
+            if order['type'] == 'limit' and order['side'] == 'buy':
+                if ask <= order['price']:
+                    self._execute_trade(order['size'], order['price'], "Limit Buy")
+                    executed = True
+            
+            # Limit Sell: Fill if Bid >= Price
+            elif order['type'] == 'limit' and order['side'] == 'sell':
+                if bid >= order['price']:
+                    self._execute_trade(-order['size'], order['price'], "Limit Sell")
+                    executed = True
+            
+            # Stop Buy (Protect Short): Trigger if Ask >= Price AND we are Short
+            elif order['type'] == 'stop' and order['side'] == 'buy':
+                if ask >= order['price'] and self.position < 0:
+                    # Only close the amount needed, don't flip long
+                    qty = min(order['size'], abs(self.position))
+                    if qty > 0:
+                        self._execute_trade(qty, order['price'], "Stop Loss Buy")
+                        executed = True # Remove the stop order once triggered
+            
+            # Stop Sell (Protect Long): Trigger if Bid <= Price AND we are Long
+            elif order['type'] == 'stop' and order['side'] == 'sell':
+                if bid <= order['price'] and self.position > 0:
+                    qty = min(order['size'], self.position)
+                    if qty > 0:
+                        self._execute_trade(-qty, order['price'], "Stop Loss Sell")
+                        executed = True
+
+            if executed:
+                filled_indices.append(i)
+        
+        # Remove filled orders (reverse order to maintain indices)
+        for i in sorted(filled_indices, reverse=True):
+            del self.active_orders[i]
+
+    def _execute_trade(self, size, price, reason):
+        """Updates internal position and balance."""
+        # PnL Calculation on closing
+        if (self.position > 0 and size < 0) or (self.position < 0 and size > 0):
+            # We are closing/reducing
+            closing_qty = min(abs(size), abs(self.position))
+            pnl = (price - self.avg_entry_price) * closing_qty
+            if self.position < 0: pnl = -pnl # Inverse for shorts
+            self.realized_pnl += pnl
+            self.balance += pnl
+            
+        # Update Position Weighted Average
+        new_pos = self.position + size
+        if new_pos == 0:
+            self.avg_entry_price = 0
+        elif (self.position >= 0 and size > 0) or (self.position <= 0 and size < 0):
+            # Increasing position
+            total_cost = (self.position * self.avg_entry_price) + (size * price)
+            self.avg_entry_price = total_cost / new_pos
+            
+        self.position = new_pos
+        self.trade_log.append(f"{datetime.datetime.now().strftime('%H:%M:%S')} | {reason} | {size:+} @ {price:.2f}")
+
+    def get_stats(self):
+        # Calculate Unrealized PnL
+        unrealized = 0.0
+        if self.position != 0:
+            unrealized = (self.reference_price - self.avg_entry_price) * self.position
+        
+        return {
+            'balance': self.balance,
+            'position': self.position,
+            'entry': self.avg_entry_price,
+            'realized': self.realized_pnl,
+            'unrealized': unrealized,
+            'total_equity': self.balance + unrealized
+        }
 
 # --- Global State ---
 ratio_history = deque(maxlen=MAX_HISTORY)
+trader = PaperTrader()
 
 app = Dash(__name__)
 
@@ -24,227 +168,141 @@ def fetch_order_book():
         response = requests.get(URL, params={'symbol': SYMBOL}, timeout=3)
         response.raise_for_status()
         data = response.json()
-        
         if data.get('result') == 'success':
             return data.get('orderBook', {})
         return None
-    except Exception as e:
-        print(f"Fetch error: {e}")
+    except:
         return None
 
 def process_data(order_book):
-    # Process Bids
-    bids = pd.DataFrame(order_book.get('bids', []), columns=['price', 'size'])
-    bids['price'] = bids['price'].astype(float)
-    bids['size'] = bids['size'].astype(float)
+    bids = pd.DataFrame(order_book.get('bids', []), columns=['price', 'size']).astype(float)
     bids = bids.sort_values(by='price', ascending=False)
     bids['cumulative'] = bids['size'].cumsum()
 
-    # Process Asks
-    asks = pd.DataFrame(order_book.get('asks', []), columns=['price', 'size'])
-    asks['price'] = asks['price'].astype(float)
-    asks['size'] = asks['size'].astype(float)
+    asks = pd.DataFrame(order_book.get('asks', []), columns=['price', 'size']).astype(float)
     asks = asks.sort_values(by='price', ascending=True)
     asks['cumulative'] = asks['size'].cumsum()
-    
     return bids, asks
 
-def get_subset(df, mid_price, percent=0.02, is_bid=True):
-    """Filters data to within specific percentage of mid price."""
-    if is_bid:
-        limit = mid_price * (1 - percent)
-        return df[df['price'] >= limit]
-    else:
-        limit = mid_price * (1 + percent)
-        return df[df['price'] <= limit]
-
-def generate_strategy_orders(mid_price):
-    """Generates price levels for strategy orders."""
-    # 10 Limit Sells between +0.6% and +2%
-    sells = np.linspace(mid_price * 1.006, mid_price * 1.02, 10)
-    
-    # 10 Limit Buys between -0.6% and -2%
-    buys = np.linspace(mid_price * 0.994, mid_price * 0.98, 10)
-    
-    # 10 Stop Loss (Upside) between 0% and +3.88%
-    sl_up = np.linspace(mid_price, mid_price * 1.0388, 10)
-    
-    # 10 Stop Loss (Downside) between 0% and -3.88%
-    sl_down = np.linspace(mid_price, mid_price * 0.9612, 10)
-    
-    return sells, buys, sl_up, sl_down
-
-def build_figure(bids, asks, title, log_scale=False, strategy_orders=None):
+def build_figure(bids, asks, title, log_scale=False, active_orders=None):
     fig = go.Figure()
 
-    # Order Book Data
-    fig.add_trace(go.Scatter(
-        x=bids['price'], y=bids['cumulative'],
-        fill='tozeroy', name='Bids', line=dict(color='green')
-    ))
+    fig.add_trace(go.Scatter(x=bids['price'], y=bids['cumulative'], fill='tozeroy', name='Bids', line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=asks['price'], y=asks['cumulative'], fill='tozeroy', name='Asks', line=dict(color='red')))
 
-    fig.add_trace(go.Scatter(
-        x=asks['price'], y=asks['cumulative'],
-        fill='tozeroy', name='Asks', line=dict(color='red')
-    ))
-
-    # Strategy Visualization
-    if strategy_orders:
-        sells, buys, sl_up, sl_down = strategy_orders
+    # Visualize Active Paper Orders
+    if active_orders:
         y_max = max(bids['cumulative'].max(), asks['cumulative'].max())
-        y_val = y_max * 0.1 if log_scale else y_max * 0.5 # Arbitrary height for visibility
-
-        # Helper to add order markers
-        def add_markers(prices, name, color, symbol):
-            fig.add_trace(go.Scatter(
-                x=prices,
-                y=[y_val] * len(prices),
-                mode='markers',
-                marker=dict(symbol=symbol, size=10, color=color, line=dict(width=1, color='white')),
-                name=name
-            ))
-
-        add_markers(sells, 'Strat: Sell Limit', 'orange', 'triangle-down')
-        add_markers(buys, 'Strat: Buy Limit', 'cyan', 'triangle-up')
-        add_markers(sl_up, 'Strat: SL Up', 'magenta', 'x')
-        add_markers(sl_down, 'Strat: SL Down', 'magenta', 'x')
-
-    layout_args = dict(
-        title=title,
-        xaxis_title="Price (USD)",
-        yaxis_title="Cumulative Volume",
-        template="plotly_dark",
-        hovermode="x unified",
-        margin=dict(l=40, r=40, t=40, b=40),
-        height=400
-    )
-    
-    if log_scale:
-        layout_args['yaxis_type'] = "log"
+        y_level = y_max * 0.1 if log_scale else y_max * 0.5
         
+        buy_prices = [o['price'] for o in active_orders if o['side'] == 'buy' and o['type'] == 'limit']
+        sell_prices = [o['price'] for o in active_orders if o['side'] == 'sell' and o['type'] == 'limit']
+        stop_prices = [o['price'] for o in active_orders if o['type'] == 'stop']
+
+        if buy_prices:
+            fig.add_trace(go.Scatter(x=buy_prices, y=[y_level]*len(buy_prices), mode='markers', marker=dict(symbol='triangle-up', size=10, color='cyan'), name='Limit Buy'))
+        if sell_prices:
+            fig.add_trace(go.Scatter(x=sell_prices, y=[y_level]*len(sell_prices), mode='markers', marker=dict(symbol='triangle-down', size=10, color='orange'), name='Limit Sell'))
+        if stop_prices:
+             fig.add_trace(go.Scatter(x=stop_prices, y=[y_level]*len(stop_prices), mode='markers', marker=dict(symbol='x', size=8, color='magenta'), name='Stop Order'))
+
+    layout_args = dict(title=title, xaxis_title="Price", yaxis_title="Vol", template="plotly_dark", height=400, margin=dict(l=40, r=40, t=40, b=40))
+    if log_scale: layout_args['yaxis_type'] = "log"
     fig.update_layout(**layout_args)
     return fig
 
 app.layout = html.Div([
-    html.H2(f"Kraken Futures: {SYMBOL} Analysis", style={'textAlign': 'center', 'fontFamily': 'sans-serif', 'color': '#eee'}),
+    html.H2(f"Kraken: {SYMBOL} + Paper Trader", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
     
-    # --- Strategy Overview ---
-    html.Div([
-        html.H4("Strategy Logic", style={'margin': '5px', 'color': '#eee', 'borderBottom': '1px solid #555'}),
-        html.Ul([
-            html.Li("Active Range: 60m Avg Ratio between -0.1 and 0.1"),
-            html.Li("Entry Orders: 10 Sells (+0.6% to +2%), 10 Buys (-0.6% to -2%)"),
-            html.Li("Stop Orders: 10 Upside (0% to +3.88%), 10 Downside (0% to -3.88%)"),
-            html.Li("Exit: Close all if 60m Avg Ratio > 0.1 or < -0.1")
-        ], style={'color': '#aaa', 'fontSize': '14px', 'textAlign': 'left'})
-    ], style={'width': '90%', 'margin': '0 auto 20px auto', 'backgroundColor': '#222', 'padding': '15px', 'borderRadius': '5px'}),
-
-    # --- Metrics Section ---
+    # --- Paper Trading Account Panel ---
     html.Div([
         html.Div([
-            html.H4("Ratio (±2% Depth)", style={'margin': '5px', 'color': '#aaa'}),
-            html.H3(id='current-ratio-display', style={'margin': '5px', 'color': '#0074D9'})
-        ], style={'width': '30%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #444', 'padding': '10px', 'borderRadius': '5px'}),
-        
+            html.H4("Equity", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='equity-display', style={'margin': '5px', 'color': '#fff'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
         html.Div([
-            html.H4("60m Avg Ratio", style={'margin': '5px', 'color': '#aaa'}),
-            html.H3(id='avg-ratio-display', style={'margin': '5px', 'color': '#FF851B'})
-        ], style={'width': '30%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #444', 'padding': '10px', 'borderRadius': '5px', 'marginLeft': '2%'}),
-
+            html.H4("Unrealized PnL", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='pnl-display', style={'margin': '5px'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
         html.Div([
-            html.H4("Strategy Status", style={'margin': '5px', 'color': '#aaa'}),
-            html.H3(id='strategy-status-display', style={'margin': '5px', 'color': '#eee'})
-        ], style={'width': '30%', 'display': 'inline-block', 'textAlign': 'center', 'border': '1px solid #444', 'padding': '10px', 'borderRadius': '5px', 'float': 'right'})
+            html.H4("Position", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='pos-display', style={'margin': '5px'})
+        ], style={'flex': 1, 'textAlign': 'center'}),
+        html.Div([
+            html.H4("Status", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='status-display', style={'margin': '5px'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderLeft': '1px solid #444'}),
+    ], style={'display': 'flex', 'backgroundColor': '#222', 'marginBottom': '20px', 'padding': '10px', 'borderRadius': '8px'}),
 
-    ], style={'width': '90%', 'margin': '0 auto 20px auto'}),
-
-    # --- Charts Section ---
+    # --- Metrics ---
     html.Div([
-        # Graph 1: Zoomed View (Linear)
-        dcc.Graph(id='focused-depth-chart'),
-        html.Hr(style={'borderColor': '#333', 'margin': '20px 0'}),
-        # Graph 2: Full View (Log Scale)
-        dcc.Graph(id='full-depth-chart')
-    ], style={'width': '95%', 'margin': '0 auto'}),
+        html.Div([html.H5("Current Ratio"), html.H3(id='ratio-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'}),
+        html.Div([html.H5("60m Avg Ratio"), html.H3(id='avg-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'})
+    ], style={'textAlign': 'center'}),
 
-    dcc.Interval(
-        id='interval-component',
-        interval=UPDATE_INTERVAL_MS,
-        n_intervals=0
-    )
-], style={'backgroundColor': '#111', 'padding': '20px', 'minHeight': '100vh'})
+    # --- Charts ---
+    dcc.Graph(id='focused-chart'),
+    dcc.Graph(id='full-chart'),
+    
+    dcc.Interval(id='timer', interval=UPDATE_INTERVAL_MS, n_intervals=0)
+], style={'backgroundColor': '#111', 'padding': '20px', 'minHeight': '100vh', 'fontFamily': 'sans-serif'})
 
 @app.callback(
-    [Output('focused-depth-chart', 'figure'),
-     Output('full-depth-chart', 'figure'),
-     Output('current-ratio-display', 'children'),
-     Output('avg-ratio-display', 'children'),
-     Output('strategy-status-display', 'children'),
-     Output('strategy-status-display', 'style')],
-    [Input('interval-component', 'n_intervals')]
+    [Output('focused-chart', 'figure'), Output('full-chart', 'figure'),
+     Output('ratio-val', 'children'), Output('avg-val', 'children'),
+     Output('equity-display', 'children'), Output('pnl-display', 'children'),
+     Output('pnl-display', 'style'), Output('pos-display', 'children'),
+     Output('pos-display', 'style'), Output('status-display', 'children'),
+     Output('status-display', 'style')],
+    [Input('timer', 'n_intervals')]
 )
-def update_dashboard(n):
+def update(n):
     ob = fetch_order_book()
-    
-    if not ob:
-        empty = go.Figure()
-        return empty, empty, "N/A", "N/A", "OFFLINE", {'color': 'red', 'margin': '5px'}
+    if not ob: return go.Figure(), go.Figure(), "-", "-", "-", "-", {}, "-", {}, "OFFLINE", {'color': 'red'}
 
     bids, asks = process_data(ob)
+    best_bid = bids['price'].iloc[0]
+    best_ask = asks['price'].iloc[0]
+    mid = (best_bid + best_ask) / 2
+
+    # 1. Calc Ratio
+    b_sub = bids[bids['price'] >= mid * 0.98]
+    a_sub = asks[asks['price'] <= mid * 1.02]
+    vb, va = b_sub['size'].sum(), a_sub['size'].sum()
+    ratio = 0 if va == 0 else 1 - (vb / va)
     
-    # 1. Determine Mid Price
-    mid_price = (bids['price'].iloc[0] + asks['price'].iloc[0]) / 2
-
-    # 2. Filter for +/- 2% (Metrics & Focused Plot)
-    bids_2pct = get_subset(bids, mid_price, 0.02, is_bid=True)
-    asks_2pct = get_subset(asks, mid_price, 0.02, is_bid=False)
-
-    # 3. Calculate Ratio on 2% Subset
-    vol_bid_2pct = bids_2pct['size'].sum()
-    vol_ask_2pct = asks_2pct['size'].sum()
-    
-    if vol_ask_2pct == 0:
-        ratio = 0
-    else:
-        ratio = 1 - (vol_bid_2pct / vol_ask_2pct)
-
-    # Update History
     ratio_history.append(ratio)
-    
-    avg_60m = 0.0
-    avg_text = "Wait..."
-    strategy_active = False
-    status_text = "INACTIVE"
-    status_style = {'margin': '5px', 'color': '#777'} # Grey
+    avg_60m = statistics.mean(ratio_history) if ratio_history else 0
 
-    if len(ratio_history) > 0:
-        avg_60m = statistics.mean(ratio_history)
-        avg_text = f"{avg_60m:.4f}"
-        
-        # Strategy Logic Check
-        if -0.1 <= avg_60m <= 0.1:
-            strategy_active = True
-            status_text = "ACTIVE (ORDERS PLACED)"
-            status_style = {'margin': '5px', 'color': '#2ECC40'} # Green
-        else:
-            status_text = "CLOSED (RANGE EXIT)"
-            status_style = {'margin': '5px', 'color': '#FF4136'} # Red
-
-    # 4. Generate Strategy Traces if Active
-    strategy_orders = None
-    if strategy_active:
-        strategy_orders = generate_strategy_orders(mid_price)
-
-    # 5. Build Plots
-    # Focused: Linear Scale, limited to 2% data
-    fig_focused = build_figure(bids_2pct, asks_2pct, f"Depth ±2% (Mid: {mid_price:.2f})", log_scale=False, strategy_orders=strategy_orders)
+    # 2. Strategy Logic & Paper Trading Update
+    active_zone = -0.1 <= avg_60m <= 0.1
     
-    # Full: Log Scale, all data
-    # Note: Strategy orders might be outside full view if filters applied, but usually fit. 
-    # Passing them here too for visibility if zoom changes.
-    fig_full = build_figure(bids, asks, "Full Order Book (Log Scale)", log_scale=True, strategy_orders=strategy_orders)
+    if active_zone:
+        # If transitioning from inactive to active, orders will be placed by this call
+        trader.activate_strategy(mid)
+        status_txt = "ACTIVE"
+        status_col = {'color': '#2ECC40'}
+    else:
+        # Logic says close all if OUTSIDE range
+        trader.reset_strategy()
+        status_txt = "CLOSED"
+        status_col = {'color': '#FF4136'}
+
+    # Process simulated fills based on this tick's best bid/ask
+    trader.process_tick(best_bid, best_ask)
+    stats = trader.get_stats()
+
+    # 3. Formatter for UI
+    pnl_col = {'color': '#2ECC40'} if stats['unrealized'] >= 0 else {'color': '#FF4136'}
+    pos_col = {'color': '#2ECC40'} if stats['position'] > 0 else ({'color': '#FF4136'} if stats['position'] < 0 else {'color': '#ccc'})
     
-    return fig_focused, fig_full, f"{ratio:.4f}", avg_text, status_text, status_style
+    # 4. Charts
+    fig1 = build_figure(b_sub, a_sub, f"Active Depth ±2% ({mid:.1f})", False, trader.active_orders)
+    fig2 = build_figure(bids, asks, "Full Book", True, trader.active_orders)
+
+    return (fig1, fig2, f"{ratio:.4f}", f"{avg_60m:.4f}", 
+            f"${stats['total_equity']:,.2f}", f"${stats['unrealized']:,.2f}", pnl_col,
+            f"{stats['position']}", pos_col, status_txt, status_col)
 
 if __name__ == '__main__':
     app.run(debug=False, port=PORT, host='0.0.0.0')
