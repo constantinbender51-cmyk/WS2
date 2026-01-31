@@ -100,4 +100,4 @@ def update_metrics(n):
 
 if __name__ == '__main__':
     # host='0.0.0.0' allows external access if needed
-    app.run_server(debug=False, port=PORT, host='0.0.0.0')
+    app.run(debug=False, port=PORT, host='0.0.0.0')
