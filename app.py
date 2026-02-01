@@ -49,37 +49,44 @@ class PaperTrader:
         mid = current_price
         order_size = 100 
 
-        # --- Generate Grids ---
+        # --- Generate Grids with Mapped Stops ---
         
-        # 1. Entries
-        # Sells: +0.6% to +2% from Mid
+        # 1. Price Arrays (Closest to Mid -> Furthest from Mid)
+        # Sells: +0.6% to +2%
         sells = np.linspace(mid * 1.006, mid * 1.02, 10)
-        # Buys: -0.6% to -2% from Mid
+        
+        # Buys: -0.6% to -2%
+        # Note: linspace(0.994, 0.98) goes High -> Low (Closest -> Furthest)
         buys = np.linspace(mid * 0.994, mid * 0.98, 10)
 
-        # 2. Stops (Relative to Entries)
-        # "0 to 3.88% from the entries"
-        # We map the stop distance linearly to the entries (1:1)
+        # 2. Stop Variance Array (0% to 3.88%)
+        # Maps 1:1 to the entries above
         stop_variances = np.linspace(0.0, 0.0388, 10)
 
-        # Create Sell Orders + Companion Buy Stops
+        # 3. Create Sell Orders + Companion Buy Stops (Above Entry)
         for i, price in enumerate(sells):
             # Place Limit Sell
             self.active_orders.append({'side': 'sell', 'type': 'limit', 'price': price, 'size': order_size})
             
-            # Place Companion Stop Buy (Protect Short)
-            # Stop Price = Entry Price + (Entry Price * Variance)
-            stop_price = price * (1 + stop_variances[i])
+            # Stop Price = Entry + (Entry * Variance)
+            # 1st order: Stop = Entry + 0 (Breakeven)
+            # Last order: Stop = Entry + 3.88%
+            variance = stop_variances[i]
+            stop_price = price * (1 + variance)
+            
             self.active_orders.append({'side': 'buy', 'type': 'stop', 'price': stop_price, 'size': order_size})
 
-        # Create Buy Orders + Companion Sell Stops
+        # 4. Create Buy Orders + Companion Sell Stops (Below Entry)
         for i, price in enumerate(buys):
             # Place Limit Buy
             self.active_orders.append({'side': 'buy', 'type': 'limit', 'price': price, 'size': order_size})
             
-            # Place Companion Stop Sell (Protect Long)
-            # Stop Price = Entry Price - (Entry Price * Variance)
-            stop_price = price * (1 - stop_variances[i])
+            # Stop Price = Entry - (Entry * Variance)
+            # 1st order: Stop = Entry - 0 (Breakeven)
+            # Last order: Stop = Entry - 3.88%
+            variance = stop_variances[i]
+            stop_price = price * (1 - variance)
+            
             self.active_orders.append({'side': 'sell', 'type': 'stop', 'price': stop_price, 'size': order_size})
 
     def process_tick(self, bid, ask):
@@ -108,6 +115,7 @@ class PaperTrader:
             
             # Stop Buy (Short Protection)
             elif order['type'] == 'stop' and order['side'] == 'buy':
+                # Trigger if Ask rises to or above Stop Price
                 if ask >= order['price'] and self.position < 0:
                     qty = min(order['size'], abs(self.position))
                     if qty > 0:
@@ -116,6 +124,7 @@ class PaperTrader:
             
             # Stop Sell (Long Protection)
             elif order['type'] == 'stop' and order['side'] == 'sell':
+                # Trigger if Bid falls to or below Stop Price
                 if bid <= order['price'] and self.position > 0:
                     qty = min(order['size'], self.position)
                     if qty > 0:
@@ -125,6 +134,7 @@ class PaperTrader:
             if executed:
                 filled_indices.append(i)
         
+        # Remove filled orders
         for i in sorted(filled_indices, reverse=True):
             del self.active_orders[i]
 
@@ -133,9 +143,9 @@ class PaperTrader:
         trade_value = abs(size * price)
         cost = trade_value * self.TOTAL_COST_RATE # 0.3%
         self.fees_paid += cost
-        self.balance -= cost # Immediately deduct cost from balance
+        self.balance -= cost 
 
-        # 2. PnL Calculation (FIFO/Average Cost)
+        # 2. PnL Calculation
         if (self.position > 0 and size < 0) or (self.position < 0 and size > 0):
             closing_qty = min(abs(size), abs(self.position))
             pnl = (price - self.avg_entry_price) * closing_qty
