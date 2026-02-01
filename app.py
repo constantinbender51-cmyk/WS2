@@ -216,7 +216,8 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
 
     if active_orders:
         y_max = max(bids['cumulative'].max(), asks['cumulative'].max())
-        y_level = y_max * 0.1 if log_scale else y_max * 0.5
+        # With log scale on X, Y levels are unaffected, but keeping visual logic
+        y_level = y_max * 0.5 
         
         buy_prices = [o['price'] for o in active_orders if o['side'] == 'buy' and o['type'] == 'limit']
         sell_prices = [o['price'] for o in active_orders if o['side'] == 'sell' and o['type'] == 'limit']
@@ -230,7 +231,7 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
              fig.add_trace(go.Scatter(x=stop_prices, y=[y_level]*len(stop_prices), mode='markers', marker=dict(symbol='x', size=8, color='magenta'), name='Stop Order'))
 
     layout_args = dict(title=title, xaxis_title="Price", yaxis_title="Vol", template="plotly_dark", height=400, margin=dict(l=40, r=40, t=40, b=40))
-    if log_scale: layout_args['yaxis_type'] = "log"
+    if log_scale: layout_args['xaxis_type'] = "log"
     fig.update_layout(**layout_args)
     return fig
 
