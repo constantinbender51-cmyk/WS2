@@ -14,6 +14,7 @@ URL = "https://futures.kraken.com/derivatives/api/v3/orderbook"
 PORT = 8080
 UPDATE_INTERVAL_MS = 5000  # 5 seconds
 MAX_HISTORY = 720  # 60 minutes
+ORDER_USD_VALUE = 1000 # $1000 per grid level (adjust as needed)
 
 # --- Paper Trading Engine ---
 class PaperTrader:
@@ -29,9 +30,10 @@ class PaperTrader:
         self.reference_price = 0.0
 
         # Cost Model
-        self.FEE_RATE = 0.002      # 0.2%
-        self.SLIPPAGE_RATE = 0.001 # 0.1%
-        self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE # 0.3% per side
+        # User specified: 0.2% Fee + 0.1% Slippage = 0.3% per side (0.6% Round Trip)
+        self.FEE_RATE = 0.002      
+        self.SLIPPAGE_RATE = 0.001 
+        self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE # 0.003
 
     def reset_strategy(self):
         """Cancels orders and closes positions (Market Close)."""
@@ -47,47 +49,40 @@ class PaperTrader:
         self.is_strategy_active = True
         self.reference_price = current_price
         mid = current_price
-        order_size = 100 
+        
+        # FIX: Calculate Quantity in BTC based on USD Target
+        # e.g. $1000 / $80000 = 0.0125 BTC
+        base_size = ORDER_USD_VALUE / mid 
 
         # --- Generate Grids with Mapped Stops ---
         
-        # 1. Price Arrays (Closest to Mid -> Furthest from Mid)
-        # Sells: +0.6% to +2%
+        # 1. Price Arrays
         sells = np.linspace(mid * 1.006, mid * 1.02, 10)
-        
-        # Buys: -0.6% to -2%
-        # Note: linspace(0.994, 0.98) goes High -> Low (Closest -> Furthest)
-        buys = np.linspace(mid * 0.994, mid * 0.98, 10)
+        buys = np.linspace(mid * 0.994, mid * 0.98, 10) # 0.994 is closest, 0.98 furthest
 
         # 2. Stop Variance Array (0% to 3.88%)
-        # Maps 1:1 to the entries above
+        # Mapped 1:1. First order (closest) has 0% variance. Last (furthest) has 3.88%
         stop_variances = np.linspace(0.0, 0.0388, 10)
 
-        # 3. Create Sell Orders + Companion Buy Stops (Above Entry)
+        # 3. Create Sell Orders + Companion Buy Stops
         for i, price in enumerate(sells):
-            # Place Limit Sell
-            self.active_orders.append({'side': 'sell', 'type': 'limit', 'price': price, 'size': order_size})
+            # Recalculate size for this specific price to maintain USD value? 
+            # Or use fixed base_size? Using fixed base_size is safer for consistency.
+            self.active_orders.append({'side': 'sell', 'type': 'limit', 'price': price, 'size': base_size})
             
-            # Stop Price = Entry + (Entry * Variance)
-            # 1st order: Stop = Entry + 0 (Breakeven)
-            # Last order: Stop = Entry + 3.88%
+            # Stop (Short Protection): Above Entry
             variance = stop_variances[i]
             stop_price = price * (1 + variance)
-            
-            self.active_orders.append({'side': 'buy', 'type': 'stop', 'price': stop_price, 'size': order_size})
+            self.active_orders.append({'side': 'buy', 'type': 'stop', 'price': stop_price, 'size': base_size})
 
-        # 4. Create Buy Orders + Companion Sell Stops (Below Entry)
+        # 4. Create Buy Orders + Companion Sell Stops
         for i, price in enumerate(buys):
-            # Place Limit Buy
-            self.active_orders.append({'side': 'buy', 'type': 'limit', 'price': price, 'size': order_size})
+            self.active_orders.append({'side': 'buy', 'type': 'limit', 'price': price, 'size': base_size})
             
-            # Stop Price = Entry - (Entry * Variance)
-            # 1st order: Stop = Entry - 0 (Breakeven)
-            # Last order: Stop = Entry - 3.88%
+            # Stop (Long Protection): Below Entry
             variance = stop_variances[i]
             stop_price = price * (1 - variance)
-            
-            self.active_orders.append({'side': 'sell', 'type': 'stop', 'price': stop_price, 'size': order_size})
+            self.active_orders.append({'side': 'sell', 'type': 'stop', 'price': stop_price, 'size': base_size})
 
     def process_tick(self, bid, ask):
         if not self.is_strategy_active:
@@ -115,38 +110,36 @@ class PaperTrader:
             
             # Stop Buy (Short Protection)
             elif order['type'] == 'stop' and order['side'] == 'buy':
-                # Trigger if Ask rises to or above Stop Price
-                if ask >= order['price'] and self.position < 0:
+                if ask >= order['price'] and self.position < -1e-9: # Check for non-zero short
                     qty = min(order['size'], abs(self.position))
-                    if qty > 0:
+                    if qty > 1e-9:
                         self._execute_trade(qty, order['price'], "Stop Loss Buy")
                         executed = True 
             
             # Stop Sell (Long Protection)
             elif order['type'] == 'stop' and order['side'] == 'sell':
-                # Trigger if Bid falls to or below Stop Price
-                if bid <= order['price'] and self.position > 0:
+                if bid <= order['price'] and self.position > 1e-9: # Check for non-zero long
                     qty = min(order['size'], self.position)
-                    if qty > 0:
+                    if qty > 1e-9:
                         self._execute_trade(-qty, order['price'], "Stop Loss Sell")
                         executed = True
 
             if executed:
                 filled_indices.append(i)
         
-        # Remove filled orders
         for i in sorted(filled_indices, reverse=True):
             del self.active_orders[i]
 
     def _execute_trade(self, size, price, reason):
         # 1. Calculate Transaction Cost (Fee + Slippage)
-        trade_value = abs(size * price)
+        # Notional Value = Quantity * Price
+        trade_value = abs(size * price) 
         cost = trade_value * self.TOTAL_COST_RATE # 0.3%
         self.fees_paid += cost
         self.balance -= cost 
 
         # 2. PnL Calculation
-        if (self.position > 0 and size < 0) or (self.position < 0 and size > 0):
+        if (self.position > 1e-9 and size < 0) or (self.position < -1e-9 and size > 0):
             closing_qty = min(abs(size), abs(self.position))
             pnl = (price - self.avg_entry_price) * closing_qty
             if self.position < 0: pnl = -pnl
@@ -156,14 +149,18 @@ class PaperTrader:
             
         # 3. Update Position
         new_pos = self.position + size
-        if new_pos == 0:
-            self.avg_entry_price = 0
+        if abs(new_pos) < 1e-9: # Close enough to zero
+            self.position = 0.0
+            self.avg_entry_price = 0.0
         elif (self.position >= 0 and size > 0) or (self.position <= 0 and size < 0):
             total_cost = (self.position * self.avg_entry_price) + (size * price)
             self.avg_entry_price = total_cost / new_pos
-            
-        self.position = new_pos
-        self.trade_log.append(f"{reason} | {size:+} @ {price:.2f} | Cost: ${cost:.2f}")
+            self.position = new_pos
+        else:
+            # Reducing position but not flipping, avg entry doesn't change
+            self.position = new_pos
+
+        self.trade_log.append(f"{reason} | {size:+.4f} @ {price:.2f} | Fee: ${cost:.2f}")
 
     def get_stats(self):
         unrealized = 0.0
@@ -233,7 +230,7 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
     return fig
 
 app.layout = html.Div([
-    html.H2(f"Kraken: {SYMBOL} + Paper Trader (Fees: 0.6%)", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
+    html.H2(f"Kraken: {SYMBOL} + Paper Trader", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
     
     # --- Paper Trading Account Panel ---
     html.Div([
@@ -320,7 +317,7 @@ def update(n):
 
     return (fig1, fig2, f"{ratio:.4f}", f"{avg_60m:.4f}", 
             f"${stats['total_equity']:,.2f}", f"${stats['unrealized']:,.2f}", pnl_col,
-            f"${stats['fees']:,.2f}", f"{stats['position']}", pos_col, status_txt, status_col)
+            f"${stats['fees']:,.2f}", f"{stats['position']:.4f}", pos_col, status_txt, status_col)
 
 if __name__ == '__main__':
     app.run(debug=False, port=PORT, host='0.0.0.0')
