@@ -14,7 +14,7 @@ URL = "https://futures.kraken.com/derivatives/api/v3/orderbook"
 PORT = 8080
 UPDATE_INTERVAL_MS = 5000  # 5 seconds
 MAX_HISTORY = 720  # 60 minutes
-ORDER_USD_VALUE = 1000 # $1000 per grid level (adjust as needed)
+ORDER_USD_VALUE = 1000 # $1000 per grid level
 
 # --- Paper Trading Engine ---
 class PaperTrader:
@@ -29,11 +29,10 @@ class PaperTrader:
         self.is_strategy_active = False
         self.reference_price = 0.0
 
-        # Cost Model
-        # User specified: 0.2% Fee + 0.1% Slippage = 0.3% per side (0.6% Round Trip)
+        # Cost Model: 0.2% Fee + 0.1% Slippage = 0.3% per side
         self.FEE_RATE = 0.002      
         self.SLIPPAGE_RATE = 0.001 
-        self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE # 0.003
+        self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE 
 
     def reset_strategy(self):
         """Cancels orders and closes positions (Market Close)."""
@@ -50,37 +49,45 @@ class PaperTrader:
         self.reference_price = current_price
         mid = current_price
         
-        # FIX: Calculate Quantity in BTC based on USD Target
-        # e.g. $1000 / $80000 = 0.0125 BTC
+        # Calculate Quantity in BTC based on USD Target
         base_size = ORDER_USD_VALUE / mid 
 
-        # --- Generate Grids with Mapped Stops ---
+        # --- Generate Grids ---
         
         # 1. Price Arrays
         sells = np.linspace(mid * 1.006, mid * 1.02, 10)
-        buys = np.linspace(mid * 0.994, mid * 0.98, 10) # 0.994 is closest, 0.98 furthest
+        buys = np.linspace(mid * 0.994, mid * 0.98, 10) 
 
         # 2. Stop Variance Array (0% to 3.88%)
-        # Mapped 1:1. First order (closest) has 0% variance. Last (furthest) has 3.88%
         stop_variances = np.linspace(0.0, 0.0388, 10)
 
         # 3. Create Sell Orders + Companion Buy Stops
         for i, price in enumerate(sells):
-            # Recalculate size for this specific price to maintain USD value? 
-            # Or use fixed base_size? Using fixed base_size is safer for consistency.
+            variance = stop_variances[i]
+            
+            # SKIPPING 0% STOP LOSS ORDERS
+            if variance == 0.0:
+                continue
+
+            # Place Limit Sell
             self.active_orders.append({'side': 'sell', 'type': 'limit', 'price': price, 'size': base_size})
             
-            # Stop (Short Protection): Above Entry
-            variance = stop_variances[i]
+            # Stop (Short Protection)
             stop_price = price * (1 + variance)
             self.active_orders.append({'side': 'buy', 'type': 'stop', 'price': stop_price, 'size': base_size})
 
         # 4. Create Buy Orders + Companion Sell Stops
         for i, price in enumerate(buys):
+            variance = stop_variances[i]
+
+            # SKIPPING 0% STOP LOSS ORDERS
+            if variance == 0.0:
+                continue
+
+            # Place Limit Buy
             self.active_orders.append({'side': 'buy', 'type': 'limit', 'price': price, 'size': base_size})
             
-            # Stop (Long Protection): Below Entry
-            variance = stop_variances[i]
+            # Stop (Long Protection)
             stop_price = price * (1 - variance)
             self.active_orders.append({'side': 'sell', 'type': 'stop', 'price': stop_price, 'size': base_size})
 
@@ -110,7 +117,7 @@ class PaperTrader:
             
             # Stop Buy (Short Protection)
             elif order['type'] == 'stop' and order['side'] == 'buy':
-                if ask >= order['price'] and self.position < -1e-9: # Check for non-zero short
+                if ask >= order['price'] and self.position < -1e-9: 
                     qty = min(order['size'], abs(self.position))
                     if qty > 1e-9:
                         self._execute_trade(qty, order['price'], "Stop Loss Buy")
@@ -118,7 +125,7 @@ class PaperTrader:
             
             # Stop Sell (Long Protection)
             elif order['type'] == 'stop' and order['side'] == 'sell':
-                if bid <= order['price'] and self.position > 1e-9: # Check for non-zero long
+                if bid <= order['price'] and self.position > 1e-9: 
                     qty = min(order['size'], self.position)
                     if qty > 1e-9:
                         self._execute_trade(-qty, order['price'], "Stop Loss Sell")
@@ -131,10 +138,9 @@ class PaperTrader:
             del self.active_orders[i]
 
     def _execute_trade(self, size, price, reason):
-        # 1. Calculate Transaction Cost (Fee + Slippage)
-        # Notional Value = Quantity * Price
+        # 1. Calculate Transaction Cost
         trade_value = abs(size * price) 
-        cost = trade_value * self.TOTAL_COST_RATE # 0.3%
+        cost = trade_value * self.TOTAL_COST_RATE 
         self.fees_paid += cost
         self.balance -= cost 
 
@@ -149,7 +155,7 @@ class PaperTrader:
             
         # 3. Update Position
         new_pos = self.position + size
-        if abs(new_pos) < 1e-9: # Close enough to zero
+        if abs(new_pos) < 1e-9: 
             self.position = 0.0
             self.avg_entry_price = 0.0
         elif (self.position >= 0 and size > 0) or (self.position <= 0 and size < 0):
@@ -157,7 +163,6 @@ class PaperTrader:
             self.avg_entry_price = total_cost / new_pos
             self.position = new_pos
         else:
-            # Reducing position but not flipping, avg entry doesn't change
             self.position = new_pos
 
         self.trade_log.append(f"{reason} | {size:+.4f} @ {price:.2f} | Fee: ${cost:.2f}")
