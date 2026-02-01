@@ -216,8 +216,7 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
 
     if active_orders:
         y_max = max(bids['cumulative'].max(), asks['cumulative'].max())
-        # With log scale on X, Y levels are unaffected, but keeping visual logic
-        y_level = y_max * 0.5 
+        y_level = y_max * 0.5
         
         buy_prices = [o['price'] for o in active_orders if o['side'] == 'buy' and o['type'] == 'limit']
         sell_prices = [o['price'] for o in active_orders if o['side'] == 'sell' and o['type'] == 'limit']
@@ -269,12 +268,13 @@ app.layout = html.Div([
     ], style={'textAlign': 'center'}),
 
     dcc.Graph(id='focused-chart'),
+    dcc.Graph(id='ten-percent-chart'),
     dcc.Graph(id='full-chart'),
     dcc.Interval(id='timer', interval=UPDATE_INTERVAL_MS, n_intervals=0)
 ], style={'backgroundColor': '#111', 'padding': '20px', 'minHeight': '100vh', 'fontFamily': 'sans-serif'})
 
 @app.callback(
-    [Output('focused-chart', 'figure'), Output('full-chart', 'figure'),
+    [Output('focused-chart', 'figure'), Output('ten-percent-chart', 'figure'), Output('full-chart', 'figure'),
      Output('ratio-val', 'children'), Output('avg-val', 'children'),
      Output('equity-display', 'children'), Output('pnl-display', 'children'),
      Output('pnl-display', 'style'), Output('fees-display', 'children'),
@@ -284,7 +284,7 @@ app.layout = html.Div([
 )
 def update(n):
     ob = fetch_order_book()
-    if not ob: return go.Figure(), go.Figure(), "-", "-", "-", "-", {}, "-", "-", {}, "OFFLINE", {'color': 'red'}
+    if not ob: return go.Figure(), go.Figure(), go.Figure(), "-", "-", "-", "-", {}, "-", "-", {}, "OFFLINE", {'color': 'red'}
 
     bids, asks = process_data(ob)
     best_bid = bids['price'].iloc[0]
@@ -294,6 +294,11 @@ def update(n):
     # 1. Calc Ratio
     b_sub = bids[bids['price'] >= mid * 0.98]
     a_sub = asks[asks['price'] <= mid * 1.02]
+    
+    # 10% Depth
+    b_10 = bids[bids['price'] >= mid * 0.90]
+    a_10 = asks[asks['price'] <= mid * 1.10]
+    
     vb, va = b_sub['size'].sum(), a_sub['size'].sum()
     ratio = 0 if va == 0 else 1 - (vb / va)
     
@@ -319,9 +324,10 @@ def update(n):
     pos_col = {'color': '#2ECC40'} if stats['position'] > 0 else ({'color': '#FF4136'} if stats['position'] < 0 else {'color': '#ccc'})
     
     fig1 = build_figure(b_sub, a_sub, f"Active Depth ±2% ({mid:.1f})", False, trader.active_orders)
-    fig2 = build_figure(bids, asks, "Full Book", True, trader.active_orders)
+    fig2 = build_figure(b_10, a_10, f"Depth ±10% ({mid:.1f})", False, trader.active_orders)
+    fig3 = build_figure(bids, asks, "Full Book", True, trader.active_orders)
 
-    return (fig1, fig2, f"{ratio:.4f}", f"{avg_60m:.4f}", 
+    return (fig1, fig2, fig3, f"{ratio:.4f}", f"{avg_60m:.4f}", 
             f"${stats['total_equity']:,.2f}", f"${stats['unrealized']:,.2f}", pnl_col,
             f"${stats['fees']:,.2f}", f"{stats['position']:.4f}", pos_col, status_txt, status_col)
 
