@@ -25,7 +25,7 @@ def fetch_binance_data(symbol='BTCUSDT', start_date='2020-01-01'):
         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
     ])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('tdf['close'] = df['close'].astype(float)
+    df.set_index('tdf['close'] = df['close'].astype(float)')
     return df[['open', 'high', 'low', 'close', 'volume']]
 
 # 2. Compute SMAs and shift them
