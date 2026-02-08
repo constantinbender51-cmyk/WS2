@@ -4,12 +4,12 @@
 pandas
 numpy
 
-# Cryptocurrency data fetching
-ccxt
-
 # Web framework and visualization
 flask
 matplotlib
 
-# Machine learning and symbolic regression
+# Machine learning and time series
 statsmodels
+
+# HTTP requests for Binance API
+requests
