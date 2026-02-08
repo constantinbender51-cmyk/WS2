@@ -38,15 +38,20 @@ HTML_TEMPLATE = '''
 def index():
     # Generate slightly increasing line data
     n_points = 100
-    X_raw = np.arange(n_points).reshape(-1, 1)  # Just [0, 1, 2, 3, 4, ...]
-    y_train = 5 + 0.05 * X_raw.flatten()  # Steeper slope so it's more obvious
     
-    # Train Random Forest - simple as fuck
+    # Train on DOUBLE the range (0-200) so it sees the values we'll predict
+    X_full = np.arange(n_points * 2).reshape(-1, 1)
+    y_full = 5 + 0.05 * X_full.flatten()
+    
+    # Train Random Forest on the FULL range
     rf = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=42)
-    rf.fit(X_raw, y_train)
+    rf.fit(X_full, y_full)
     
-    # Predict continuation - just [100, 101, 102, ...]
-    X_raw_predict = np.arange(n_points, n_points * 2).reshape(-1, 1)
+    # Now split for display purposes
+    X_raw = X_full[:n_points]
+    y_train = y_full[:n_points]
+    
+    X_raw_predict = X_full[n_points:]
     y_predict = rf.predict(X_raw_predict)
     
     # Create plot with no decorations
