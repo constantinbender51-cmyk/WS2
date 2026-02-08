@@ -4,5 +4,7 @@ ccxt
 numpy
 tqdm
 requests
-pickle
+pickle-mixin
 datetime
+scikit-learn
+flask
