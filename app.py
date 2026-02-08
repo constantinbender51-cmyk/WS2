@@ -38,48 +38,28 @@ HTML_TEMPLATE = '''
 def index():
     # Generate slightly increasing line data
     n_points = 100
-    X_raw = np.arange(n_points)
-    y_train = 5 + 0.02 * X_raw  # Slight upward slope
+    X_raw = np.arange(n_points).reshape(-1, 1)  # Just [0, 1, 2, 3, 4, ...]
+    y_train = 5 + 0.05 * X_raw.flatten()  # Steeper slope so it's more obvious
     
-    # Create features using LAGGED values (previous y value and position)
-    # This way the RF learns: "next value = previous value + slope"
-    X_train_features = []
-    y_train_targets = []
+    # Train Random Forest - simple as fuck
+    rf = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=42)
+    rf.fit(X_raw, y_train)
     
-    for i in range(1, n_points):
-        X_train_features.append([y_train[i-1], X_raw[i]])  # [previous_y, current_x]
-        y_train_targets.append(y_train[i])
-    
-    X_train_features = np.array(X_train_features)
-    y_train_targets = np.array(y_train_targets)
-    
-    # Train Random Forest
-    rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf.fit(X_train_features, y_train_targets)
-    
-    # Predict continuation - iteratively using previous predictions
-    X_raw_predict = np.arange(n_points, n_points * 2)
-    y_predict = []
-    last_y = y_train[-1]
-    
-    for x in X_raw_predict:
-        next_y = rf.predict([[last_y, x]])[0]
-        y_predict.append(next_y)
-        last_y = next_y
-    
-    y_predict = np.array(y_predict)
+    # Predict continuation - just [100, 101, 102, ...]
+    X_raw_predict = np.arange(n_points, n_points * 2).reshape(-1, 1)
+    y_predict = rf.predict(X_raw_predict)
     
     # Create plot with no decorations
     fig, ax = plt.subplots(figsize=(12, 6))
     
     # Plot original data (increasing line)
-    ax.plot(X_raw, y_train, 'b-', linewidth=2)
+    ax.plot(X_raw.flatten(), y_train, 'b-', linewidth=2)
     
     # Plot vertical separator
     ax.axvline(x=n_points, color='red', linestyle='-', linewidth=2)
     
     # Plot prediction
-    ax.plot(X_raw_predict, y_predict, 'g-', linewidth=2)
+    ax.plot(X_raw_predict.flatten(), y_predict, 'g-', linewidth=2)
     
     # Remove all decorations
     ax.set_xlim(0, n_points * 2)
