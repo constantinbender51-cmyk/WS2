@@ -16,8 +16,8 @@ app = Flask(__name__)
 def fetch_btc_data():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
-    # Fetching limited history for speed. In prod, fetch full history.
     try:
+        # Fetch sufficient history
         ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=1500)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
@@ -30,55 +30,56 @@ df = fetch_btc_data()
 df['sma_365'] = df['close'].rolling(window=365).mean()
 data = df.dropna(subset=['sma_365']).reset_index(drop=True)
 
-# Downsample for GP speed (GPs are O(N^3) complexity)
-# We take every 5th point to keep the matrix inversion fast
-X = np.arange(len(data))[::5].reshape(-1, 1)
-y = data['sma_365'].values[::5]
+# Downsample for GP speed (O(N^3) complexity)
+X_train = np.arange(len(data))[::5].reshape(-1, 1)
+y_train = data['sma_365'].values[::5]
 
-# Kernel Construction:
-# 1. Trend: DotProduct() allows the model to extrapolate linearly/polynomially.
-# 2. Local: RBF() captures the smooth curvature of the SMA.
-# 3. Noise: WhiteKernel() handles sensor noise/irregularities.
+# Kernel Construction
 kernel = C(1.0) * DotProduct(sigma_0=1.0) + C(1.0) * RBF(length_scale=100.0) + WhiteKernel(noise_level=1.0)
 
 gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True)
 
-print("Fitting GP (O(N^3) operation)...")
-gp.fit(X, y)
+print("Fitting GP...")
+gp.fit(X_train, y_train)
 print(f"Learned Kernel: {gp.kernel_}")
 
 # --- 3. Extrapolation ---
-future_days = 365 * 2 # 2 Years
+future_days = 730 # 2 Years
 X_future = np.arange(len(data) + future_days).reshape(-1, 1)
 
-# Predict Mean AND Standard Deviation (Confidence Interval)
 y_pred, sigma = gp.predict(X_future, return_std=True)
 
 # --- 4. Server ---
 @app.route('/')
-def plot_gp():
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    # Historical Data (All points, not just downsampled)
-    ax.scatter(np.arange(len(data)), data['sma_365'], c='k', s=5, label='Actual Data', alpha=0.5)
+def plot_gp_visible():
+    fig, ax = plt.subplots(figsize=(14, 8))
     
     # GP Mean Prediction
-    ax.plot(X_future, y_pred, 'b-', label='GP Posterior Mean', linewidth=2)
+    ax.plot(X_future, y_pred, color='navy', linewidth=2, label='GP Posterior Mean', zorder=5)
     
-    # Confidence Intervals (95% = 1.96 std dev)
+    # Confidence Intervals
     ax.fill_between(X_future.ravel(), 
                     y_pred - 1.96 * sigma, 
                     y_pred + 1.96 * sigma, 
-                    alpha=0.2, color='blue', label='95% Confidence Interval')
+                    alpha=0.2, color='blue', label='95% Confidence Interval', zorder=4)
     
-    ax.set_title(f"Gaussian Process Extrapolation\nKernel: {gp.kernel_}", fontsize=10)
+    # Actual Data (High Visibility Settings)
+    # Plotting every point (not downsampled) to ensure density is visible
+    ax.scatter(np.arange(len(data)), data['sma_365'], 
+               color='crimson',    # High contrast Red
+               s=25,               # Larger size
+               alpha=1.0,          # Solid opacity
+               label='Actual Data (BTC 365-SMA)', 
+               zorder=10)          # Draw ON TOP of lines
+    
+    ax.set_title(f"Gaussian Process Extrapolation (High Visibility)\nKernel: {gp.kernel_}", fontsize=10)
     ax.set_xlabel('Days')
-    ax.set_ylabel('BTC 365-SMA')
-    ax.legend(loc='upper left')
-    ax.grid(True, linestyle='--')
+    ax.set_ylabel('BTC 365-SMA (USDT)')
+    ax.legend(loc='upper left', framealpha=1.0)
+    ax.grid(True, linestyle='--', alpha=0.5)
     
     output = io.BytesIO()
-    fig.savefig(output, format='png')
+    fig.savefig(output, format='png', dpi=100)
     plt.close(fig)
     output.seek(0)
     
