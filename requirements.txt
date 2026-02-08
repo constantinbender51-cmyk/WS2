@@ -1,15 +1,6 @@
-dash
-plotly
 pandas
 numpy
 matplotlib
-deap
-requests
 flask
 scikit-learn
 python-binance
-scipy
-ccxt
-python-dotenv
-tqdm
-pickle-mixin
