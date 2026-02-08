@@ -17,40 +17,29 @@ HTML_TEMPLATE = '''
     <style>
         body {
             margin: 0;
-            padding: 20px;
+            padding: 0;
             background-color: white;
-            font-family: Arial, sans-serif;
-        }
-        h1 {
-            text-align: center;
-            color: #333;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
         }
         img {
             display: block;
-            margin: 20px auto;
-            max-width: 100%;
+            width: 100%;
+            height: 100vh;
+            object-fit: contain;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Random Forest Predicting a Flat Line</h1>
-        <img src="data:image/png;base64,{{ img_data }}" alt="Line prediction">
-    </div>
+    <img src="data:image/png;base64,{{ img_data }}" alt="Line prediction">
 </body>
 </html>
 '''
 
 @app.route('/')
 def index():
-    # Generate flat line data
+    # Generate slightly increasing line data
     n_points = 100
     X_train = np.arange(n_points).reshape(-1, 1)
-    y_train = np.ones(n_points) * 5  # Flat line at y=5
+    y_train = 5 + 0.02 * X_train.flatten()  # Slight upward slope
     
     # Train Random Forest
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
@@ -60,24 +49,22 @@ def index():
     X_predict = np.arange(n_points, n_points * 2).reshape(-1, 1)
     y_predict = rf.predict(X_predict)
     
-    # Create plot
+    # Create plot with no decorations
     fig, ax = plt.subplots(figsize=(12, 6))
     
     # Plot original data (flat line)
-    ax.plot(X_train, y_train, 'b-', linewidth=2, label='Original Data')
+    ax.plot(X_train, y_train, 'b-', linewidth=2)
     
     # Plot vertical separator
-    ax.axvline(x=n_points, color='red', linestyle='--', linewidth=2, label='Separator')
+    ax.axvline(x=n_points, color='red', linestyle='-', linewidth=2)
     
     # Plot prediction
-    ax.plot(X_predict, y_predict, 'g-', linewidth=2, label='Random Forest Prediction')
+    ax.plot(X_predict, y_predict, 'g-', linewidth=2)
     
-    ax.set_xlabel('X', fontsize=12)
-    ax.set_ylabel('Y', fontsize=12)
-    ax.set_title('Random Forest: Because Even AI Knows a Flat Line When It Sees One', fontsize=14)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
+    # Remove all decorations
+    ax.set_xlim(0, n_points * 2)
     ax.set_ylim(0, 10)
+    ax.axis('off')
     
     # Convert plot to base64 image
     img_buffer = io.BytesIO()
