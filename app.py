@@ -10,6 +10,19 @@ warnings.filterwarnings('ignore')
 from statsmodels.tsa.arima.model import ARIMA
 from itertools import product
 import requests
+import threading
+import time
+
+# Global variables to store model state
+model_state = {
+    'model_trained': False,
+    'forecast_plot': None,
+    'best_params': None,
+    'aic_value': None,
+    'forecast_values': None,
+    'forecast_dates': None,
+    'last_update': None
+}
 
 # Fetch Bitcoin data from Binance API
 def fetch_btc_data():
@@ -73,8 +86,11 @@ def grid_search_arima(train_data, max_p=3, max_d=2, max_q=3):
     
     return best_params, best_aic
 
-# Main function to prepare data and train model
-def run_arima_analysis():
+# Train the model in a separate thread
+def train_model():
+    global model_state
+    
+    print("Starting model training...")
     print("Fetching Bitcoin data...")
     btc_data = fetch_btc_data()
     
@@ -129,14 +145,69 @@ def run_arima_analysis():
     plot_url = base64.b64encode(img_buffer.getvalue()).decode()
     plt.close()
     
-    return plot_url, best_params, best_aic, forecast, forecast_dates
+    # Update model state
+    model_state['model_trained'] = True
+    model_state['forecast_plot'] = plot_url
+    model_state['best_params'] = best_params
+    model_state['aic_value'] = best_aic
+    model_state['forecast_values'] = forecast
+    model_state['forecast_dates'] = forecast_dates
+    model_state['last_update'] = datetime.now()
+    
+    print("Model training completed!")
+
+# Start model training in background
+def start_training():
+    training_thread = threading.Thread(target=train_model)
+    training_thread.daemon = True
+    training_thread.start()
+    return training_thread
 
 # Create Flask app
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    plot_url, best_params, best_aic, forecast, forecast_dates = run_arima_analysis()
+    global model_state
+    
+    # Check if model is trained
+    if not model_state['model_trained']:
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Bitcoin 21-Day SMA ARIMA Forecast</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                .container { max-width: 800px; margin: 0 auto; }
+                .loading { background-color: #f5f5f5; padding: 20px; border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Bitcoin 21-Day SMA ARIMA Forecast</h1>
+                <div class="loading">
+                    <h2>Training model...</h2>
+                    <p>Please wait while the ARIMA model is being trained. This may take a few minutes.</p>
+                    <p>The page will automatically refresh once training is complete.</p>
+                    <script>
+                        setTimeout(function() {
+                            window.location.reload();
+                        }, 10000); // Refresh every 10 seconds
+                    </script>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        return html_template
+    
+    # If model is trained, show results
+    plot_url = model_state['forecast_plot']
+    best_params = model_state['best_params']
+    aic_value = model_state['aic_value']
+    forecast = model_state['forecast_values']
+    forecast_dates = model_state['forecast_dates']
     
     forecast_text = "<ul>"
     for i, date in enumerate(forecast_dates):
@@ -163,8 +234,9 @@ def index():
             <div class="info-box">
                 <h2>Model Information</h2>
                 <p><strong>Optimal Parameters:</strong> ARIMA{best_params}</p>
-                <p><strong>Akaike Information Criterion (AIC):</strong> {best_aic:.2f}</p>
+                <p><strong>Akaike Information Criterion (AIC):</strong> {aic_value:.2f}</p>
                 <p><strong>Forecast Period:</strong> Next 7 days</p>
+                <p><strong>Last Updated:</strong> {model_state['last_update'].strftime('%Y-%m-%d %H:%M:%S')}</p>
             </div>
             
             <div class="info-box">
@@ -184,5 +256,11 @@ def index():
     return render_template_string(html_template)
 
 if __name__ == '__main__':
-    print("Starting server... Please wait while data is processed.")
+    print("Starting server...")
+    print("Model training will begin in the background...")
+    
+    # Start model training in background
+    training_thread = start_training()
+    
+    # Start Flask app
     app.run(debug=True, host='0.0.0.0', port=5000)
