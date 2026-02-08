@@ -8,22 +8,25 @@ app = Flask(__name__)
 
 @app.route('/')
 def plot():
-    # Straight line: y = 50 from x=0 to x=10
+    # Create line at -10 degrees: y = 50 - x * tan(10°)
+    angle_rad = np.deg2rad(10)
+    slope = np.tan(angle_rad)
+    
     x_train = np.linspace(0, 10, 100).reshape(-1, 1)
-    y_train = np.full(100, 50.0)
-
+    y_train = 50 - (x_train.flatten() * slope)
+    
     # Train RF
     model = RandomForestRegressor(n_estimators=100, random_state=0)
     model.fit(x_train, y_train)
-
+    
     # Predict continuation: x=10 to x=20
     x_pred = np.linspace(10, 20, 100).reshape(-1, 1)
     y_pred = model.predict(x_pred)
-
+    
     # Combine
     x_combined = np.concatenate([x_train.flatten(), x_pred.flatten()])
     y_combined = np.concatenate([y_train, y_pred])
-
+    
     # Plot
     fig, ax = plt.subplots(figsize=(12, 4), facecolor='white')
     
@@ -31,7 +34,7 @@ def plot():
     ax.plot(x_combined, y_combined, color='black', linewidth=2)
     
     # Vertical line at prediction start (x=10)
-    ax.axvline(x=10, color='black', linewidth=1.5, linestyle='-')
+    ax.axvline(x=10, color='black', linewidth=1.5)
 
     # Kill all elements
     ax.set_axis_off()
