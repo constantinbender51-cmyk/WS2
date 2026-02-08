@@ -61,7 +61,7 @@ est_gp = SymbolicRegressor(
     p_point_mutation=0.1,
     max_samples=0.95,
     verbose=1,
-    parsimony_coefficient=0.001, # Low penalty for complexity
+    parsimony_coefficient=0.01, # Low penalty for complexity
     function_set=['add', 'sub', 'mul', 'div', 
                   'sin', 'cos', 'tan', 'sqrt', 'log', 'abs', 'neg'],
     n_jobs=-1,                  # Parallel processing
