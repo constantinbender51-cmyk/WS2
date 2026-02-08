@@ -1,335 +1,127 @@
-import requests
 import pandas as pd
-import plotly.graph_objects as go
-from dash import Dash, dcc, html
-from dash.dependencies import Input, Output
-from collections import deque
-import statistics
 import numpy as np
-import datetime
+from binance import Client
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+from flask import Flask, Response
+import io
+import base64
+from datetime import datetime, timedelta
 
-# --- Configuration ---
-SYMBOL = "PF_XBTUSD"
-URL = "https://futures.kraken.com/derivatives/api/v3/orderbook"
-PORT = 8080
-UPDATE_INTERVAL_MS = 5000  # 5 seconds
-MAX_HISTORY = 720  # 60 minutes
-ORDER_USD_VALUE = 1000 # $1000 per grid level
+# Initialize Binance client (no API keys needed for public data)
+client = Client()
 
-# --- Paper Trading Engine ---
-class PaperTrader:
-    def __init__(self, initial_balance=10000):
-        self.balance = initial_balance
-        self.position = 0.0
-        self.avg_entry_price = 0.0
-        self.realized_pnl = 0.0
-        self.fees_paid = 0.0
-        self.active_orders = [] 
-        self.trade_log = deque(maxlen=50)
-        self.is_strategy_active = False
-        self.reference_price = 0.0
+# 1. Fetch 1h OHLC data from Binance since 2020
+def fetch_binance_data(symbol='BTCUSDT', start_date='2020-01-01'):
+    klines = client.get_historical_klines(
+        symbol,
+        Client.KLINE_INTERVAL_1HOUR,
+        start_date
+    )
+    df = pd.DataFrame(klines, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+    ])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('tdf['close'] = df['close'].astype(float)
+    return df[['open', 'high', 'low', 'close', 'volume']]
 
-        # Cost Model: 0.2% Fee + 0.1% Slippage = 0.3% per side
-        self.FEE_RATE = 0.002      
-        self.SLIPPAGE_RATE = 0.001 
-        self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE 
-
-    def reset_strategy(self):
-        """Cancels orders and closes positions (Market Close)."""
-        self.active_orders = []
-        if self.position != 0:
-            self._execute_trade(-self.position, self.reference_price, "Strategy Deactivated")
-        self.is_strategy_active = False
-
-    def activate_strategy(self, current_price):
-        if self.is_strategy_active:
-            return 
-            
-        self.is_strategy_active = True
-        self.reference_price = current_price
-        mid = current_price
-        
-        # Calculate Quantity in BTC based on USD Target
-        base_size = ORDER_USD_VALUE / mid 
-
-        # --- Generate Grids ---
-        
-        # 1. Price Arrays
-        sells = np.linspace(mid * 1.006, mid * 1.02, 10)
-        buys = np.linspace(mid * 0.994, mid * 0.98, 10) 
-
-        # 2. Stop Variance Array (0% to 3.88%)
-        stop_variances = np.linspace(0.0, 0.0388, 10)
-
-        # 3. Create Sell Orders + Companion Buy Stops
-        for i, price in enumerate(sells):
-            variance = stop_variances[i]
-            
-            # SKIPPING 0% STOP LOSS ORDERS
-            if variance == 0.0:
-                continue
-
-            # Place Limit Sell
-            self.active_orders.append({'side': 'sell', 'type': 'limit', 'price': price, 'size': base_size})
-            
-            # Stop (Short Protection)
-            stop_price = price * (1 + variance)
-            self.active_orders.append({'side': 'buy', 'type': 'stop', 'price': stop_price, 'size': base_size})
-
-        # 4. Create Buy Orders + Companion Sell Stops
-        for i, price in enumerate(buys):
-            variance = stop_variances[i]
-
-            # SKIPPING 0% STOP LOSS ORDERS
-            if variance == 0.0:
-                continue
-
-            # Place Limit Buy
-            self.active_orders.append({'side': 'buy', 'type': 'limit', 'price': price, 'size': base_size})
-            
-            # Stop (Long Protection)
-            stop_price = price * (1 - variance)
-            self.active_orders.append({'side': 'sell', 'type': 'stop', 'price': stop_price, 'size': base_size})
-
-    def process_tick(self, bid, ask):
-        if not self.is_strategy_active:
-            return
-
-        current_mid = (bid + ask) / 2
-        self.reference_price = current_mid
-        
-        filled_indices = []
-
-        for i, order in enumerate(self.active_orders):
-            executed = False
-            
-            # Limit Buy
-            if order['type'] == 'limit' and order['side'] == 'buy':
-                if ask <= order['price']:
-                    self._execute_trade(order['size'], order['price'], "Limit Buy")
-                    executed = True
-            
-            # Limit Sell
-            elif order['type'] == 'limit' and order['side'] == 'sell':
-                if bid >= order['price']:
-                    self._execute_trade(-order['size'], order['price'], "Limit Sell")
-                    executed = True
-            
-            # Stop Buy (Short Protection)
-            elif order['type'] == 'stop' and order['side'] == 'buy':
-                if ask >= order['price'] and self.position < -1e-9: 
-                    qty = min(order['size'], abs(self.position))
-                    if qty > 1e-9:
-                        self._execute_trade(qty, order['price'], "Stop Loss Buy")
-                        executed = True 
-            
-            # Stop Sell (Long Protection)
-            elif order['type'] == 'stop' and order['side'] == 'sell':
-                if bid <= order['price'] and self.position > 1e-9: 
-                    qty = min(order['size'], self.position)
-                    if qty > 1e-9:
-                        self._execute_trade(-qty, order['price'], "Stop Loss Sell")
-                        executed = True
-
-            if executed:
-                filled_indices.append(i)
-        
-        for i in sorted(filled_indices, reverse=True):
-            del self.active_orders[i]
-
-    def _execute_trade(self, size, price, reason):
-        # 1. Calculate Transaction Cost
-        trade_value = abs(size * price) 
-        cost = trade_value * self.TOTAL_COST_RATE 
-        self.fees_paid += cost
-        self.balance -= cost 
-
-        # 2. PnL Calculation
-        if (self.position > 1e-9 and size < 0) or (self.position < -1e-9 and size > 0):
-            closing_qty = min(abs(size), abs(self.position))
-            pnl = (price - self.avg_entry_price) * closing_qty
-            if self.position < 0: pnl = -pnl
-            
-            self.realized_pnl += pnl
-            self.balance += pnl
-            
-        # 3. Update Position
-        new_pos = self.position + size
-        if abs(new_pos) < 1e-9: 
-            self.position = 0.0
-            self.avg_entry_price = 0.0
-        elif (self.position >= 0 and size > 0) or (self.position <= 0 and size < 0):
-            total_cost = (self.position * self.avg_entry_price) + (size * price)
-            self.avg_entry_price = total_cost / new_pos
-            self.position = new_pos
-        else:
-            self.position = new_pos
-
-        self.trade_log.append(f"{reason} | {size:+.4f} @ {price:.2f} | Fee: ${cost:.2f}")
-
-    def get_stats(self):
-        unrealized = 0.0
-        if self.position != 0:
-            unrealized = (self.reference_price - self.avg_entry_price) * self.position
-        
-        return {
-            'balance': self.balance,
-            'position': self.position,
-            'realized': self.realized_pnl,
-            'unrealized': unrealized,
-            'fees': self.fees_paid,
-            'total_equity': self.balance + unrealized
-        }
-
-# --- Global State ---
-ratio_history = deque(maxlen=MAX_HISTORY)
-trader = PaperTrader()
-
-app = Dash(__name__)
-
-def fetch_order_book():
-    try:
-        response = requests.get(URL, params={'symbol': SYMBOL}, timeout=3)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('result') == 'success':
-            return data.get('orderBook', {})
-        return None
-    except:
-        return None
-
-def process_data(order_book):
-    bids = pd.DataFrame(order_book.get('bids', []), columns=['price', 'size']).astype(float)
-    bids = bids.sort_values(by='price', ascending=False)
-    bids['cumulative'] = bids['size'].cumsum()
-
-    asks = pd.DataFrame(order_book.get('asks', []), columns=['price', 'size']).astype(float)
-    asks = asks.sort_values(by='price', ascending=True)
-    asks['cumulative'] = asks['size'].cumsum()
-    return bids, asks
-
-def build_figure(bids, asks, title, log_scale=False, active_orders=None):
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(x=bids['price'], y=bids['cumulative'], fill='tozeroy', name='Bids', line=dict(color='green')))
-    fig.add_trace(go.Scatter(x=asks['price'], y=asks['cumulative'], fill='tozeroy', name='Asks', line=dict(color='red')))
-
-    if active_orders:
-        y_max = max(bids['cumulative'].max(), asks['cumulative'].max())
-        y_level = y_max * 0.5
-        
-        buy_prices = [o['price'] for o in active_orders if o['side'] == 'buy' and o['type'] == 'limit']
-        sell_prices = [o['price'] for o in active_orders if o['side'] == 'sell' and o['type'] == 'limit']
-        stop_prices = [o['price'] for o in active_orders if o['type'] == 'stop']
-
-        if buy_prices:
-            fig.add_trace(go.Scatter(x=buy_prices, y=[y_level]*len(buy_prices), mode='markers', marker=dict(symbol='triangle-up', size=10, color='cyan'), name='Limit Buy'))
-        if sell_prices:
-            fig.add_trace(go.Scatter(x=sell_prices, y=[y_level]*len(sell_prices), mode='markers', marker=dict(symbol='triangle-down', size=10, color='orange'), name='Limit Sell'))
-        if stop_prices:
-             fig.add_trace(go.Scatter(x=stop_prices, y=[y_level]*len(stop_prices), mode='markers', marker=dict(symbol='x', size=8, color='magenta'), name='Stop Order'))
-
-    layout_args = dict(title=title, xaxis_title="Price", yaxis_title="Vol", template="plotly_dark", height=400, margin=dict(l=40, r=40, t=40, b=40))
-    if log_scale: layout_args['xaxis_type'] = "log"
-    fig.update_layout(**layout_args)
-    return fig
-
-app.layout = html.Div([
-    html.H2(f"Kraken: {SYMBOL} + Paper Trader", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
+# 2. Compute SMAs and shift them
+def add_sma_features(df):
+    # Calculate SMAs
+    df['sma_365'] = df['close'].rolling(window=365).mean()
+    df['sma_730'] = df['close'].rolling(window=730).mean()
+    df['sma_1460'] = df['close'].rolling(window=1460).mean()
     
-    # --- Paper Trading Account Panel ---
-    html.Div([
-        html.Div([
-            html.H4("Equity", style={'margin': '0', 'color': '#aaa'}),
-            html.H2(id='equity-display', style={'margin': '5px', 'color': '#fff'})
-        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
-        html.Div([
-            html.H4("Unrealized PnL", style={'margin': '0', 'color': '#aaa'}),
-            html.H2(id='pnl-display', style={'margin': '5px'})
-        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
-        html.Div([
-            html.H4("Fees Paid", style={'margin': '0', 'color': '#aaa'}),
-            html.H2(id='fees-display', style={'margin': '5px', 'color': '#FF851B'})
-        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
-        html.Div([
-            html.H4("Position", style={'margin': '0', 'color': '#aaa'}),
-            html.H2(id='pos-display', style={'margin': '5px'})
-        ], style={'flex': 1, 'textAlign': 'center'}),
-        html.Div([
-            html.H4("Status", style={'margin': '0', 'color': '#aaa'}),
-            html.H2(id='status-display', style={'margin': '5px'})
-        ], style={'flex': 1, 'textAlign': 'center', 'borderLeft': '1px solid #444'}),
-    ], style={'display': 'flex', 'backgroundColor': '#222', 'marginBottom': '20px', 'padding': '10px', 'borderRadius': '8px'}),
-
-    # --- Metrics ---
-    html.Div([
-        html.Div([html.H5("Current Ratio"), html.H3(id='ratio-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'}),
-        html.Div([html.H5("60m Avg Ratio"), html.H3(id='avg-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'})
-    ], style={'textAlign': 'center'}),
-
-    dcc.Graph(id='focused-chart'),
-    dcc.Graph(id='ten-percent-chart'),
-    dcc.Graph(id='full-chart'),
-    dcc.Interval(id='timer', interval=UPDATE_INTERVAL_MS, n_intervals=0)
-], style={'backgroundColor': '#111', 'padding': '20px', 'minHeight': '100vh', 'fontFamily': 'sans-serif'})
-
-@app.callback(
-    [Output('focused-chart', 'figure'), Output('ten-percent-chart', 'figure'), Output('full-chart', 'figure'),
-     Output('ratio-val', 'children'), Output('avg-val', 'children'),
-     Output('equity-display', 'children'), Output('pnl-display', 'children'),
-     Output('pnl-display', 'style'), Output('fees-display', 'children'),
-     Output('pos-display', 'children'), Output('pos-display', 'style'),
-     Output('status-display', 'children'), Output('status-display', 'style')],
-    [Input('timer', 'n_intervals')]
-)
-def update(n):
-    ob = fetch_order_book()
-    if not ob: return go.Figure(), go.Figure(), go.Figure(), "-", "-", "-", "-", {}, "-", "-", {}, "OFFLINE", {'color': 'red'}
-
-    bids, asks = process_data(ob)
-    best_bid = bids['price'].iloc[0]
-    best_ask = asks['price'].iloc[0]
-    mid = (best_bid + best_ask) / 2
-
-    # 1. Calc Ratio
-    b_sub = bids[bids['price'] >= mid * 0.98]
-    a_sub = asks[asks['price'] <= mid * 1.02]
+    # Shift SMAs to future (negative shift = future values)
+    df['sma_365_shifted'] = df['sma_365'].shift(-365)
+    df['sma_730_shifted'] = df['sma_730'].shift(-730)
+    df['sma_1460_shifted'] = df['sma_1460'].shift(-1460)
     
-    # 10% Depth
-    b_10 = bids[bids['price'] >= mid * 0.90]
-    a_10 = asks[asks['price'] <= mid * 1.10]
-    
-    vb, va = b_sub['size'].sum(), a_sub['size'].sum()
-    ratio = 0 if va == 0 else 1 - (vb / va)
-    
-    ratio_history.append(ratio)
-    avg_60m = statistics.mean(ratio_history) if ratio_history else 0
+    return df
 
-    # 2. Strategy Logic
-    active_zone = -0.1 <= avg_60m <= 0.1
+# 3. Prepare data for training
+def prepare_ml_data(df):
+    # Features: current price and SMAs
+    feature_cols = ['close', 'sma_365', 'sma_730', 'sma_1460']
+    target_cols = ['sma_365_shifted', 'sma_730_shifted', 'sma_1460_shifted']
     
-    if active_zone:
-        trader.activate_strategy(mid)
-        status_txt = "ACTIVE"
-        status_col = {'color': '#2ECC40'}
-    else:
-        trader.reset_strategy()
-        status_txt = "CLOSED"
-        status_col = {'color': '#FF4136'}
-
-    trader.process_tick(best_bid, best_ask)
-    stats = trader.get_stats()
-
-    pnl_col = {'color': '#2ECC40'} if stats['unrealized'] >= 0 else {'color': '#FF4136'}
-    pos_col = {'color': '#2ECC40'} if stats['position'] > 0 else ({'color': '#FF4136'} if stats['position'] < 0 else {'color': '#ccc'})
+    X = df[feature_cols].copy()
+    y = df[target_cols].copy()
     
-    fig1 = build_figure(b_sub, a_sub, f"Active Depth ±2% ({mid:.1f})", False, trader.active_orders)
-    fig2 = build_figure(b_10, a_10, f"Depth ±10% ({mid:.1f})", False, trader.active_orders)
-    fig3 = build_figure(bids, asks, "Full Book", True, trader.active_orders)
+    # Remove rows with NaN targets (future periods)
+    valid_mask = y.notna().all(axis=1)
+    X_train = X[valid_mask]
+    y_train = y[valid_mask]
+    
+    return X_train, y_train, feature_cols, target_cols
 
-    return (fig1, fig2, fig3, f"{ratio:.4f}", f"{avg_60m:.4f}", 
-            f"${stats['total_equity']:,.2f}", f"${stats['unrealized']:,.2f}", pnl_col,
-            f"${stats['fees']:,.2f}", f"{stats['position']:.4f}", pos_col, status_txt, status_col)
+# 4. Train Random Forest model
+def train_model(X_train, y_train):
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    return model
+
+# 5. Web server with plotting
+app = Flask(__name__)
+
+@app.route('/')
+def plot_results():
+    # Generate prediction for last available point
+    last_idx = X_train.index[-1]
+    last_features = X_train.loc[last_idx].values.reshape(1, -1)
+    prediction = model.predict(last_features)[0]
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Plot actual closing prices
+    ax.plot(df.index[-2000:], df['close'][-2000:], label='Actual Price', alpha=0.7)
+    
+    # Plot actual SMAs (where available)
+    ax.plot(df.index[-2000:], df['sma_365'][-2000:], label='365-SMA', alpha=0.8)
+    ax.plot(df.index[-2000:], df['sma_730'][-2000:], label='730-SMA', alpha=0.8)
+    ax.plot(df.index[-2000:], df['sma_1460'][-2000:], label='1460-SMA', alpha=0.8)
+    
+    # Plot predictions as future points
+    future_dates = [df.index[-1] + timedelta(hours=i) for i in [365, 730, 1460]]
+    ax.scatter(future_dates, prediction, color='red', s=100, zorder=5, label='Predictions')
+    
+    ax.set_title('Binance BTC/USDT Price with SMA Predictions')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Price (USDT)')
+    ax.legend()
+    ax.grid(True)
+    
+    # Save to buffer
+    img = io.BytesIO()
+    plt.savefig(img, format='png', bbox_inches='tight')
+    img.seek(0)
+    plt.close()
+    
+    return Response(img.getvalue(), mimetype='image/png')
 
 if __name__ == '__main__':
-    app.run(debug=False, port=PORT, host='0.0.0.0')
+    print("Fetching data...")
+    df = fetch_binance_data()
+    print(f"Data shape: {df.shape}")
+    
+    print("Adding SMA features...")
+    df = add_sma_features(df)
+    
+    print("Preparing ML data...")
+    X_train, y_train, feature_cols, target_cols = prepare_ml_data(df)
+    print(f"Training samples: {len(X_train)}")
+    
+    print("Training model...")
+    model = train_model(X_train, y_train)
+    
+    # Evaluate model
+    y_pred = model.predict(X_train)
+    mse = mean_squared_error(y_train, y_pred)
+    print(f"Model MSE: {mse:.2f}")
+    
+    print("Starting web server on http://localhost:8080")
+    app.run(host='0.0.0.0', port=8080, debug=False)
