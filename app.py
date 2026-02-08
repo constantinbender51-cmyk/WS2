@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import numpy as np
 from io import BytesIO
 from flask import Flask, Response
 
@@ -7,27 +6,22 @@ app = Flask(__name__)
 
 @app.route('/')
 def plot():
-    # Create a clean white canvas
-    plt.figure(figsize=(12, 6), facecolor='white')
-    ax = plt.gca()
-    ax.set_facecolor('white')
+    # Create pure white canvas
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor='white')
     
-    # Generate a smooth line (this is your "SMA line" - simplified for demo)
-    x = np.linspace(0, 10, 100)
-    y = np.sin(x) * 10 + 50  # This is your "SMA line"
+    # Plot ONLY a single black line
+    ax.plot([0.1, 0.9], [0.5, 0.5], color='black', linewidth=2)
     
-    # Plot ONLY the line (no grid, no labels, no extra shit)
-    plt.plot(x, y, color='blue', linewidth=2.5)
-    
-    # Remove all axes and borders
+    # KILL ALL ELEMENTS
+    ax.set_axis_off()
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_visible(False)
     
-    # Save as PNG
+    # Save with ZERO padding
     buf = BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, facecolor='white')
     buf.seek(0)
     plt.close()
     return Response(buf.getvalue(), mimetype='image/png')
