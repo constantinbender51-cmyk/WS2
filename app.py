@@ -11,19 +11,16 @@ app = Flask(__name__)
 
 @app.route('/')
 def serve_line():
-    # 1. Generate Straight Line Data
+    # 1. Generate Straight Line Data (Feed it a straight line as requested)
     x = np.linspace(0, 10, 100).reshape(-1, 1)
-    # Linear data fed to the system
     y = (1.5 * x).ravel() + np.random.normal(0, 0.1, x.shape[0])
 
-    # 2. ML Prediction (Complex Model capable of non-linear scenarios)
-    # Preprocessing required for Neural Net
+    # 2. ML Prediction (Complex Model maintained for general scenarios)
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
     x_scaled = scaler_x.fit_transform(x)
     y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
 
-    # Train MLP (General purpose regressor)
     model = MLPRegressor(hidden_layer_sizes=(100, 100), activation='relu', 
                          solver='adam', max_iter=5000, random_state=42)
     model.fit(x_scaled, y_scaled)
@@ -38,20 +35,13 @@ def serve_line():
     # 3. Plotting
     plt.figure(figsize=(12, 6), frameon=False)
     
-    # Original Data
     plt.plot(x, y, color='black', linewidth=2)
-    
-    # Vertical Line at end
     plt.axvline(x=x[-1], color='red', linewidth=2, linestyle='--')
-    
-    # Predicted Continuation
     plt.plot(x_future, y_future, color='blue', linewidth=2, linestyle='-')
 
-    # Remove all axis/chrome
     plt.axis('off')
     plt.gca().set_position([0, 0, 1, 1])
 
-    # Serve
     img = io.BytesIO()
     plt.savefig(img, format='png')
     img.seek(0)
@@ -60,4 +50,5 @@ def serve_line():
     return send_file(img, mimetype='image/png')
 
 if __name__ == '__main__':
-    app.run(port=8080)
+    # host='0.0.0.0' binds to all network interfaces
+    app.run(host='0.0.0.0', port=8080)
