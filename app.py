@@ -12,12 +12,10 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel, DotProduct, ExpSi
 
 app = Flask(__name__)
 
-# --- 1. Data Pipeline ---
+# --- 1. Data Pipeline (Single Fetch) ---
 def fetch_full_history():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
-    # Start early enough to capture the 2017/2018 cycle top for context if possible, 
-    # but 2018-01-01 is safe for consistent API data.
     since = exchange.parse8601('2018-01-01T00:00:00Z')
     all_ohlcv = []
     
@@ -38,79 +36,77 @@ def fetch_full_history():
     df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-# --- 2. Processing ---
-print("Fetching Data...")
-df = fetch_full_history()
-df['sma_365'] = df['close'].rolling(window=365).mean()
-data = df.dropna(subset=['sma_365']).reset_index(drop=True)
-
-# Downsampling: Using every 10th point. 
-# Complex kernels are expensive; 250 data points is the sweet spot for a quick server response.
-X_train = np.arange(len(data))[::10].reshape(-1, 1)
-y_train = data['sma_365'].values[::10]
-
-# --- 3. Complex Kernel Construction ---
-# K1: Long Term Trend (Rising)
-k1 = C(10.0) * DotProduct(sigma_0=0.0) + RBF(length_scale=2000.0)
-
-# K2: The Halving Cycle (Quasi-Periodic)
-# We multiply by RBF to allow the cycle to evolve/decay rather than stay perfectly rigid forever
-k2 = C(1.0) * ExpSineSquared(length_scale=100.0, periodicity=1400.0, periodicity_bounds=(1200, 1600)) * \
-     RBF(length_scale=1000.0)
-
-# K3: Medium Term Irregularities (The "Texture")
-k3 = C(1.0) * RationalQuadratic(length_scale=100.0, alpha=1.0)
-
-# K4: Noise
-k4 = WhiteKernel(noise_level=10.0, noise_level_bounds=(1e-5, 1e5))
-
-kernel = k1 + k2 + k3 + k4
-
-gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10, normalize_y=True)
-
-print("Fitting Complex GP...")
-gp.fit(X_train, y_train)
-print(f"Learned Kernel: {gp.kernel_}")
-
-# --- 4. Extrapolation ---
-future_days = 365 * 3 # 3 Years
-X_total = np.arange(len(data) + future_days).reshape(-1, 1)
-
-y_pred, sigma = gp.predict(X_total, return_std=True)
-
-# --- 5. Visualization ---
+# --- 2. Multi-SMA Processing Engine ---
 @app.route('/')
-def plot_complex_gp():
-    fig, ax = plt.subplots(figsize=(14, 8))
+def plot_multi_sma():
+    print("Fetching Data...")
+    df = fetch_full_history()
     
-    # Uncertainty Bands (Outer vs Inner)
-    ax.fill_between(X_total.ravel(), 
-                    y_pred - 1.96 * sigma, 
-                    y_pred + 1.96 * sigma, 
-                    alpha=0.1, color='blue', label='95% Confidence')
+    # Configuration
+    smas = [21, 45, 90, 180, 365]
+    future_days = 365 * 1  # 1 Year forecast for clearer short-term detail
     
-    ax.fill_between(X_total.ravel(), 
-                    y_pred - 0.67 * sigma, 
-                    y_pred + 0.67 * sigma, 
-                    alpha=0.2, color='blue', label='50% Confidence')
+    fig, axes = plt.subplots(len(smas), 1, figsize=(12, 20), sharex=True)
+    plt.subplots_adjust(hspace=0.3)
+    
+    for i, window in enumerate(smas):
+        ax = axes[i]
+        print(f"Processing {window}-Day SMA...")
+        
+        # Calculate SMA
+        col_name = f'sma_{window}'
+        df[col_name] = df['close'].rolling(window=window).mean()
+        data = df.dropna(subset=[col_name]).reset_index(drop=True)
+        
+        # Adaptive Downsampling
+        # Short SMAs (21d) have high freq noise, need more density -> Every 8th point
+        # Long SMAs (365d) are smooth -> Every 15th point
+        step = 8 if window < 90 else 15
+        
+        X_train = np.arange(len(data))[::step].reshape(-1, 1)
+        y_train = data[col_name].values[::step]
+        
+        # Kernel Definition (Re-instantiated for each model to avoid contamination)
+        # We allow higher noise_level for shorter SMAs
+        noise_start = 50.0 if window < 90 else 10.0
+        
+        k1 = C(10.0) * DotProduct(sigma_0=0.0) # Trend
+        k2 = C(1.0) * ExpSineSquared(length_scale=100.0, periodicity=1400.0) * RBF(length_scale=1000.0) # Cycle
+        k3 = C(1.0) * RationalQuadratic(length_scale=50.0, alpha=1.0) # Texture
+        k4 = WhiteKernel(noise_level=noise_start) # Noise
+        
+        kernel = k1 + k2 + k3 + k4
+        
+        # Fit
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, normalize_y=True)
+        gp.fit(X_train, y_train)
+        
+        # Predict
+        X_total = np.arange(len(data) + future_days).reshape(-1, 1)
+        y_pred, sigma = gp.predict(X_total, return_std=True)
+        
+        # --- Plotting ---
+        # 1. Uncertainty
+        ax.fill_between(X_total.ravel(), y_pred - 1.96 * sigma, y_pred + 1.96 * sigma, 
+                        alpha=0.15, color='blue', label='95% Conf')
+        
+        # 2. Model Mean
+        ax.plot(X_total, y_pred, color='navy', linewidth=1.5, label='GP Projection')
+        
+        # 3. Actual Data
+        ax.plot(np.arange(len(data)), data[col_name], 
+                color='crimson', linewidth=2, label=f'Actual {window}-SMA')
+        
+        ax.set_title(f"{window}-Day SMA Gaussian Process", fontsize=10, pad=3)
+        ax.grid(True, linestyle=':', alpha=0.6)
+        
+        if i == 0:
+            ax.legend(loc='upper left', fontsize='small')
 
-    # The Model Mean
-    ax.plot(X_total, y_pred, color='navy', linewidth=2, label='Posterior Mean', zorder=5)
-    
-    # Actual Data
-    ax.plot(np.arange(len(data)), data['sma_365'], 
-            color='crimson', linewidth=2, label='Actual BTC 365-SMA', zorder=6)
-    
-    # Vertical line for "Today"
-    ax.axvline(x=len(data), color='k', linestyle='--', alpha=0.5, label='Forecast Start')
-
-    ax.set_title(f"Multi-Kernel Gaussian Process (Trend + Cycle + Texture)\n{gp.kernel_}", fontsize=8)
-    ax.set_ylabel('Price (USDT)')
-    ax.legend(loc='upper left')
-    ax.grid(True, linestyle='--', alpha=0.5)
+    axes[-1].set_xlabel("Days (Index)", fontsize=10)
     
     output = io.BytesIO()
-    fig.savefig(output, format='png', dpi=100)
+    fig.savefig(output, format='png', dpi=80)
     plt.close(fig)
     output.seek(0)
     
