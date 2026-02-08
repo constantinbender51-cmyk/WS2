@@ -8,6 +8,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from flask import Flask, Response
 from prophet import Prophet
+from prophet.plot import add_changepoints_to_plot
 
 app = Flask(__name__)
 
@@ -15,11 +16,9 @@ app = Flask(__name__)
 def fetch_raw_history():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
-    # Start 2017 to capture full previous cycle context
     since = exchange.parse8601('2017-01-01T00:00:00Z') 
     all_ohlcv = []
     
-    print("Fetching Raw Data...")
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, '1d', since, limit=1000)
@@ -34,80 +33,105 @@ def fetch_raw_history():
     df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-# --- 2. Prophet Modeling Engine ---
-# Runs once on startup to cache the heavy optimization
-def generate_forecast():
+# --- 2. Complex Event Modeling ---
+def get_halving_events():
+    # Defining exact dates where the supply logic changed
+    halvings = pd.DataFrame({
+        'holiday': 'halving',
+        'ds': pd.to_datetime(['2016-07-09', '2020-05-11', '2024-04-19']),
+        'lower_window': 0,
+        'upper_window': 180, # The "shock" lasts ~6 months post-event
+    })
+    return halvings
+
+# --- 3. Modeling Engine ---
+def generate_complex_forecast():
     df = fetch_raw_history()
-    
-    # Prophet requires specific column names: 'ds' (Date) and 'y' (Value)
     data = df[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
     
-    # Configuration
-    # seasonality_mode='multiplicative': The swings get bigger as price gets higher (Log-like behavior)
-    # changepoint_prior_scale: Flexibility of the trend line (0.05 is default, 0.1 allows more shifts)
-    m = Prophet(seasonality_mode='multiplicative', 
-                changepoint_prior_scale=0.1,
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False)
+    # 1. Holiday Injection
+    halvings = get_halving_events()
     
-    # Explicitly model the "Halving Cycle" (Approx 4 years / 1460 days)
-    m.add_seasonality(name='4_year_cycle', period=1460, fourier_order=8)
+    # 2. Hyperparameter Tuning (Manual Complexity)
+    # changepoint_prior_scale=0.5: (Very Flexible) Allows the trend to react violently to crashes.
+    # seasonality_prior_scale=10.0: (Rigid) Forces the cycle to be a strong predictor.
+    m = Prophet(seasonality_mode='multiplicative',
+                changepoint_prior_scale=0.5,
+                seasonality_prior_scale=10.0,
+                holidays=halvings,
+                interval_width=0.95, # 95% Confidence Interval
+                daily_seasonality=False,
+                weekly_seasonality=False)
     
-    print("Fitting Prophet Model (MCMC)...")
+    # 3. High-Fidelity Cycle Extraction
+    # Fourier Order 15 allows the wave to be "spiky" (parabolic top) rather than smooth
+    m.add_seasonality(name='4_year_cycle', period=1460, fourier_order=15)
+    m.add_seasonality(name='yearly', period=365.25, fourier_order=10)
+    
+    print("Fitting Complex Prophet Model...")
     m.fit(data)
     
-    # Forecast Horizon
-    future = m.make_future_dataframe(periods=365 * 2) # 2 Years
+    future = m.make_future_dataframe(periods=365 * 2) 
     forecast = m.predict(future)
     
     return m, forecast, data
 
 # Precompute
-model, forecast, history = generate_forecast()
+model, forecast, history = generate_complex_forecast()
 
 @app.route('/')
-def plot_prophet():
-    # Visualization: Decomposition
-    # We will plot the Main Forecast + The Isolated 4-Year Component
+def plot_complex_prophet():
+    fig = plt.figure(figsize=(16, 14))
+    gs = fig.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1])
+    plt.subplots_adjust(hspace=0.4)
     
-    fig = plt.figure(figsize=(14, 12))
-    gs = fig.add_gridspec(3, 1, height_ratios=[2, 1, 1])
-    
-    # Plot 1: Main Forecast
+    # --- Plot 1: The Master Forecast ---
     ax1 = fig.add_subplot(gs[0])
     
-    # Actual Data
-    ax1.scatter(history['ds'], history['y'], color='black', s=2, alpha=0.3, label='Actual Daily Close')
+    # Trend Line
+    ax1.plot(forecast['ds'], forecast['yhat'], color='#004488', linewidth=2, label='Ensemble Forecast')
     
-    # Model Trend
-    ax1.plot(forecast['ds'], forecast['yhat'], color='#0072B2', linewidth=2, label='Model Forecast')
-    
-    # Uncertainty
+    # Uncertainty "Cloud"
     ax1.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'], 
-                     color='#0072B2', alpha=0.2, label='Uncertainty Interval')
+                     color='#004488', alpha=0.15, label='95% Uncertainty')
     
-    ax1.set_title('Prophet Time Sequence Decomposition: BTC/USDT', fontsize=12)
+    # Actual Data
+    ax1.scatter(history['ds'], history['y'], color='black', s=3, alpha=0.4, label='Price Action', zorder=3)
+    
+    # Halving Markers
+    halvings = ['2016-07-09', '2020-05-11', '2024-04-19']
+    for h in halvings:
+        ax1.axvline(pd.to_datetime(h), color='red', linestyle='--', alpha=0.6, linewidth=1)
+        ax1.text(pd.to_datetime(h), ax1.get_ylim()[1]*0.9, ' HALVING', color='red', fontsize=8, rotation=90)
+
+    # Visualize Regime Changes (Changepoints)
+    # This highlights where the model decided the "Trend" fundamentally broke
+    add_changepoints_to_plot(ax1.figure, model, forecast, ax=ax1)
+    
+    ax1.set_title('Bayesian Structural Time Series: BTC/USDT (Trend + Seasonality + Event Shocks)', fontsize=12)
     ax1.set_ylabel('Price (USDT)')
     ax1.legend(loc='upper left')
-    ax1.grid(True, alpha=0.3)
+    ax1.grid(True, alpha=0.2)
     
-    # Plot 2: The Trend Component (The "Fair Value" line without noise)
+    # --- Plot 2: The 4-Year Fractal ---
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    ax2.plot(forecast['ds'], forecast['trend'], color='red', linewidth=2)
-    ax2.set_title('Component 1: Underlying Growth Trend (Piecewise Linear)', fontsize=10)
+    ax2.plot(forecast['ds'], forecast['4_year_cycle'], color='purple', linewidth=1.5)
+    ax2.set_title('Component: 4-Year Cycle (The "Halving Heartbeat")', fontsize=10)
+    ax2.set_ylabel('Cycle Strength')
     ax2.grid(True, alpha=0.3)
     
-    # Plot 3: The 4-Year Cycle Component (Extracted Seasonality)
+    # --- Plot 3: The Yearly Seasonality ---
     ax3 = fig.add_subplot(gs[2], sharex=ax1)
-    # Plotting the multiplicative factor (percentage impact)
-    ax3.plot(forecast['ds'], forecast['4_year_cycle'], color='green', linewidth=1.5)
-    ax3.set_title('Component 2: Extracted 4-Year Halving Cycle (Multiplicative Factor)', fontsize=10)
-    ax3.set_ylabel('Impact %')
+    ax3.plot(forecast['ds'], forecast['yearly'], color='green', linewidth=1.5)
+    ax3.set_title('Component: Annual Seasonality (Tax/Summer/Winter Effects)', fontsize=10)
     ax3.grid(True, alpha=0.3)
-    
-    # Formatting
-    plt.tight_layout()
+
+    # --- Plot 4: The Halving Shock Impact ---
+    ax4 = fig.add_subplot(gs[3], sharex=ax1)
+    ax4.plot(forecast['ds'], forecast['halving'], color='red', linewidth=1.5)
+    ax4.set_title('Component: Supply Shock Events (Post-Halving Volatility)', fontsize=10)
+    ax4.fill_between(forecast['ds'], 0, forecast['halving'], color='red', alpha=0.1)
+    ax4.grid(True, alpha=0.3)
     
     output = io.BytesIO()
     fig.savefig(output, format='png', dpi=100)
