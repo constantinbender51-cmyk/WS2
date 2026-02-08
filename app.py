@@ -38,28 +38,32 @@ HTML_TEMPLATE = '''
 def index():
     # Generate slightly increasing line data
     n_points = 100
-    X_train = np.arange(n_points).reshape(-1, 1)
-    y_train = 5 + 0.02 * X_train.flatten()  # Slight upward slope
+    X_raw = np.arange(n_points)
+    y_train = 5 + 0.02 * X_raw  # Slight upward slope
+    
+    # Create 2 features: position and delta (slope indicator)
+    X_train = np.column_stack([X_raw, np.ones(n_points) * 0.02])  # [position, slope]
     
     # Train Random Forest
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
     rf.fit(X_train, y_train)
     
-    # Predict continuation
-    X_predict = np.arange(n_points, n_points * 2).reshape(-1, 1)
+    # Predict continuation with same features
+    X_raw_predict = np.arange(n_points, n_points * 2)
+    X_predict = np.column_stack([X_raw_predict, np.ones(n_points) * 0.02])
     y_predict = rf.predict(X_predict)
     
     # Create plot with no decorations
     fig, ax = plt.subplots(figsize=(12, 6))
     
-    # Plot original data (flat line)
-    ax.plot(X_train, y_train, 'b-', linewidth=2)
+    # Plot original data (increasing line)
+    ax.plot(X_raw, y_train, 'b-', linewidth=2)
     
     # Plot vertical separator
     ax.axvline(x=n_points, color='red', linestyle='-', linewidth=2)
     
     # Plot prediction
-    ax.plot(X_predict, y_predict, 'g-', linewidth=2)
+    ax.plot(X_raw_predict, y_predict, 'g-', linewidth=2)
     
     # Remove all decorations
     ax.set_xlim(0, n_points * 2)
