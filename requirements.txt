@@ -1,7 +1,11 @@
-dash 
-plotly 
+dash
+plotly
 pandas
 numpy
 matplotlib
 deap
 requests
+flask
+scikit-learn
+python-binance
+scipy
