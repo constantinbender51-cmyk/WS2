@@ -8,31 +8,26 @@ app = Flask(__name__)
 
 @app.route('/')
 def plot():
-    # Generate -10° straight line
-    angle_rad = np.deg2rad(10)
-    slope = -np.tan(angle_rad)  # Negative for downward slope
-    y = 50 + slope * np.arange(200)  # 200 points: 0→199
+    # Training data: straight downward line (x=0 to x=10)
+    x_train = np.linspace(0, 10, 100).reshape(-1, 1)
+    y_train = 60 - 1.0 * x_train.flatten()  # Drops 1 unit per x
     
-    # Features: [y_{t-2}, y_{t-1}] → predict y_t
-    X, target = [], []
-    for i in range(2, 100):  # Train on first 100 points (indices 2-99)
-        X.append([y[i-2], y[i-1]])
-        target.append(y[i])
+    # Train RF on (x, y) pairs
+    model = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=0)
+    model.fit(x_train, y_train)
     
-    # Train RF on the slope pattern (delta between last 2 points)
-    model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=0)
-    model.fit(X, target)
+    # Predict ALL future points at once (x=10 to x=20) — NO recursion
+    x_pred = np.linspace(10, 20, 100).reshape(-1, 1)
+    y_pred = model.predict(x_pred)
     
-    # Roll forward from point 100 to 199 using ONLY predicted values
-    y_pred = y[:100].tolist()  # Start with real data (first 100 points)
-    for i in range(100, 200):
-        next_val = model.predict([[y_pred[-2], y_pred[-1]]])[0]
-        y_pred.append(next_val)
+    # Combine
+    x_all = np.concatenate([x_train.flatten(), x_pred.flatten()])
+    y_all = np.concatenate([y_train, y_pred])
     
-    # Plot: one black line, vertical marker at prediction start (point 100)
+    # Plot: pure white, black lines only
     fig, ax = plt.subplots(figsize=(12, 4), facecolor='white')
-    ax.plot(range(200), y_pred, color='black', linewidth=2)
-    ax.axvline(x=100, color='black', linewidth=1.5)
+    ax.plot(x_all, y_all, color='black', linewidth=2)          # Main line
+    ax.axvline(x=10, color='black', linewidth=1.5)             # Prediction start
     ax.set_axis_off()
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
     
