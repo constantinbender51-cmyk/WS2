@@ -41,17 +41,33 @@ def index():
     X_raw = np.arange(n_points)
     y_train = 5 + 0.02 * X_raw  # Slight upward slope
     
-    # Create 2 features: position and delta (slope indicator)
-    X_train = np.column_stack([X_raw, np.ones(n_points) * 0.02])  # [position, slope]
+    # Create features using LAGGED values (previous y value and position)
+    # This way the RF learns: "next value = previous value + slope"
+    X_train_features = []
+    y_train_targets = []
+    
+    for i in range(1, n_points):
+        X_train_features.append([y_train[i-1], X_raw[i]])  # [previous_y, current_x]
+        y_train_targets.append(y_train[i])
+    
+    X_train_features = np.array(X_train_features)
+    y_train_targets = np.array(y_train_targets)
     
     # Train Random Forest
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf.fit(X_train, y_train)
+    rf.fit(X_train_features, y_train_targets)
     
-    # Predict continuation with same features
+    # Predict continuation - iteratively using previous predictions
     X_raw_predict = np.arange(n_points, n_points * 2)
-    X_predict = np.column_stack([X_raw_predict, np.ones(n_points) * 0.02])
-    y_predict = rf.predict(X_predict)
+    y_predict = []
+    last_y = y_train[-1]
+    
+    for x in X_raw_predict:
+        next_y = rf.predict([[last_y, x]])[0]
+        y_predict.append(next_y)
+        last_y = next_y
+    
+    y_predict = np.array(y_predict)
     
     # Create plot with no decorations
     fig, ax = plt.subplots(figsize=(12, 6))
