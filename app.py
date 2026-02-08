@@ -7,103 +7,78 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from flask import Flask, Response
-from gplearn.genetic import SymbolicRegressor
-from datetime import datetime, timedelta
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, DotProduct, ConstantKernel as C
 
 app = Flask(__name__)
 
-# --- 1. Data Acquisition (Binance via CCXT) ---
+# --- 1. Data Pipeline ---
 def fetch_btc_data():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
-    timeframe = '1d'
-    since = exchange.parse8601('2018-01-01T00:00:00Z')
-    all_ohlcv = []
-    
-    while True:
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 86400000 
-            if since > exchange.milliseconds():
-                break
-            time.sleep(0.05) 
-        except Exception as e:
-            print(f"Data fetch error: {e}")
-            break
-            
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
+    # Fetching limited history for speed. In prod, fetch full history.
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=1500)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        return df
+    except:
+        return pd.DataFrame()
 
-# --- 2. Processing & High-Intensity SR Modeling ---
-print("Initializing Data...")
+# --- 2. Gaussian Process Configuration ---
+print("Initializing Gaussian Process...")
 df = fetch_btc_data()
 df['sma_365'] = df['close'].rolling(window=365).mean()
 data = df.dropna(subset=['sma_365']).reset_index(drop=True)
 
-X = np.arange(len(data)).reshape(-1, 1)
-y = data['sma_365'].values
+# Downsample for GP speed (GPs are O(N^3) complexity)
+# We take every 5th point to keep the matrix inversion fast
+X = np.arange(len(data))[::5].reshape(-1, 1)
+y = data['sma_365'].values[::5]
 
-print("Configuring High-Intensity Symbolic Regressor...")
-# EXPANDED SEARCH PARAMETERS
-est_gp = SymbolicRegressor(
-    population_size=5000,       # Increased from 1000
-    generations=50,             # Increased from 20
-    tournament_size=40,         # High selection pressure
-    stopping_criteria=0.0001,
-    const_range=(-10000, 10000),# Wider constant search
-    p_crossover=0.6,
-    p_subtree_mutation=0.15,
-    p_hoist_mutation=0.1,
-    p_point_mutation=0.1,
-    max_samples=0.95,
-    verbose=1,
-    parsimony_coefficient=10000, # Low penalty for complexity
-    function_set=['add', 'sub', 'mul', 'div', 
-                  'sin', 'cos', 'tan', 'sqrt', 'log', 'abs', 'neg'],
-    n_jobs=-1,                  # Parallel processing
-    random_state=42
-)
+# Kernel Construction:
+# 1. Trend: DotProduct() allows the model to extrapolate linearly/polynomially.
+# 2. Local: RBF() captures the smooth curvature of the SMA.
+# 3. Noise: WhiteKernel() handles sensor noise/irregularities.
+kernel = C(1.0) * DotProduct(sigma_0=1.0) + C(1.0) * RBF(length_scale=100.0) + WhiteKernel(noise_level=1.0)
 
-print("Training started (High Intensity)...")
-est_gp.fit(X, y)
-print(f"Best Equation Found: {est_gp._program}")
+gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True)
+
+print("Fitting GP (O(N^3) operation)...")
+gp.fit(X, y)
+print(f"Learned Kernel: {gp.kernel_}")
 
 # --- 3. Extrapolation ---
-future_days = 730 # 2 Years
-X_total = np.arange(len(data) + future_days).reshape(-1, 1)
-y_gp = est_gp.predict(X_total)
+future_days = 365 * 2 # 2 Years
+X_future = np.arange(len(data) + future_days).reshape(-1, 1)
+
+# Predict Mean AND Standard Deviation (Confidence Interval)
+y_pred, sigma = gp.predict(X_future, return_std=True)
 
 # --- 4. Server ---
 @app.route('/')
-def plot_sr_high_intensity():
-    fig, ax = plt.subplots(figsize=(14, 8))
+def plot_gp():
+    fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Historical Data
-    ax.plot(X, y, 'k', label='Actual BTC 365-SMA', linewidth=2)
+    # Historical Data (All points, not just downsampled)
+    ax.scatter(np.arange(len(data)), data['sma_365'], c='k', s=5, label='Actual Data', alpha=0.5)
     
-    # SR Model Fit (In-Sample)
-    ax.plot(X_total[:len(X)], y_gp[:len(X)], 'r--', label='Model Fit (Reconstruction)', alpha=0.6)
+    # GP Mean Prediction
+    ax.plot(X_future, y_pred, 'b-', label='GP Posterior Mean', linewidth=2)
     
-    # SR Extrapolation (Out-of-Sample)
-    ax.plot(X_total[len(X):], y_gp[len(X):], 'b-', label=f'Extrapolation (+{future_days} days)', linewidth=2.5)
+    # Confidence Intervals (95% = 1.96 std dev)
+    ax.fill_between(X_future.ravel(), 
+                    y_pred - 1.96 * sigma, 
+                    y_pred + 1.96 * sigma, 
+                    alpha=0.2, color='blue', label='95% Confidence Interval')
     
-    # Text formatting for equation
-    eq_str = str(est_gp._program)
-    # Wrap text if too long
-    title_text = f"High-Intensity Symbolic Regression\nEquation: {eq_str[:80]}..." if len(eq_str) > 80 else f"Equation: {eq_str}"
-    
-    ax.set_title(title_text, fontsize=9)
-    ax.set_xlabel('Days since SMA start')
-    ax.set_ylabel('Price (USDT)')
-    ax.legend()
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax.set_title(f"Gaussian Process Extrapolation\nKernel: {gp.kernel_}", fontsize=10)
+    ax.set_xlabel('Days')
+    ax.set_ylabel('BTC 365-SMA')
+    ax.legend(loc='upper left')
+    ax.grid(True, linestyle='--')
     
     output = io.BytesIO()
-    fig.savefig(output, format='png', dpi=150)
+    fig.savefig(output, format='png')
     plt.close(fig)
     output.seek(0)
     
