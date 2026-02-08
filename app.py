@@ -8,75 +8,97 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from flask import Flask, Response
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, DotProduct, ConstantKernel as C
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, DotProduct, ExpSineSquared, ConstantKernel as C
 
 app = Flask(__name__)
 
-# --- 1. Data Pipeline ---
-def fetch_btc_data():
+# --- 1. Full Data Acquisition (Pagination Restored) ---
+def fetch_full_history():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
-    try:
-        # Fetch sufficient history
-        ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=1500)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        return df
-    except:
-        return pd.DataFrame()
+    timeframe = '1d'
+    # Explicit start date to capture the full curve structure
+    since = exchange.parse8601('2018-01-01T00:00:00Z')
+    all_ohlcv = []
+    
+    print("Fetching full history from 2018...")
+    while True:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 86400000 
+            # Stop if we reach the present
+            if since > exchange.milliseconds():
+                break
+            time.sleep(0.05) # Rate limit respect
+        except Exception as e:
+            print(f"Fetch Error: {e}")
+            break
+            
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
-# --- 2. Gaussian Process Configuration ---
-print("Initializing Gaussian Process...")
-df = fetch_btc_data()
+# --- 2. Processing ---
+df = fetch_full_history()
 df['sma_365'] = df['close'].rolling(window=365).mean()
 data = df.dropna(subset=['sma_365']).reset_index(drop=True)
 
-# Downsample for GP speed (O(N^3) complexity)
-X_train = np.arange(len(data))[::5].reshape(-1, 1)
-y_train = data['sma_365'].values[::5]
+# Downsample: GP cannot handle 2500+ points efficiently. 
+# We take every 15th point to capture the shape while keeping N < 500.
+X_train = np.arange(len(data))[::15].reshape(-1, 1)
+y_train = data['sma_365'].values[::15]
 
-# Kernel Construction
-kernel = C(1.0) * DotProduct(sigma_0=1.0) + C(1.0) * RBF(length_scale=100.0) + WhiteKernel(noise_level=1.0)
+print(f"Training Data Points: {len(X_train)}")
+
+# --- 3. Kernel & Model ---
+# Complex Kernel:
+# 1. DotProduct: Long-term Growth Trend
+# 2. RBF: Local non-linear deviations (The hills and valleys)
+# 3. WhiteKernel: Noise handling
+kernel = C(1.0) * DotProduct(sigma_0=1.0) + \
+         C(1.0) * RBF(length_scale=100.0) + \
+         WhiteKernel(noise_level=10.0)
 
 gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True)
 
-print("Fitting GP...")
+print("Fitting GP on full history...")
 gp.fit(X_train, y_train)
 print(f"Learned Kernel: {gp.kernel_}")
 
-# --- 3. Extrapolation ---
+# --- 4. Extrapolation ---
 future_days = 730 # 2 Years
-X_future = np.arange(len(data) + future_days).reshape(-1, 1)
+X_total = np.arange(len(data) + future_days).reshape(-1, 1)
 
-y_pred, sigma = gp.predict(X_future, return_std=True)
+# Predict in chunks to save memory if needed, but here we do one pass
+y_pred, sigma = gp.predict(X_total, return_std=True)
 
-# --- 4. Server ---
+# --- 5. Visualization ---
 @app.route('/')
-def plot_gp_visible():
+def plot_full_gp():
     fig, ax = plt.subplots(figsize=(14, 8))
     
-    # GP Mean Prediction
-    ax.plot(X_future, y_pred, color='navy', linewidth=2, label='GP Posterior Mean', zorder=5)
+    # 1. The GP Model (Mean)
+    ax.plot(X_total, y_pred, color='navy', linewidth=2, label='GP Model Mean', zorder=5)
     
-    # Confidence Intervals
-    ax.fill_between(X_future.ravel(), 
+    # 2. Uncertainty Bands
+    ax.fill_between(X_total.ravel(), 
                     y_pred - 1.96 * sigma, 
                     y_pred + 1.96 * sigma, 
-                    alpha=0.2, color='blue', label='95% Confidence Interval', zorder=4)
+                    alpha=0.2, color='blue', label='95% Confidence', zorder=4)
     
-    # Actual Data (High Visibility Settings)
-    # Plotting every point (not downsampled) to ensure density is visible
-    ax.scatter(np.arange(len(data)), data['sma_365'], 
-               color='crimson',    # High contrast Red
-               s=25,               # Larger size
-               alpha=1.0,          # Solid opacity
-               label='Actual Data (BTC 365-SMA)', 
-               zorder=10)          # Draw ON TOP of lines
+    # 3. The ACTUAL Data (Full History)
+    # We plot the full resolution data (not downsampled) to prove it matches the screenshot
+    ax.plot(np.arange(len(data)), data['sma_365'], 
+            color='crimson', linewidth=2.5, label='Actual BTC 365-SMA (2018-Present)', zorder=6)
     
-    ax.set_title(f"Gaussian Process Extrapolation (High Visibility)\nKernel: {gp.kernel_}", fontsize=10)
-    ax.set_xlabel('Days')
-    ax.set_ylabel('BTC 365-SMA (USDT)')
-    ax.legend(loc='upper left', framealpha=1.0)
-    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_title(f"Gaussian Process on Full History (2018-2026)\nKernel: {gp.kernel_}", fontsize=10)
+    ax.set_xlabel('Days since SMA Valid (approx Jan 2019)')
+    ax.set_ylabel('Price (USDT)')
+    ax.legend(loc='upper left')
+    ax.grid(True, which='major', linestyle='--', alpha=0.6)
     
     output = io.BytesIO()
     fig.savefig(output, format='png', dpi=100)
