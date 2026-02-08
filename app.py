@@ -11,20 +11,21 @@ app = Flask(__name__)
 
 @app.route('/')
 def serve_line():
-    # 1. Generate complicated noisy data (Non-linear)
+    # 1. Generate Straight Line Data
     x = np.linspace(0, 10, 100).reshape(-1, 1)
-    y = np.sin(x).ravel() + np.random.normal(0, 0.2, x.shape[0]) + (x.ravel() * 0.1)
+    # Linear data fed to the system
+    y = (1.5 * x).ravel() + np.random.normal(0, 0.1, x.shape[0])
 
-    # 2. ML Prediction (Neural Network)
-    # Preprocessing
+    # 2. ML Prediction (Complex Model capable of non-linear scenarios)
+    # Preprocessing required for Neural Net
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
     x_scaled = scaler_x.fit_transform(x)
     y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
 
-    # Train MLP
-    model = MLPRegressor(hidden_layer_sizes=(100, 100), activation='tanh', 
-                         solver='lbfgs', max_iter=2000, random_state=42)
+    # Train MLP (General purpose regressor)
+    model = MLPRegressor(hidden_layer_sizes=(100, 100), activation='relu', 
+                         solver='adam', max_iter=5000, random_state=42)
     model.fit(x_scaled, y_scaled)
 
     # Predict continuation
@@ -40,7 +41,7 @@ def serve_line():
     # Original Data
     plt.plot(x, y, color='black', linewidth=2)
     
-    # Vertical Line at end of known data
+    # Vertical Line at end
     plt.axvline(x=x[-1], color='red', linewidth=2, linestyle='--')
     
     # Predicted Continuation
