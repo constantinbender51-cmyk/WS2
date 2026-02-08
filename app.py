@@ -1,84 +1,62 @@
-from flask import Flask, render_template_string
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+from flask import Flask, send_file
 import io
-import base64
 
 app = Flask(__name__)
 
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Random Forest Line Prediction</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            background-color: white;
-        }
-        img {
-            display: block;
-            width: 100%;
-            height: 100vh;
-            object-fit: contain;
-        }
-    </style>
-</head>
-<body>
-    <img src="data:image/png;base64,{{ img_data }}" alt="Line prediction">
-</body>
-</html>
-'''
-
 @app.route('/')
-def index():
-    # Generate slightly increasing line data
-    n_points = 100
+def serve_line():
+    # 1. Generate complicated noisy data (Non-linear)
+    x = np.linspace(0, 10, 100).reshape(-1, 1)
+    y = np.sin(x).ravel() + np.random.normal(0, 0.2, x.shape[0]) + (x.ravel() * 0.1)
+
+    # 2. ML Prediction (Neural Network)
+    # Preprocessing
+    scaler_x = StandardScaler()
+    scaler_y = StandardScaler()
+    x_scaled = scaler_x.fit_transform(x)
+    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
+
+    # Train MLP
+    model = MLPRegressor(hidden_layer_sizes=(100, 100), activation='tanh', 
+                         solver='lbfgs', max_iter=2000, random_state=42)
+    model.fit(x_scaled, y_scaled)
+
+    # Predict continuation
+    future_steps = 30
+    x_future = np.linspace(10, 13, future_steps).reshape(-1, 1)
+    x_future_scaled = scaler_x.transform(x_future)
+    y_future_scaled = model.predict(x_future_scaled)
+    y_future = scaler_y.inverse_transform(y_future_scaled.reshape(-1, 1)).ravel()
+
+    # 3. Plotting
+    plt.figure(figsize=(12, 6), frameon=False)
     
-    # Train on DOUBLE the range (0-200) so it sees the values we'll predict
-    X_full = np.arange(n_points * 2).reshape(-1, 1)
-    y_full = 5 + 0.05 * X_full.flatten()
+    # Original Data
+    plt.plot(x, y, color='black', linewidth=2)
     
-    # Train Random Forest on the FULL range
-    rf = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=42)
-    rf.fit(X_full, y_full)
+    # Vertical Line at end of known data
+    plt.axvline(x=x[-1], color='red', linewidth=2, linestyle='--')
     
-    # Now split for display purposes
-    X_raw = X_full[:n_points]
-    y_train = y_full[:n_points]
-    
-    X_raw_predict = X_full[n_points:]
-    y_predict = rf.predict(X_raw_predict)
-    
-    # Create plot with no decorations
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    # Plot original data (increasing line)
-    ax.plot(X_raw.flatten(), y_train, 'b-', linewidth=2)
-    
-    # Plot vertical separator
-    ax.axvline(x=n_points, color='red', linestyle='-', linewidth=2)
-    
-    # Plot prediction
-    ax.plot(X_raw_predict.flatten(), y_predict, 'g-', linewidth=2)
-    
-    # Remove all decorations
-    ax.set_xlim(0, n_points * 2)
-    ax.set_ylim(0, 10)
-    ax.axis('off')
-    
-    # Convert plot to base64 image
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', bbox_inches='tight', facecolor='white')
-    img_buffer.seek(0)
-    img_data = base64.b64encode(img_buffer.read()).decode()
+    # Predicted Continuation
+    plt.plot(x_future, y_future, color='blue', linewidth=2, linestyle='-')
+
+    # Remove all axis/chrome
+    plt.axis('off')
+    plt.gca().set_position([0, 0, 1, 1])
+
+    # Serve
+    img = io.BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
     plt.close()
     
-    return render_template_string(HTML_TEMPLATE, img_data=img_data)
+    return send_file(img, mimetype='image/png')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(port=8080)
