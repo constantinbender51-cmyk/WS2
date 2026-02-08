@@ -2,9 +2,4 @@ python-dotenv
 pandas
 ccxt
 numpy
-tqdm
 requests
-pickle-mixin
-datetime
-scikit-learn
-flask
