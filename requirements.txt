@@ -1,4 +1,4 @@
-# Dependencies for app.py only
+# Dependencies for app.py
 
 # Data processing and analysis
 pandas
