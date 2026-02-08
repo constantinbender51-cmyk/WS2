@@ -12,9 +12,4 @@ flask
 matplotlib
 
 # Machine learning and symbolic regression
-gplearn
-
-# Time series forecasting
-prophet
-
-# Note: datetime, io, and time are part of Python standard library
+statsmodels
