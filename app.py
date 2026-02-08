@@ -1,58 +1,98 @@
 import io
+import time
 import numpy as np
+import pandas as pd
+import ccxt
 import matplotlib
-matplotlib.use('Agg') # Non-interactive backend for server integration
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from flask import Flask, Response
-from sklearn.svm import SVR
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
+from gplearn.genetic import SymbolicRegressor
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# 1. Data Generation & Model Training
-# Non-linear domain (Sine wave)
-X_train = np.sort(5 * np.random.rand(80, 1), axis=0)
-y_train = np.sin(X_train).ravel()
-y_train[::5] += 3 * (0.5 - np.random.rand(16)) # Add noise
+# --- 1. Data Acquisition (Binance via CCXT) ---
+def fetch_btc_data():
+    exchange = ccxt.binance()
+    symbol = 'BTC/USDT'
+    timeframe = '1d'
+    since = exchange.parse8601('2018-01-01T00:00:00Z')
+    all_ohlcv = []
+    
+    # Pagination loop (Binance limit is usually 500-1000)
+    while True:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 86400000 # Advance timestamp
+            if since > exchange.milliseconds():
+                break
+            time.sleep(0.1) # Rate limit respect
+        except Exception as e:
+            print(f"Data fetch error: {e}")
+            break
+            
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
-# Model: SVR with RBF kernel to capture non-linearity
-svr_rbf = make_pipeline(StandardScaler(), SVR(kernel='rbf', C=100, gamma=0.1, epsilon=.1))
-svr_rbf.fit(X_train, y_train)
+# --- 2. Processing & SR Modeling ---
+print("Initializing Data and Model...")
+df = fetch_btc_data()
+df['sma_365'] = df['close'].rolling(window=365).mean()
+data = df.dropna(subset=['sma_365']).reset_index(drop=True)
 
-# 2. Sampling / Prediction
-# Continuation of non-linear line
-X_test_nonlinear = np.arange(0.0, 7.0, 0.01)[:, np.newaxis]
-y_pred_nonlinear = svr_rbf.predict(X_test_nonlinear)
+# Feature Engineering: X is days since start of SMA
+X = np.arange(len(data)).reshape(-1, 1)
+y = data['sma_365'].values
 
-# Straight declining line domain (Out of distribution test)
-X_test_linear = np.linspace(5, 10, 100)[:, np.newaxis]
-# The "ground truth" for the declining line to compare against model's inference
-y_true_linear = -1 * (X_test_linear - 5) - 1 
-y_pred_linear = svr_rbf.predict(X_test_linear)
+# Symbolic Regression Config
+# Constraints: Limited generations for execution speed. 
+# Functions: Basic arithmetic + trigs for seasonality/cycles.
+est_gp = SymbolicRegressor(population_size=1000,
+                           generations=20,
+                           stopping_criteria=0.01,
+                           p_crossover=0.7,
+                           p_subtree_mutation=0.1,
+                           p_hoist_mutation=0.05,
+                           p_point_mutation=0.1,
+                           max_samples=0.9,
+                           verbose=1,
+                           function_set=['add', 'sub', 'mul', 'div', 'sin', 'cos', 'log', 'sqrt'],
+                           random_state=42)
 
+print("Training Symbolic Regressor (this may take a moment)...")
+est_gp.fit(X, y)
+print(f"Best Equation: {est_gp._program}")
+
+# --- 3. Extrapolation ---
+future_days = 365
+X_future = np.arange(len(data) + future_days).reshape(-1, 1)
+y_gp = est_gp.predict(X_future)
+
+# --- 4. Server ---
 @app.route('/')
-def plot_png():
-    # 3. Visualization
-    fig, ax = plt.subplots(figsize=(10, 6))
+def plot_sr():
+    fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Training Data
-    ax.scatter(X_train, y_train, color='darkorange', label='Training Data (Non-linear)', s=10, zorder=3)
+    # Historical Data
+    ax.plot(X, y, 'k', label='Actual BTC 365-SMA (2018-2026)', linewidth=2)
     
-    # Model Prediction on Non-linear continuation
-    ax.plot(X_test_nonlinear, y_pred_nonlinear, color='navy', lw=2, label='RBF Model Prediction (Interpolation/Extrapolation)')
+    # SR Model Fit & Extrapolation
+    # Split color to show where history ends and future begins
+    ax.plot(X_future[:len(X)], y_gp[:len(X)], 'r--', label='SR Model Fit (In-Sample)', alpha=0.7)
+    ax.plot(X_future[len(X):], y_gp[len(X):], 'g-', label='SR Extrapolation (Next 365 Days)', linewidth=2)
     
-    # Linear Declining Line (Target vs Model Behavior)
-    ax.plot(X_test_linear, y_true_linear, color='green', linestyle='--', label='Target Declining Line (Ground Truth)')
-    ax.plot(X_test_linear, y_pred_linear, color='red', linestyle='-', label='Model Response to Declining Input')
-
-    ax.set_title('SVR Response to Non-Linear Training vs Linear Declining Input')
-    ax.set_xlabel('Input Feature (X)')
-    ax.set_ylabel('Target (y)')
+    ax.set_title(f'Symbolic Regression on BTC 365-SMA\nFormula: {est_gp._program}', fontsize=10)
+    ax.set_xlabel('Days since SMA start')
+    ax.set_ylabel('Price (USDT)')
     ax.legend()
-    ax.grid(True)
-
-    # Buffer image to memory
+    ax.grid(True, alpha=0.3)
+    
+    # Buffer
     output = io.BytesIO()
     fig.savefig(output, format='png')
     plt.close(fig)
@@ -61,5 +101,4 @@ def plot_png():
     return Response(output.getvalue(), mimetype='image/png')
 
 if __name__ == '__main__':
-    # Binds strictly to 8080
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=8080)
