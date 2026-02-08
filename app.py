@@ -145,12 +145,15 @@ def train_model():
     plot_url = base64.b64encode(img_buffer.getvalue()).decode()
     plt.close()
     
+    # Convert forecast to list to avoid indexing issues
+    forecast_list = forecast.tolist()
+    
     # Update model state
     model_state['model_trained'] = True
     model_state['forecast_plot'] = plot_url
     model_state['best_params'] = best_params
     model_state['aic_value'] = best_aic
-    model_state['forecast_values'] = forecast
+    model_state['forecast_values'] = forecast_list
     model_state['forecast_dates'] = forecast_dates
     model_state['last_update'] = datetime.now()
     
@@ -246,7 +249,7 @@ def index():
             
             <div class="plot-container">
                 <h2>Historical vs Forecasted 21-Day SMA</h2>
-                <img src="data:image/png;base64,{plot_url}" width="100%" alt="ARIMA Forecast Plot">
+                <img src="image/png;base64,{plot_url}" width="100%" alt="ARIMA Forecast Plot">
             </div>
         </div>
     </body>
