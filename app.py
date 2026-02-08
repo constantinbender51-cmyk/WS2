@@ -88,15 +88,16 @@ def plot_complex_prophet():
     # --- Plot 1: The Master Forecast ---
     ax1 = fig.add_subplot(gs[0])
     
-    # Trend Line
+    # Trend Line and Uncertainty
     ax1.plot(forecast['ds'], forecast['yhat'], color='#004488', linewidth=2, label='Ensemble Forecast')
-    
-    # Uncertainty "Cloud"
     ax1.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'], 
                      color='#004488', alpha=0.15, label='95% Uncertainty')
     
     # Actual Data
     ax1.scatter(history['ds'], history['y'], color='black', s=3, alpha=0.4, label='Price Action', zorder=3)
+    
+    # Corrected Changepoint call: Passing all as keywords to avoid positional conflicts
+    add_changepoints_to_plot(ax=ax1, m=model, fcst=forecast)
     
     # Halving Markers
     halvings = ['2016-07-09', '2020-05-11', '2024-04-19']
@@ -104,33 +105,28 @@ def plot_complex_prophet():
         ax1.axvline(pd.to_datetime(h), color='red', linestyle='--', alpha=0.6, linewidth=1)
         ax1.text(pd.to_datetime(h), ax1.get_ylim()[1]*0.9, ' HALVING', color='red', fontsize=8, rotation=90)
 
-    # Visualize Regime Changes (Changepoints)
-    # This highlights where the model decided the "Trend" fundamentally broke
-    add_changepoints_to_plot(ax1.figure, model, forecast, ax=ax1)
-    
-    ax1.set_title('Bayesian Structural Time Series: BTC/USDT (Trend + Seasonality + Event Shocks)', fontsize=12)
+    ax1.set_title('Bayesian Structural Time Series: BTC/USDT', fontsize=12)
     ax1.set_ylabel('Price (USDT)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.2)
     
-    # --- Plot 2: The 4-Year Fractal ---
+    # --- Plot 2: 4-Year Fractal ---
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
     ax2.plot(forecast['ds'], forecast['4_year_cycle'], color='purple', linewidth=1.5)
-    ax2.set_title('Component: 4-Year Cycle (The "Halving Heartbeat")', fontsize=10)
-    ax2.set_ylabel('Cycle Strength')
+    ax2.set_title('Component: 4-Year Cycle', fontsize=10)
     ax2.grid(True, alpha=0.3)
     
-    # --- Plot 3: The Yearly Seasonality ---
+    # --- Plot 3: Yearly Seasonality ---
     ax3 = fig.add_subplot(gs[2], sharex=ax1)
     ax3.plot(forecast['ds'], forecast['yearly'], color='green', linewidth=1.5)
-    ax3.set_title('Component: Annual Seasonality (Tax/Summer/Winter Effects)', fontsize=10)
+    ax3.set_title('Component: Annual Seasonality', fontsize=10)
     ax3.grid(True, alpha=0.3)
 
-    # --- Plot 4: The Halving Shock Impact ---
+    # --- Plot 4: Halving Shock ---
     ax4 = fig.add_subplot(gs[3], sharex=ax1)
     ax4.plot(forecast['ds'], forecast['halving'], color='red', linewidth=1.5)
-    ax4.set_title('Component: Supply Shock Events (Post-Halving Volatility)', fontsize=10)
     ax4.fill_between(forecast['ds'], 0, forecast['halving'], color='red', alpha=0.1)
+    ax4.set_title('Component: Supply Shock Events', fontsize=10)
     ax4.grid(True, alpha=0.3)
     
     output = io.BytesIO()
