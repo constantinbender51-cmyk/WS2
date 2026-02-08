@@ -1,38 +1,17 @@
-# Core dependencies for the trading models and web applications
+# Dependencies for app.py only
 
 # Data processing and analysis
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Machine learning and symbolic regression
-scikit-learn>=1.3.0
-gplearn>=0.4.2
-
 # Cryptocurrency data fetching
 ccxt>=4.0.0
-python-binance>=1.0.19
 
 # Web framework and visualization
 flask>=3.0.0
 matplotlib>=3.7.0
 
-# HTTP requests and API calls
-requests>=2.31.0
+# Machine learning and symbolic regression
+gplearn>=0.4.2
 
-# Date and time handling
-datetime
-
-# Environment variable management
-python-dotenv>=1.0.0
-
-# Progress bars
-tqdm>=4.65.0
-
-# Serialization
-pickle-mixin
-
-# Data resampling and time series
-pandas>=2.0.0  # Already listed, but needed for resampling functions
-
-# Note: Some packages like 'urllib' and 'json' are part of Python standard library
-# Note: 'base64', 'collections', 'threading', 'csv', 'os', 'sys', 'io', 'time', 're' are standard library modules
+# Note: datetime, io, and time are part of Python standard library
