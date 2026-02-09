@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import io
 import base64
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 import warnings
 warnings.filterwarnings('ignore')
 from statsmodels.tsa.arima.model import ARIMA
@@ -21,33 +21,51 @@ model_state = {
     'aic_value': None,
     'forecast_values': None,
     'forecast_dates': None,
-    'last_update': None
+    'last_update': None,
+    'periods': [],  # Store available periods for pagination
+    'current_period_id': None
 }
 
-# Fetch Bitcoin data from Binance API
-def fetch_btc_data():
-    # Calculate dates for data since 2018
-    start_date = '2018-01-01'
-    end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+# Fetch Bitcoin data from Binance API with pagination
+def fetch_btc_data_paginated():
+    # Start from 2018-01-01
+    start_date = datetime(2018, 1, 1)
+    end_date = datetime.now() + timedelta(days=1)
     
-    # Format dates for Binance API
-    start_timestamp = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
-    end_timestamp = int(datetime.strptime(end_date, '%Y-%m-%d').timestamp() * 1000)
+    all_data = []
+    current_start = start_date
     
-    url = f"https://api.binance.com/api/v3/klines"
-    params = {
-        'symbol': 'BTCUSDT',
-        'interval': '1d',
-        'startTime': start_timestamp,
-        'endTime': end_timestamp,
-        'limit': 10000  # Max allowed
-    }
-    
-    response = requests.get(url, params=params)
-    data = response.json()
+    while current_start < end_date:
+        # Set end date for this chunk (max 1000 days per request)
+        chunk_end = min(current_start + timedelta(days=999), end_date)
+        
+        # Format dates for Binance API
+        start_timestamp = int(current_start.timestamp() * 1000)
+        end_timestamp = int(chunk_end.timestamp() * 1000)
+        
+        url = f"https://api.binance.com/api/v3/klines"
+        params = {
+            'symbol': 'BTCUSDT',
+            'interval': '1d',
+            'startTime': start_timestamp,
+            'endTime': end_timestamp,
+            'limit': 1000
+        }
+        
+        response = requests.get(url, params=params)
+        data = response.json()
+        
+        if data:
+            all_data.extend(data)
+        
+        # Move to next chunk
+        current_start = chunk_end + timedelta(seconds=1)
+        
+        # Be respectful to the API
+        time.sleep(0.1)
     
     # Convert to DataFrame
-    df = pd.DataFrame(data, columns=[
+    df = pd.DataFrame(all_data, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'number_of_trades',
         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
@@ -87,48 +105,100 @@ def grid_search_arima(train_data, max_p=3, max_d=2, max_q=3):
     
     return best_params, best_aic
 
-# Train the model in a separate thread
-def train_model():
+# Get available 6-month periods for pagination
+def get_available_periods():
+    periods = []
+    start_date = datetime(2018, 1, 1)
+    current_date = datetime.now()
+    
+    # Create 6-month periods from 2018 to 2026
+    year = 2018
+    while year <= 2026:
+        # First half of the year
+        period1_start = datetime(year, 1, 1)
+        if period1_start <= current_date:
+            periods.append({
+                'start': period1_start,
+                'end': datetime(year, 6, 30),
+                'label': f"{year} Jan-Jun",
+                'id': f"{year}_H1"
+            })
+        
+        # Second half of the year
+        period2_start = datetime(year, 7, 1)
+        if period2_start <= current_date:
+            periods.append({
+                'start': period2_start,
+                'end': datetime(year, 12, 31),
+                'label': f"{year} Jul-Dec",
+                'id': f"{year}_H2"
+            })
+        
+        year += 1
+    
+    return periods
+
+# Train the model for a specific period
+def train_model_for_period(period_id=None):
     global model_state
     
-    print("Starting model training...")
-    print("Fetching Bitcoin data...")
-    btc_data = fetch_btc_data()
+    print(f"Starting model training for period: {period_id}")
+    print("Fetching Bitcoin data with pagination...")
+    btc_data = fetch_btc_data_paginated()
     
     print("Calculating 21-day SMA...")
     sma21 = calculate_sma21(btc_data)
     sma21_clean = sma21.dropna()
     
-    # Get current date to determine the most recent 6-month period
-    current_date = datetime.now()
+    # Get available periods
+    periods = get_available_periods()
+    model_state['periods'] = periods
     
-    # Find the start of the current 6-month period (Jan, Jul or Feb, Aug, etc.)
-    if current_date.month <= 6:
-        period_start = datetime(current_date.year, 1, 1)
+    # Find the requested period or use the most recent one
+    if period_id and period_id != 'latest':
+        selected_period = next((p for p in periods if p['id'] == period_id), None)
     else:
-        period_start = datetime(current_date.year, 7, 1)
+        selected_period = periods[-1] if periods else None
     
-    # Get data for the current 6-month period plus the next month for testing
-    period_end = period_start + timedelta(days=6*30)  # Approx 6 months
-    test_period_end = period_end + timedelta(days=30)  # Add 1 more month for testing
+    if not selected_period:
+        # Default to recent 6 months if no valid period found
+        selected_period = {
+            'start': datetime.now() - timedelta(days=180),
+            'end': datetime.now(),
+            'label': "Recent 6 months",
+            'id': "recent"
+        }
     
-    # Filter data to our desired period
-    filtered_data = sma21_clean[(sma21_clean.index >= period_start) & (sma21_clean.index <= test_period_end)]
+    # Filter data for the selected period (6 months train)
+    period_data = sma21_clean[
+        (sma21_clean.index >= selected_period['start']) & 
+        (sma21_clean.index <= selected_period['end'])
+    ]
     
-    # Ensure we have enough data points
-    if len(filtered_data) < 100:  # Minimum required for ARIMA
-        # If not enough data in current period, use the most recent available
-        filtered_data = sma21_clean.tail(200)
+    # Add next month for testing
+    test_start = selected_period['end'] + timedelta(days=1)
+    test_end = test_start + timedelta(days=30)  # 1 month for testing
     
-    # Split into train (6 months) and test (1 month)
-    total_days = len(filtered_data)
-    test_size = min(30, total_days // 4)  # Use 1 month or 25% of data for testing
-    train_size = total_days - test_size
+    test_data_full = sma21_clean[
+        (sma21_clean.index >= test_start) & 
+        (sma21_clean.index <= test_end)
+    ]
     
-    train_data = filtered_data.head(train_size)
-    test_data = filtered_data.tail(test_size)
+    # Define train/test split
+    if len(test_data_full) > 0:
+        train_data = period_data
+        test_data = test_data_full
+    else:
+        # If no test data available, use last 30 days of period as test
+        train_data = period_data.iloc[:-30] if len(period_data) > 30 else period_data
+        test_data = period_data.iloc[-30:] if len(period_data) > 30 else pd.Series(dtype=float)
     
     print(f"Training data size: {len(train_data)}, Test data size: {len(test_data)}")
+    
+    if len(train_data) < 50:
+        print("Not enough training data, using last 100 available points")
+        train_data = sma21_clean.tail(100)
+        test_data = pd.Series(dtype=float)
     
     print("Performing grid search for optimal parameters...")
     best_params, best_aic = grid_search_arima(train_data)
@@ -155,24 +225,32 @@ def train_model():
     
     # Prepare plotting data
     plt.figure(figsize=(15, 8))
-    plt.plot(filtered_data.index, filtered_data.values, label='Actual 21-day SMA', color='blue')
-    plt.plot(test_data.index, test_data.values, label='Test Data', color='green')
+    
+    # Plot all available data for context
+    plt.plot(sma21_clean.index, sma21_clean.values, label='All Historical 21-day SMA', color='lightgray', alpha=0.5)
+    
+    # Highlight the selected period
+    plt.plot(period_data.index, period_data.values, label='Selected 6-Month Period', color='blue')
+    
+    # Plot test data if available
+    if len(test_data) > 0:
+        plt.plot(test_data.index, test_data.values, label='Test Data (Next Month)', color='green')
     
     # Plot forecast
-    forecast_dates = pd.date_range(start=filtered_data.index[-1] + timedelta(days=1), periods=forecast_steps, freq='D')
-    plt.plot(forecast_dates, forecast, label='Forecast', color='red', linestyle='--')
+    forecast_dates = pd.date_range(start=period_data.index[-1] + timedelta(days=1), periods=forecast_steps, freq='D')
+    plt.plot(forecast_dates, forecast, label='Forecast', color='red', linestyle='--', linewidth=2)
     
     # Confidence intervals
     plt.fill_between(forecast_dates, 
                      forecast_ci.iloc[:, 0], 
                      forecast_ci.iloc[:, 1], 
-                     color='pink', alpha=0.3, label='Confidence Interval')
+                     color='red', alpha=0.2, label='Confidence Interval')
     
-    plt.title('Bitcoin 21-Day SMA Forecast using ARIMA')
+    plt.title(f'Bitcoin 21-Day SMA Forecast for {selected_period["label"]} using ARIMA')
     plt.xlabel('Date')
     plt.ylabel('Price (USD)')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     
     # Save plot to base64 string
@@ -187,18 +265,19 @@ def train_model():
     
     # Update model state
     model_state['model_trained'] = True
-    model_state['forecast_plot'] = plot_url
+    model_state['forecast_plot'] = f"data:image/png;base64,{plot_url}"
     model_state['best_params'] = best_params
     model_state['aic_value'] = best_aic if best_params else float('inf')
     model_state['forecast_values'] = forecast_list
     model_state['forecast_dates'] = forecast_dates
     model_state['last_update'] = datetime.now()
+    model_state['current_period_id'] = selected_period['id']
     
     print("Model training completed!")
 
 # Start model training in background
-def start_training():
-    training_thread = threading.Thread(target=train_model)
+def start_training(period_id=None):
+    training_thread = threading.Thread(target=lambda: train_model_for_period(period_id))
     training_thread.daemon = True
     training_thread.start()
     return training_thread
@@ -210,8 +289,11 @@ app = Flask(__name__)
 def index():
     global model_state
     
-    # Check if model is trained
-    if not model_state['model_trained']:
+    # Get period ID from query parameter
+    period_id = request.args.get('period')
+    
+    # Check if model is trained or if we need to retrain for a different period
+    if not model_state['model_trained'] or (period_id and period_id != model_state['current_period_id']):
         html_template = """
         <!DOCTYPE html>
         <html>
@@ -227,7 +309,7 @@ def index():
             <div class="container">
                 <h1>Bitcoin 21-Day SMA ARIMA Forecast</h1>
                 <div class="loading">
-                    <h2>Training model...</h2>
+                    <h2>Training model for selected period...</h2>
                     <p>Please wait while the ARIMA model is being trained. This may take a few minutes.</p>
                     <p>The page will automatically refresh once training is complete.</p>
                     <script>
@@ -240,6 +322,8 @@ def index():
         </body>
         </html>
         """
+        # Start training for the selected period
+        start_training(period_id)
         return html_template
     
     # If model is trained, show results
@@ -248,6 +332,15 @@ def index():
     aic_value = model_state['aic_value']
     forecast = model_state['forecast_values']
     forecast_dates = model_state['forecast_dates']
+    
+    # Generate pagination links
+    periods_html = ""
+    if model_state['periods']:
+        periods_html = "<div class='pagination'><h3>Select Period:</h3><div style='overflow-x: auto; white-space: nowrap; padding: 10px 0;'>"
+        for period in model_state['periods']:
+            active_class = "style='background-color: #0056b3;'" if period['id'] == model_state['current_period_id'] else ""
+            periods_html += f"<a href='/?period={period['id']}' {active_class} style='display: inline-block; margin-right: 5px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 3px; font-size: 14px;'>{period['label']}</a>"
+        periods_html += "</div></div>"
     
     forecast_text = "<ul>"
     for i, date in enumerate(forecast_dates):
@@ -265,11 +358,14 @@ def index():
             .info-box {{ background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
             .plot-container {{ text-align: center; }}
             h1 {{ color: #333; }}
+            .pagination a:visited {{ color: white; }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>Bitcoin 21-Day SMA ARIMA Forecast</h1>
+            
+            {periods_html}
             
             <div class="info-box">
                 <h2>Model Information</h2>
@@ -286,7 +382,7 @@ def index():
             
             <div class="plot-container">
                 <h2>Historical vs Forecasted 21-Day SMA</h2>
-                <img src="image/png;base64,{plot_url}" width="100%" alt="ARIMA Forecast Plot">
+                <img src="{plot_url}" width="100%" alt="ARIMA Forecast Plot">
             </div>
         </div>
     </body>
@@ -299,7 +395,7 @@ if __name__ == '__main__':
     print("Starting server...")
     print("Model training will begin in the background...")
     
-    # Start model training in background
+    # Start model training in background for the default period
     training_thread = start_training()
     
     # Start Flask app
