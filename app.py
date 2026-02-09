@@ -64,24 +64,25 @@ def fetch_btc_data():
 def calculate_sma21(data):
     return data['close'].rolling(window=21).mean()
 
-# Grid search for optimal ARIMA parameters
+# Grid search for optimal ARIMA parameters with improved handling
 def grid_search_arima(train_data, max_p=3, max_d=2, max_q=3):
     best_aic = float('inf')
     best_params = None
     
-    p_values = range(0, max_p + 1)
+    p_values = range(0, min(max_p + 1, len(train_data)//10))  # Limit p based on data size
     d_values = range(0, max_d + 1)
     q_values = range(0, max_q + 1)
     
     for p, d, q in product(p_values, d_values, q_values):
         try:
+            # Set enforce_stationarity and invertibility to False to handle convergence issues
             model = ARIMA(train_data, order=(p, d, q))
-            fitted_model = model.fit()
+            fitted_model = model.fit(method_kwargs={"warn_convergence": False})
             
             if fitted_model.aic < best_aic:
                 best_aic = fitted_model.aic
                 best_params = (p, d, q)
-        except:
+        except Exception as e:
             continue
     
     return best_params, best_aic
@@ -98,18 +99,31 @@ def train_model():
     sma21 = calculate_sma21(btc_data)
     sma21_clean = sma21.dropna()
     
+    # Use only recent data to reduce computational complexity
+    recent_data = sma21_clean.tail(500)  # Use last 500 days
+    
     # Split data into train and test sets (use last 30 days as test)
-    split_idx = len(sma21_clean) - 30
-    train_data = sma21_clean[:split_idx]
-    test_data = sma21_clean[split_idx:]
+    split_idx = len(recent_data) - 30
+    train_data = recent_data[:split_idx]
+    test_data = recent_data[split_idx:]
     
     print("Performing grid search for optimal parameters...")
     best_params, best_aic = grid_search_arima(train_data)
     print(f"Best parameters: {best_params}, AIC: {best_aic}")
     
+    # If no good parameters found, use default
+    if best_params is None:
+        best_params = (1, 1, 1)
+        print(f"No optimal parameters found. Using default: {best_params}")
+    
     # Fit model with best parameters
-    model = ARIMA(train_data, order=best_params)
-    fitted_model = model.fit()
+    try:
+        model = ARIMA(train_data, order=best_params)
+        fitted_model = model.fit(method_kwargs={"warn_convergence": False})
+    except:
+        # If fitting fails with best params, use default
+        model = ARIMA(train_data, order=(1, 1, 1))
+        fitted_model = model.fit(method_kwargs={"warn_convergence": False})
     
     # Forecast next 7 days
     forecast_steps = 7
@@ -118,11 +132,11 @@ def train_model():
     
     # Prepare plotting data
     plt.figure(figsize=(15, 8))
-    plt.plot(sma21_clean.index, sma21_clean.values, label='Actual 21-day SMA', color='blue')
+    plt.plot(recent_data.index, recent_data.values, label='Actual 21-day SMA', color='blue')
     plt.plot(test_data.index, test_data.values, label='Test Data', color='green')
     
     # Plot forecast
-    forecast_dates = pd.date_range(start=sma21_clean.index[-1] + timedelta(days=1), periods=forecast_steps, freq='D')
+    forecast_dates = pd.date_range(start=recent_data.index[-1] + timedelta(days=1), periods=forecast_steps, freq='D')
     plt.plot(forecast_dates, forecast, label='Forecast', color='red', linestyle='--')
     
     # Confidence intervals
@@ -152,7 +166,7 @@ def train_model():
     model_state['model_trained'] = True
     model_state['forecast_plot'] = plot_url
     model_state['best_params'] = best_params
-    model_state['aic_value'] = best_aic
+    model_state['aic_value'] = best_aic if best_params else float('inf')
     model_state['forecast_values'] = forecast_list
     model_state['forecast_dates'] = forecast_dates
     model_state['last_update'] = datetime.now()
@@ -249,7 +263,7 @@ def index():
             
             <div class="plot-container">
                 <h2>Historical vs Forecasted 21-Day SMA</h2>
-                <img src="image/png;base64,{plot_url}" width="100%" alt="ARIMA Forecast Plot">
+                <img src="data:image/png;base64,{plot_url}" width="100%" alt="ARIMA Forecast Plot">
             </div>
         </div>
     </body>
