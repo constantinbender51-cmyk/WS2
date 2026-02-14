@@ -6,7 +6,7 @@ import socketserver
 from openai import OpenAI
 from dotenv import load_dotenv
 
-def process_with_metrics():
+def generate_community_synthesis():
     load_dotenv()
     api_key = os.getenv("DSAPI")
     db_url = "https://try3btc.up.railway.app/"
@@ -19,43 +19,40 @@ def process_with_metrics():
         print(f"Data Fetch Error: {e}")
         return None
 
-    posts_to_send = []
-    comments_to_send = []
+    # Aggregate all text into a single corpus for global context
+    corpus = []
     results = data.get("results", {})
 
     for subreddit in results:
         for post in results[subreddit]:
-            posts_to_send.append({
-                "id": post.get("id"),
-                "type": "post",
-                "text": f"T: {post.get('title')} B: {post.get('body')}"
-            })
+            corpus.append(f"POST: {post.get('title')} | {post.get('body')}")
             for comment in post.get("comments", []):
-                comments_to_send.append({
-                    "id": post.get("id"),
-                    "type": "comment",
-                    "text": comment.get("text", "")
-                })
+                corpus.append(f"COMMENT: {comment.get('text', '')}")
 
-    total_posts = len(posts_to_send)
-    total_comments = len(comments_to_send)
-    total_items = total_posts + total_comments
+    full_text = "\n".join(corpus)
     
-    print(f"--- PRE-FLIGHT METRICS ---")
-    print(f"Total Posts: {total_posts}")
-    print(f"Total Comments: {total_comments}")
-    print(f"Total Payload Items: {total_items}")
-    print(f"--------------------------")
+    print(f"--- DATA METRICS ---")
+    print(f"Total Text Length: {len(full_text)} characters")
+    print(f"Total Subreddits: {len(results)}")
+    print(f"--------------------")
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-    full_payload = posts_to_send + comments_to_send
 
     try:
         completion = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "Analyze the sentiment of EVERY item in this list. Return a comprehensive JSON summary."},
-                {"role": "user", "content": json.dumps(full_payload)}
+                {
+                    "role": "system", 
+                    "content": (
+                        "You are an objective data analyst. Analyze the following Reddit data corpus. "
+                        "Do not score individual items. Provide a high-level community sentiment analysis. "
+                        "Identify: 1. Overall sentiment trend. 2. Primary themes of discussion. "
+                        "3. Notable conflicts or consensus. 4. Emergent patterns. "
+                        "Return strictly in JSON format."
+                    )
+                },
+                {"role": "user", "content": full_text[:32000]} # Truncate to stay within context window
             ],
             response_format={'type': 'json_object'}
         )
@@ -65,17 +62,17 @@ def process_with_metrics():
         return None
 
 def serve_response(content):
-    with open("analysis_result.json", "w") as f:
+    with open("sentiment_report.json", "w") as f:
         f.write(content)
 
     PORT = 8080
     Handler = http.server.SimpleHTTPRequestHandler
 
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"Serving analysis at port {PORT}")
+        print(f"Serving Synthesis Report at http://localhost:{PORT}/sentiment_report.json")
         httpd.serve_forever()
 
 if __name__ == "__main__":
-    analysis_content = process_with_metrics()
-    if analysis_content:
-        serve_response(analysis_content)
+    report = generate_community_synthesis()
+    if report:
+        serve_response(report)
