@@ -1,6 +1,8 @@
 import os
 import requests
 import json
+import http.server
+import socketserver
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -9,29 +11,25 @@ def process_with_metrics():
     api_key = os.getenv("DSAPI")
     db_url = "https://try3btc.up.railway.app/"
     
-    # 1. Fetch data from the utility
     try:
         response = requests.get(db_url)
         response.raise_for_status()
         data = response.json()
     except Exception as e:
         print(f"Data Fetch Error: {e}")
-        return
+        return None
 
-    # 2. Extract and count
     posts_to_send = []
     comments_to_send = []
     results = data.get("results", {})
 
     for subreddit in results:
         for post in results[subreddit]:
-            # Capture Post
             posts_to_send.append({
                 "id": post.get("id"),
                 "type": "post",
                 "text": f"T: {post.get('title')} B: {post.get('body')}"
             })
-            # Capture Comments
             for comment in post.get("comments", []):
                 comments_to_send.append({
                     "id": post.get("id"),
@@ -39,7 +37,6 @@ def process_with_metrics():
                     "text": comment.get("text", "")
                 })
 
-    # 3. Pre-flight metrics for Jimmy
     total_posts = len(posts_to_send)
     total_comments = len(comments_to_send)
     total_items = total_posts + total_comments
@@ -50,9 +47,7 @@ def process_with_metrics():
     print(f"Total Payload Items: {total_items}")
     print(f"--------------------------")
 
-    # 4. Transmit aggregate payload
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-    
     full_payload = posts_to_send + comments_to_send
 
     try:
@@ -64,10 +59,23 @@ def process_with_metrics():
             ],
             response_format={'type': 'json_object'}
         )
-        print("\n--- ANALYSIS RESULT ---")
-        print(completion.choices[0].message.content)
+        return completion.choices[0].message.content
     except Exception as e:
         print(f"Analysis Error: {e}")
+        return None
+
+def serve_response(content):
+    with open("analysis_result.json", "w") as f:
+        f.write(content)
+
+    PORT = 8080
+    Handler = http.server.SimpleHTTPRequestHandler
+
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        print(f"Serving analysis at port {PORT}")
+        httpd.serve_forever()
 
 if __name__ == "__main__":
-    process_with_metrics()
+    analysis_content = process_with_metrics()
+    if analysis_content:
+        serve_response(analysis_content)
