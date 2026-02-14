@@ -1,16 +1,3 @@
-gdown
-# Dependencies for app.py
-
-# Data processing and analysis
-pandas
-numpy
-
-# Web framework and visualization
-flask
-matplotlib
-
-# Machine learning and time series
-statsmodels
-
-# HTTP requests for Binance API
 requests
+openai
+python-dotenv
