@@ -4,63 +4,70 @@ import json
 from openai import OpenAI
 from dotenv import load_dotenv
 
-def analyze_entire_community():
+def process_with_metrics():
     load_dotenv()
     api_key = os.getenv("DSAPI")
     db_url = "https://try3btc.up.railway.app/"
     
+    # 1. Fetch data from the utility
     try:
-        raw_data = requests.get(db_url).json()
+        response = requests.get(db_url)
+        response.raise_for_status()
+        data = response.json()
     except Exception as e:
-        print(f"Connection Error: {e}")
+        print(f"Data Fetch Error: {e}")
         return
 
-    # 1. Flattening logic to catch EVERYTHING
-    payload = []
-    results = raw_data.get("results", {})
-    
-    for sub, posts in results.items():
-        for p in posts:
-            # Append Post
-            payload.append({
+    # 2. Extract and count
+    posts_to_send = []
+    comments_to_send = []
+    results = data.get("results", {})
+
+    for subreddit in results:
+        for post in results[subreddit]:
+            # Capture Post
+            posts_to_send.append({
+                "id": post.get("id"),
                 "type": "post",
-                "id": p.get("id", "N/A"),
-                "content": f"TITLE: {p.get('title')} BODY: {p.get('body')}"
+                "text": f"T: {post.get('title')} B: {post.get('body')}"
             })
-            # Append Every Comment
-            for c in p.get("comments", []):
-                payload.append({
+            # Capture Comments
+            for comment in post.get("comments", []):
+                comments_to_send.append({
+                    "id": post.get("id"),
                     "type": "comment",
-                    "id": p.get("id"), # Linking to parent post ID
-                    "content": c.get("text")
+                    "text": comment.get("text", "")
                 })
 
-    total_items = len(payload)
-    print(f"Transmitting {total_items} discrete items to DeepSeek...")
+    # 3. Pre-flight metrics for Jimmy
+    total_posts = len(posts_to_send)
+    total_comments = len(comments_to_send)
+    total_items = total_posts + total_comments
+    
+    print(f"--- PRE-FLIGHT METRICS ---")
+    print(f"Total Posts: {total_posts}")
+    print(f"Total Comments: {total_comments}")
+    print(f"Total Payload Items: {total_items}")
+    print(f"--------------------------")
 
+    # 4. Transmit aggregate payload
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     
-    # 2. Strict Prompt to prevent partial analysis
-    system_msg = (
-        f"You are an objective engine. You are receiving a dataset of {total_items} items. "
-        "You MUST analyze every item. Do not provide samples. "
-        "Return a JSON object: "
-        "{ 'meta': {'total_processed': int, 'overall_sentiment': float}, "
-        "'analysis': [{'id': string, 'sentiment': string, 'score': float}] }"
-    )
+    full_payload = posts_to_send + comments_to_send
 
     try:
         completion = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(payload)}
+                {"role": "system", "content": "Analyze the sentiment of EVERY item in this list. Return a comprehensive JSON summary."},
+                {"role": "user", "content": json.dumps(full_payload)}
             ],
             response_format={'type': 'json_object'}
         )
+        print("\n--- ANALYSIS RESULT ---")
         print(completion.choices[0].message.content)
     except Exception as e:
-        print(f"API Error: {e}")
+        print(f"Analysis Error: {e}")
 
 if __name__ == "__main__":
-    analyze_entire_community()
+    process_with_metrics()
