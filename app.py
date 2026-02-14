@@ -6,7 +6,7 @@ import socketserver
 from openai import OpenAI
 from dotenv import load_dotenv
 
-def generate_community_synthesis():
+def process_with_metrics():
     load_dotenv()
     api_key = os.getenv("DSAPI")
     db_url = "https://try3btc.up.railway.app/"
@@ -19,21 +19,22 @@ def generate_community_synthesis():
         print(f"Data Fetch Error: {e}")
         return None
 
-    # Aggregate all text into a single corpus for global context
-    corpus = []
+    # Aggregate the entire corpus
+    corpus_fragments = []
     results = data.get("results", {})
 
-    for subreddit in results:
-        for post in results[subreddit]:
-            corpus.append(f"POST: {post.get('title')} | {post.get('body')}")
+    for subreddit, posts in results.items():
+        for post in posts:
+            fragment = f"Subreddit: {subreddit}\nTitle: {post.get('title')}\nBody: {post.get('body')}\n"
             for comment in post.get("comments", []):
-                corpus.append(f"COMMENT: {comment.get('text', '')}")
+                fragment += f"Comment: {comment.get('text', '')}\n"
+            corpus_fragments.append(fragment)
 
-    full_text = "\n".join(corpus)
+    full_corpus = "\n---\n".join(corpus_fragments)
     
     print(f"--- DATA METRICS ---")
-    print(f"Total Text Length: {len(full_text)} characters")
-    print(f"Total Subreddits: {len(results)}")
+    print(f"Total Characters: {len(full_corpus)}")
+    print(f"Total Logical Fragments: {len(corpus_fragments)}")
     print(f"--------------------")
 
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
@@ -44,15 +45,12 @@ def generate_community_synthesis():
             messages=[
                 {
                     "role": "system", 
-                    "content": (
-                        "You are an objective data analyst. Analyze the following Reddit data corpus. "
-                        "Do not score individual items. Provide a high-level community sentiment analysis. "
-                        "Identify: 1. Overall sentiment trend. 2. Primary themes of discussion. "
-                        "3. Notable conflicts or consensus. 4. Emergent patterns. "
-                        "Return strictly in JSON format."
-                    )
+                    "content": "You are a specialized data analyst. Analyze the following social media dataset. "
+                               "Provide a comprehensive sentiment analysis of the entire community. "
+                               "Identify dominant themes, emotional trends, and collective consensus. "
+                               "Return the analysis as a structured JSON object."
                 },
-                {"role": "user", "content": full_text[:32000]} # Truncate to stay within context window
+                {"role": "user", "content": full_corpus}
             ],
             response_format={'type': 'json_object'}
         )
@@ -62,17 +60,18 @@ def generate_community_synthesis():
         return None
 
 def serve_response(content):
-    with open("sentiment_report.json", "w") as f:
+    with open("analysis_result.json", "w") as f:
         f.write(content)
 
     PORT = 8080
-    Handler = http.server.SimpleHTTPRequestHandler
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args): return
 
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"Serving Synthesis Report at http://localhost:{PORT}/sentiment_report.json")
+    with socketserver.TCPServer(("", PORT), QuietHandler) as httpd:
+        print(f"Serving aggregate analysis at http://localhost:{PORT}/analysis_result.json")
         httpd.serve_forever()
 
 if __name__ == "__main__":
-    report = generate_community_synthesis()
-    if report:
-        serve_response(report)
+    analysis_content = process_with_metrics()
+    if analysis_content:
+        serve_response(analysis_content)
