@@ -1,141 +1,105 @@
-import requests
 import pandas as pd
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
-from flask import Flask, send_file, render_template_string
-from io import BytesIO
-import time
-from datetime import datetime
-import threading
-
-# Headless backend
-matplotlib.use('Agg')
-
-app = Flask(__name__)
+import gdown
+import os
 
 # --- CONFIGURATION ---
-SYMBOL = 'BTCUSDT'
-INTERVAL = '1m'
-START_DATE = '2025-11-01'
-END_DATE = '2026-02-14'
-BIN_COUNT = 250 
+FILE_ID = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
+OUTPUT_FILE = 'btc_1m_2018_2026.csv'
+BIN_SIZE = 500  # Price bin width (e.g., every $500)
 
-# Global Memory Buffer
-IMG_CACHE = None
+def download_data():
+    if not os.path.exists(OUTPUT_FILE):
+        url = f'https://drive.google.com/uc?id={FILE_ID}'
+        gdown.download(url, OUTPUT_FILE, quiet=False)
+    else:
+        print("File already exists. Skipping download.")
 
-def get_timestamp(date_str):
-    return int(datetime.strptime(date_str, '%Y-%m-%d').timestamp() * 1000)
-
-def fetch_market_data():
-    print(f"[{datetime.now()}] ACQUIRING VECTOR STREAM: {SYMBOL} ({START_DATE} -> {END_DATE})...")
-    base_url = "https://api.binance.com/api/v3/klines"
-    start_ts = get_timestamp(START_DATE)
-    end_ts = get_timestamp(END_DATE)
+def process_intensity():
+    # Load Data (Assuming standard Binance columns without header)
+    # If header exists, change 'header=None' to 'header=0'
+    print("Loading dataset...")
+    df = pd.read_csv(OUTPUT_FILE, header=None)
     
-    data = []
-    current_ts = start_ts
+    # Binance 1m CSV Format:
+    # 0: Open Time, 1: Open, 2: High, 3: Low, 4: Close, 5: Vol, 
+    # 6: Close Time, 7: Quote Vol, 8: Trades, 9: Taker Buy Base, ...
+    df.columns = [
+        'open_time', 'open', 'high', 'low', 'close', 'volume', 
+        'close_time', 'qav', 'num_trades', 'taker_buy_base', 
+        'taker_buy_quote', 'ignore'
+    ]
     
-    while current_ts < end_ts:
-        params = {
-            'symbol': SYMBOL, 'interval': INTERVAL,
-            'startTime': current_ts, 'endTime': end_ts, 'limit': 1000
-        }
-        
-        try:
-            resp = requests.get(base_url, params=params, timeout=10)
-            resp.raise_for_status()
-            klines = resp.json()
-            
-            if not klines: break
-                
-            data.extend(klines)
-            current_ts = klines[-1][6] + 1
-            time.sleep(0.05) # Aggressive rate limit
-            print(f"\rVectors loaded: {len(data)}", end="")
-            
-        except Exception as e:
-            print(f"\nStream interrupt: {e}")
-            break
-            
-    print("\nVector acquisition complete.")
-    
-    df = pd.DataFrame(data, columns=[
-        'opentime', 'open', 'high', 'low', 'close', 'volume', 
-        'closetime', 'qav', 'num_trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
-    ])
-    cols = ['open', 'high', 'low', 'close', 'volume']
+    # Optimize types
+    cols = ['open', 'high', 'low', 'close', 'taker_buy_base']
     df[cols] = df[cols].astype(float)
-    return df
-
-def compute_and_render():
-    global IMG_CACHE
-    df = fetch_market_data()
     
-    if df.empty:
-        print("Dataset empty. Aborting render.")
-        return
-
-    # Binning Logic
+    # 1. Price Binning
+    # We use the 'Close' price to determine which bin the minute belongs to.
+    # A more precise method uses (High+Low)/2, but Close is sufficient for 4M rows.
     price_min = df['low'].min()
     price_max = df['high'].max()
-    bins = np.linspace(price_min, price_max, BIN_COUNT + 1)
+    bins = np.arange(0, price_max + BIN_SIZE, BIN_SIZE) # Start at 0 to catch early days
     
-    # Vectorized Classification
-    df['mid'] = (df['high'] + df['low']) / 2
-    # 1 = Buy (Demand), -1 = Sell (Supply)
-    df['direction'] = np.where(df['close'] >= df['open'], 1, -1)
-    df['bin_idx'] = np.digitize(df['mid'], bins) - 1
-    df['bin_idx'] = df['bin_idx'].clip(0, BIN_COUNT - 1)
+    df['price_bin'] = pd.cut(df['close'], bins)
     
-    vol_buy = df[df['direction'] == 1].groupby('bin_idx')['volume'].sum()
-    vol_sell = df[df['direction'] == -1].groupby('bin_idx')['volume'].sum()
+    # 2. Aggregation (The "Willingness" Calculation)
+    # Group by Price Bin
+    print("Aggregating volume by price bin...")
+    grouped = df.groupby('price_bin', observed=True)
     
-    all_indices = pd.Index(range(BIN_COUNT))
-    vol_buy = vol_buy.reindex(all_indices, fill_value=0).values
-    vol_sell = vol_sell.reindex(all_indices, fill_value=0).values
+    # Calculate Metrics:
+    # A. Total Taker Buy Volume (Raw Willingness)
+    # B. Count of Minutes (Time Spent)
+    analysis = grouped.agg({
+        'taker_buy_base': 'sum',  # Total Buy Vol
+        'close': 'count'          # Total Minutes (Time)
+    }).rename(columns={'close': 'minutes_spent'})
     
-    # Plotting
+    # 3. Time Normalization (Intensity)
+    # Intensity = Volume / Time
+    # "How many BTC were bought per minute while price was in this bin?"
+    analysis['buy_intensity'] = analysis['taker_buy_base'] / analysis['minutes_spent']
+    
+    # Get the mid-point of each bin for plotting
+    analysis['price_mid'] = analysis.index.map(lambda x: x.mid).astype(float)
+    
+    # Filter out empty bins or bins with very low time (outliers)
+    analysis = analysis[analysis['minutes_spent'] > 60] # Must have spent at least 1 hour total
+    
+    return analysis
+
+def plot_demand_intensity(df):
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(14, 9))
+    fig, ax = plt.subplots(figsize=(12, 10))
     
-    y_pos = bins[:-1]
-    height = bins[1] - bins[0]
+    # Y-Axis = Price
+    # X-Axis = Intensity (BTC Bought / Minute)
+    y = df['price_mid']
+    x = df['buy_intensity']
     
-    ax.barh(y_pos, vol_buy, height=height, color='#00ff00', alpha=0.6, label='Demand', align='edge')
-    ax.barh(y_pos, -vol_sell, height=height, color='#ff0000', alpha=0.6, label='Supply', align='edge')
+    # Plot as a horizontal bar chart or a line
+    # A line is better to see the "Structure" of demand
+    ax.plot(x, y, color='#00ffcc', linewidth=2, label='Demand Intensity (Buy Vol / Time)')
     
-    ax.set_title(f'BTC/USDT Liquidity Profile | {START_DATE} :: {END_DATE}')
-    ax.set_xlabel('Volume < Supply | Demand >')
-    ax.axvline(0, color='white', linewidth=0.5)
+    # Fill for visual weight
+    ax.fill_betweenx(y, 0, x, color='#00ffcc', alpha=0.2)
+    
+    ax.set_title('BTC Time-Normalized Demand Schedule (2018-2026)\n"True Willingness to Buy"', fontsize=14)
+    ax.set_ylabel('Price (USDT)')
+    ax.set_xlabel('Intensity: Average Aggressor Buy Volume per Minute (BTC/min)')
+    
+    # Log scale on X might be necessary if early years had massive volume
+    # ax.set_xscale('log') 
+    
+    ax.grid(True, alpha=0.2)
     ax.legend()
     
-    img = BytesIO()
-    plt.savefig(img, format='png', bbox_inches='tight', dpi=100)
-    img.seek(0)
-    plt.close()
-    
-    IMG_CACHE = img
-    print("Render complete. Cache hot.")
+    plt.tight_layout()
+    plt.show()
 
-@app.route('/')
-def index():
-    return """
-    <body style="background:#000; display:flex; justify-content:center; margin:0;">
-        <img src="/plot.png" style="height:100vh; border:1px solid #333;">
-    </body>
-    """
-
-@app.route('/plot.png')
-def plot():
-    if IMG_CACHE:
-        IMG_CACHE.seek(0)
-        return send_file(IMG_CACHE, mimetype='image/png')
-    return "Initializing...", 503
-
-if __name__ == '__main__':
-    # Blocking Fetch on Startup
-    compute_and_render()
-    
-    print("Serving on port 8080...")
-    app.run(host='0.0.0.0', port=8080)
+if __name__ == "__main__":
+    download_data()
+    data = process_intensity()
+    plot_demand_intensity(data)
