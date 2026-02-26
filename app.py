@@ -2,21 +2,12 @@ import io
 import requests
 import pandas as pd
 import matplotlib
+# 'Agg' backend prevents matplotlib from opening a GUI window on the server
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from flask import Flask, send_file
 
 app = Flask(__name__)
-
-# ==========================================
-# TIME SENSITIVITY MULTIPLIER
-# ==========================================
-# Because 1h crypto moves are usually small fractions (e.g., 0.02 for 2%),
-# (close-open)/open rarely exceeds -1.0 to actually force time backwards.
-# This multiplier scales the price action so time literally regresses on red candles,
-# forming the enclosed "Momentum Bubbles".
-SENSITIVITY_MULTIPLIER = 100  
-# ==========================================
 
 def fetch_binance_data():
     """Fetches the last 30 days of 1h BTCUSDT data from Binance (720 candles)."""
@@ -24,7 +15,7 @@ def fetch_binance_data():
     params = {
         "symbol": "BTCUSDT",
         "interval": "1h",
-        "limit": 720
+        "limit": 720  # 30 days * 24 hours
     }
     response = requests.get(url, params=params)
     data = response.json()
@@ -34,62 +25,49 @@ def fetch_binance_data():
             'TakerBuyBaseVol', 'TakerBuyQuoteVol', 'Ignore']
     
     df = pd.DataFrame(data, columns=cols)
-    df['Open'] = df['Open'].astype(float)
+    
+    # Convert Binance timestamp (milliseconds) to actual Datetime objects
+    df['Datetime'] = pd.to_datetime(df['OpenTime'], unit='ms')
+    
+    # Convert string prices to floats
     df['Close'] = df['Close'].astype(float)
-    
-    return df
-
-def process_relativistic_time(df):
-    """
-    Calculates time drift using the user's formula:
-    time_step = 1 + (close - open) / open
-    """
-    # Calculate the fractional movement (e.g., 0.05 for a 5% gain)
-    fractional_move = (df['Close'] - df['Open']) / df['Open']
-    
-    # Apply the formula with the multiplier to allow for negative time steps
-    df['Time_Step'] = 1 + (fractional_move * SENSITIVITY_MULTIPLIER)
-    
-    # X-axis is the cumulative sum of these warped time steps
-    df['X_Movement'] = df['Time_Step'].cumsum()
     
     return df
 
 @app.route('/')
 def serve_plot():
-    # 1. Fetch & Process Data
+    # 1. Fetch Data
     df = fetch_binance_data()
-    df = process_relativistic_time(df)
     
-    # 2. Create Plot
+    # 2. Create Plot (Price vs Standard Time)
     fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0d1117')
     ax.set_facecolor('#0d1117')
     
-    # Plot the continuous trajectory of the points
+    # Plot standard chronological line
     ax.plot(
-        df['X_Movement'], 
+        df['Datetime'], 
         df['Close'], 
         color='#00ffcc',      # Neon cyan line
-        linewidth=0.8,        # Thin line to trace the orbits/bubbles
-        alpha=0.7,
-        marker='o',           # Draw the literal points
-        markersize=3,         
-        markerfacecolor='white',
-        markeredgecolor='none',
+        linewidth=1.5,        
+        alpha=0.8,
         zorder=2
     )
     
-    # 3. Styling
-    ax.set_title("BTCUSDT Relativistic Momentum Bubbles", color='white', fontsize=16, pad=20)
+    # Optional: fill the area under the curve slightly for aesthetics
+    ax.fill_between(df['Datetime'], df['Close'], df['Close'].min(), color='#00ffcc', alpha=0.05)
     
-    formula_text = f"X-Axis Formula: Time += 1 + [ (Close - Open) / Open * {SENSITIVITY_MULTIPLIER} ]"
-    ax.set_xlabel(f"Warped Time Drift\n{formula_text}", color='white', fontsize=11)
+    # 3. Styling
+    ax.set_title("BTCUSDT Baseline: Standard Price vs Standard Time (1h, 30 Days)", color='white', fontsize=16, pad=20)
+    ax.set_xlabel("Chronological Time (UTC)", color='white', fontsize=12)
     ax.set_ylabel("Price (USDT)", color='white', fontsize=12)
     
     ax.tick_params(colors='white')
     ax.grid(True, linestyle='-', alpha=0.1, color='white')
     
-    # Remove borders for a cleaner aesthetic
+    # Rotate date labels so they don't overlap
+    plt.xticks(rotation=45)
+    
+    # Remove harsh borders
     for spine in ax.spines.values():
         spine.set_edgecolor('#30363d')
     
@@ -103,5 +81,5 @@ def serve_plot():
     return send_file(buf, mimetype='image/png')
 
 if __name__ == '__main__':
-    print("Serving Momentum Bubbles on http://0.0.0.0:5000")
+    print("Serving Baseline Plot on http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000)
