@@ -1,277 +1,100 @@
-#!/usr/bin/env python3
-"""
-Repository File Combiner - Web Interface
-Combines all files from a GitHub repository into a single file and serves it as a download.
-Run on port 8080, accessible from any IP (0.0.0.0)
-"""
-
-import os
-import sys
-import tempfile
-import zipfile
-import requests
-import base64
-from flask import Flask, render_template_string, request, send_file, flash, redirect
 import io
+import requests
+import pandas as pd
+import matplotlib
+# Use the 'Agg' backend so matplotlib doesn't try to open a GUI window on a server
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+from flask import Flask, send_file
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # For session management
 
-# HTML Template for the web interface
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Repository File Combiner</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            text-align: center;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            color: #555;
-            font-weight: bold;
-        }
-        input[type="text"] {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            font-size: 16px;
-            box-sizing: border-box;
-        }
-        input[type="text"]:focus {
-            outline: none;
-            border-color: #4CAF50;
-        }
-        .btn {
-            background-color: #4CAF50;
-            color: white;
-            padding: 12px 24px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 16px;
-            width: 100%;
-        }
-        .btn:hover {
-            background-color: #45a049;
-        }
-        .info {
-            background-color: #e7f3fe;
-            border-left: 6px solid #2196F3;
-            margin-bottom: 15px;
-            padding: 10px;
-            border-radius: 3px;
-        }
-        .error {
-            background-color: #ffebee;
-            border-left: 6px solid #f44336;
-            margin-bottom: 15px;
-            padding: 10px;
-            border-radius: 3px;
-        }
-        .example {
-            color: #666;
-            font-size: 14px;
-            margin-top: 5px;
-        }
-        .footer {
-            text-align: center;
-            margin-top: 20px;
-            color: #666;
-            font-size: 14px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Repository File Combiner</h1>
-        
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <div class="info">
-            <strong>How it works:</strong> Enter a GitHub repository URL or in the format "username/repository" 
-            to combine all its files into a single downloadable file.
-        </div>
-        
-        <form method="POST">
-            <div class="form-group">
-                <label for="repo">Repository:</label>
-                <input type="text" id="repo" name="repo" 
-                       placeholder="e.g., octocat/Hello-World or https://github.com/octocat/Hello-World" 
-                       value="{{ request.form.repo if request.form.repo else '' }}" required>
-                <div class="example">Examples: flask/flask, https://github.com/torvalds/linux</div>
-            </div>
-            
-            <button type="submit" class="btn">Combine and Download</button>
-        </form>
-        
-        <div class="footer">
-            Server running on port 8080 • Accessible from any IP
-        </div>
-    </div>
-</body>
-</html>
-'''
+def fetch_binance_data():
+    """Fetches the last 30 days of 1h BTCUSDT data from Binance."""
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": "BTCUSDT",
+        "interval": "1h",
+        "limit": 720  # 30 days * 24 hours = 720 hours
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    
+    # Define columns based on Binance API documentation
+    cols = ['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 
+            'CloseTime', 'QuoteVolume', 'NumTrades', 
+            'TakerBuyBaseVol', 'TakerBuyQuoteVol', 'Ignore']
+    
+    df = pd.DataFrame(data, columns=cols)
+    
+    # Convert necessary columns to float
+    df['Open'] = df['Open'].astype(float)
+    df['Close'] = df['Close'].astype(float)
+    df['Volume'] = df['Volume'].astype(float)
+    
+    return df
 
-def parse_repo_input(repo_input):
-    """Parse repository input to extract owner and repo name"""
-    # Remove any trailing slashes
-    repo_input = repo_input.rstrip('/')
+def process_movement_data(df):
+    """Processes directional movement and scales volume for bubbles."""
+    # Green body -> +1 (forward), Red body -> -1 (backward)
+    df['Direction'] = df.apply(lambda row: 1 if row['Close'] >= row['Open'] else -1, axis=1)
     
-    # Handle full GitHub URLs
-    if 'github.com' in repo_input:
-        # Extract owner/repo from URL
-        parts = repo_input.split('github.com/')[-1].split('/')
-        if len(parts) >= 2:
-            return parts[0], parts[1].replace('.git', '')
+    # Cumulative movement for the X-axis
+    df['Movement_X'] = df['Direction'].cumsum()
     
-    # Handle "owner/repo" format
-    elif '/' in repo_input:
-        parts = repo_input.split('/')
-        if len(parts) == 2:
-            return parts[0], parts[1].replace('.git', '')
+    # Color map for the bubbles
+    df['Color'] = df['Direction'].map({1: '#26a69a', -1: '#ef5350'}) # Standard crypto green/red
     
-    return None, None
+    # Normalize volume to use as bubble sizes (min size 20, max size 600)
+    min_vol = df['Volume'].min()
+    max_vol = df['Volume'].max()
+    df['BubbleSize'] = 20 + 580 * ((df['Volume'] - min_vol) / (max_vol - min_vol))
+    
+    return df
 
-def get_repo_contents(owner, repo, path=''):
-    """Recursively get all files from a GitHub repository"""
-    url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
-    headers = {'Accept': 'application/vnd.github.v3+json'}
+@app.route('/')
+def serve_plot():
+    # 1. Fetch & Process Data
+    df = fetch_binance_data()
+    df = process_movement_data(df)
     
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        contents = response.json()
-        
-        files = []
-        
-        for item in contents:
-            if item['type'] == 'file':
-                # Get file content
-                file_response = requests.get(item['download_url'])
-                file_response.raise_for_status()
-                files.append({
-                    'path': item['path'],
-                    'content': file_response.text
-                })
-            elif item['type'] == 'dir':
-                # Recursively get files from subdirectory
-                files.extend(get_repo_contents(owner, repo, item['path']))
-        
-        return files
+    # 2. Create Plot
+    fig, ax = plt.subplots(figsize=(14, 8), facecolor='#121212')
+    ax.set_facecolor('#121212')
     
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"Error accessing repository: {str(e)}")
-
-def create_combined_file(files):
-    """Create a single file combining all repository files"""
-    output = io.BytesIO()
+    # Faint line to show the chronological path
+    ax.plot(df['Movement_X'], df['Close'], color='white', alpha=0.15, linewidth=1, zorder=1)
     
-    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        # Add a README first
-        readme_content = f"""Repository File Combination
-Generated on: Combined all files from the repository
-Total files combined: {len(files)}
-
-This archive contains all files from the repository.
-"""
-        zipf.writestr('00_COMBINED_README.txt', readme_content)
-        
-        # Add all files
-        for file_info in files:
-            zipf.writestr(file_info['path'], file_info['content'])
-        
-        # Also create a single combined text file with all contents
-        combined_content = ""
-        for file_info in sorted(files, key=lambda x: x['path']):
-            combined_content += f"\n{'='*80}\n"
-            combined_content += f"FILE: {file_info['path']}\n"
-            combined_content += f"{'='*80}\n\n"
-            combined_content += file_info['content']
-            combined_content += "\n\n"
-        
-        zipf.writestr('00_ALL_FILES_COMBINED.txt', combined_content)
+    # Scatter plot for Momentum Bubbles
+    ax.scatter(
+        df['Movement_X'], 
+        df['Close'], 
+        s=df['BubbleSize'], 
+        c=df['Color'], 
+        alpha=0.7, 
+        edgecolors='black',
+        linewidth=0.5,
+        zorder=2
+    )
     
-    output.seek(0)
-    return output
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        repo_input = request.form.get('repo', '').strip()
-        
-        if not repo_input:
-            flash('Please enter a repository', 'error')
-            return redirect('/')
-        
-        # Parse repository input
-        owner, repo = parse_repo_input(repo_input)
-        
-        if not owner or not repo:
-            flash('Invalid repository format. Please use "owner/repo" or a GitHub URL', 'error')
-            return redirect('/')
-        
-        try:
-            # Get all files from repository
-            flash(f'Fetching files from {owner}/{repo}...', 'info')
-            files = get_repo_contents(owner, repo)
-            
-            if not files:
-                flash('No files found in repository', 'error')
-                return redirect('/')
-            
-            # Create combined file
-            flash(f'Found {len(files)} files. Creating download...', 'info')
-            combined_file = create_combined_file(files)
-            
-            # Send file for download
-            return send_file(
-                combined_file,
-                mimetype='application/zip',
-                as_attachment=True,
-                download_name=f'{repo}_combined_files.zip'
-            )
-            
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'error')
-            return redirect('/')
+    # Styling
+    ax.set_title("BTCUSDT Momentum Bubbles (Last 30 Days, 1h Interval)", color='white', fontsize=16)
+    ax.set_xlabel("Cumulative Movement (Green = Forward +1, Red = Backward -1)", color='white', fontsize=12)
+    ax.set_ylabel("Price (USDT)", color='white', fontsize=12)
     
-    return render_template_string(HTML_TEMPLATE)
+    ax.tick_params(colors='white')
+    ax.grid(True, linestyle='--', alpha=0.2, color='white')
+    
+    # 3. Save to memory buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    
+    # 4. Serve the image
+    return send_file(buf, mimetype='image/png')
 
 if __name__ == '__main__':
-    print("="*50)
-    print("Repository File Combiner Server")
-    print("="*50)
-    print("Server starting on http://0.0.0.0:8080")
-    print("Access from any device on your network using your IP address")
-    print("\nPress Ctrl+C to stop the server")
-    print("="*50)
-    
-    # Run the Flask app
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    # Serve on 0.0.0.0 so it is exposed to your local network / public IP
+    print("Serving Momentum Bubbles on http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000)
